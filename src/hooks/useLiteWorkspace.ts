@@ -13,23 +13,26 @@ import { useTauriEvent } from "./useTauriEvent";
 type LiteWorkspaceQuery = {
   contextId: string | null;
   search: string;
+  page: number;
 };
 
 const emptyCounts: LibraryCounts = { all: 0, inbox: 0, content_base: 0 };
+const capturePageSize = 50;
 
 function toCaptureFilter(query: LiteWorkspaceQuery): CaptureFilter {
   return {
     context_id: query.contextId,
     search: query.search.trim() || null,
     tag: null,
-    limit: 250,
-    offset: 0,
+    limit: capturePageSize,
+    offset: Math.max(0, query.page) * capturePageSize,
   };
 }
 
 export function useLiteWorkspace(query: LiteWorkspaceQuery, onError: (message: string) => void) {
   const [contexts, setContexts] = useState<Context[]>([]);
   const [captures, setCaptures] = useState<Capture[]>([]);
+  const [captureTotal, setCaptureTotal] = useState(0);
   const [counts, setCounts] = useState<LibraryCounts>(emptyCounts);
   const [isLoading, setIsLoading] = useState(true);
   const queryRef = useRef(query);
@@ -55,8 +58,11 @@ export function useLiteWorkspace(query: LiteWorkspaceQuery, onError: (message: s
     const currentRequest = ++captureRequestId.current;
     setIsLoading(true);
     try {
-      const nextCaptures = await api.listCaptures(toCaptureFilter(queryOverride ?? queryRef.current));
-      if (mountedRef.current && currentRequest === captureRequestId.current) setCaptures(nextCaptures);
+      const page = await api.listCapturePage(toCaptureFilter(queryOverride ?? queryRef.current));
+      if (mountedRef.current && currentRequest === captureRequestId.current) {
+        setCaptures(page.items);
+        setCaptureTotal(page.total);
+      }
     } catch (error) {
       if (mountedRef.current && currentRequest === captureRequestId.current) errorHandlerRef.current(String(error));
     } finally {
@@ -83,7 +89,7 @@ export function useLiteWorkspace(query: LiteWorkspaceQuery, onError: (message: s
   useEffect(() => {
     const timeout = window.setTimeout(() => void refreshCaptures(), 140);
     return () => window.clearTimeout(timeout);
-  }, [query.contextId, query.search, refreshCaptures]);
+  }, [query.contextId, query.page, query.search, refreshCaptures]);
 
   useTauriEvent("capture-created", () => void refreshAll());
   useTauriEvent<CaptureUpdatedEvent>("capture-analysis-updated", ({ payload }) => {
@@ -106,5 +112,5 @@ export function useLiteWorkspace(query: LiteWorkspaceQuery, onError: (message: s
   useTauriEvent<CaptureErrorEvent>("capture-error", ({ payload }) => errorHandlerRef.current(payload.message));
   useTauriEvent("data-reset", () => void refreshAll());
 
-  return { captures, contexts, counts, isLoading, refreshAll, refreshCaptures };
+  return { captures, captureTotal, contexts, counts, isLoading, refreshAll, refreshCaptures };
 }

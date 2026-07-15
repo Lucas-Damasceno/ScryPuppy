@@ -317,10 +317,66 @@ svg {
   font-size: 9px;
 }
 
-.paste-palette-footer span {
+.paste-palette-footer.has-pagination {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.paste-shortcuts,
+.paste-shortcuts > span,
+.paste-pagination {
   display: flex;
   align-items: center;
+}
+
+.paste-shortcuts {
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.paste-shortcuts > span {
   gap: 3px;
+}
+
+.paste-pagination {
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.paste-pagination button {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  color: var(--text-secondary);
+  background: var(--card-solid);
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.paste-pagination button:hover:not(:disabled) {
+  border-color: rgba(227, 75, 69, 0.32);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.paste-pagination button:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.paste-pagination button.is-previous svg {
+  transform: rotate(180deg);
+}
+
+.paste-pagination > span {
+  min-width: 56px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-align: center;
 }
 
 .tag-view-controls,

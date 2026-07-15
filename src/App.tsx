@@ -21,6 +21,7 @@ import "./App.css";
 
 const inboxId = "inbox";
 const contentBaseId = "content-base";
+const pastePageSize = 10;
 
 type ConfirmationOptions = {
   title: string;
@@ -45,19 +46,45 @@ function App() {
 function PastePalette({ preview = false }: { preview?: boolean }) {
   const [items, setItems] = useState<Capture[]>([]);
   const [search, setSearch] = useState("");
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [isPasting, setIsPasting] = useState(false);
   const [language, setLanguage] = useState<AppLanguage>("en");
   const searchRef = useRef<HTMLInputElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
+  const requestIdRef = useRef(0);
   const tr = (english: string, variables?: Record<string, string | number>) => translate(language, english, variables);
+  const pageCount = Math.max(1, Math.ceil(total / pastePageSize));
+  const rangeStart = total === 0 ? 0 : (page * pastePageSize) + 1;
+  const rangeEnd = total === 0 ? 0 : Math.min(rangeStart + items.length - 1, total);
 
-  const loadItems = useCallback(async (query = search) => {
-    const nextItems = preview
-      ? pastePreviewItems.filter((item) => item.content_text.toLowerCase().includes(query.toLowerCase()))
-      : await api.listPasteItems(query);
-    setItems(nextItems);
-    setSelectedIndex((current) => Math.min(current, Math.max(0, nextItems.length - 1)));
-  }, [preview, search]);
+  const loadItems = useCallback(async (query: string, pageIndex: number) => {
+    const requestId = ++requestIdRef.current;
+    setIsLoading(true);
+    try {
+      const nextPage = preview
+        ? (() => {
+            const matches = pastePreviewItems.filter((item) =>
+              item.content_text.toLowerCase().includes(query.toLowerCase()),
+            );
+            const offset = pageIndex * pastePageSize;
+            return { items: matches.slice(offset, offset + pastePageSize), total: matches.length };
+          })()
+        : await api.listPasteItems(query, pageIndex, pastePageSize);
+      if (requestId !== requestIdRef.current) return;
+      setItems(nextPage.items);
+      setTotal(nextPage.total);
+      setSelectedIndex((current) => Math.min(current, Math.max(0, nextPage.items.length - 1)));
+    } catch {
+      if (requestId !== requestIdRef.current) return;
+      setItems([]);
+      setTotal(0);
+    } finally {
+      if (requestId === requestIdRef.current) setIsLoading(false);
+    }
+  }, [preview]);
 
   const chooseItem = useCallback(async (item: Capture | undefined) => {
     if (!item || isPasting || preview) return;
@@ -82,15 +109,25 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
   }, [language]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => loadItems().catch(() => setItems([])), 90);
+    const timeout = window.setTimeout(() => void loadItems(search, page), 90);
     return () => window.clearTimeout(timeout);
-  }, [loadItems]);
+  }, [loadItems, page, search]);
+
+  useEffect(() => {
+    if (page >= pageCount) setPage(pageCount - 1);
+  }, [page, pageCount]);
+
+  useEffect(() => {
+    resultsRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [page, search]);
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
     listen("paste-palette-opened", () => {
+      setSearch("");
+      setPage(0);
       setSelectedIndex(0);
-      loadItems().catch(() => setItems([]));
+      void loadItems("", 0);
       window.setTimeout(() => searchRef.current?.focus(), 0);
     }).then((unlisten) => unlisteners.push(unlisten));
     if (!preview) getCurrentWindow().onFocusChanged(({ payload }) => {
@@ -107,6 +144,14 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
         setSelectedIndex((current) => Math.max(current - 1, 0));
+      } else if (event.key === "PageDown" && page < pageCount - 1) {
+        event.preventDefault();
+        setPage((current) => current + 1);
+        setSelectedIndex(0);
+      } else if (event.key === "PageUp" && page > 0) {
+        event.preventDefault();
+        setPage((current) => current - 1);
+        setSelectedIndex(0);
       } else if (event.key === "Enter") {
         event.preventDefault();
         chooseItem(items[selectedIndex]);
@@ -121,7 +166,7 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [chooseItem, items, selectedIndex]);
+  }, [chooseItem, items, page, pageCount, selectedIndex]);
 
   useEffect(() => {
     document.querySelector(".paste-result.is-selected")?.scrollIntoView({ block: "nearest" });
@@ -137,7 +182,7 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
             <input
               ref={searchRef}
               value={search}
-              onChange={(event) => { setSearch(event.currentTarget.value); setSelectedIndex(0); }}
+              onChange={(event) => { setSearch(event.currentTarget.value); setPage(0); setSelectedIndex(0); }}
               placeholder={tr("Search history...")}
               aria-label={tr("Search history")}
               autoComplete="off"
@@ -147,8 +192,8 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
           <kbd>Esc</kbd>
         </header>
 
-        <div className="paste-results" role="listbox" aria-label={tr("Recent items")}>
-          {items.length === 0 ? (
+        <div ref={resultsRef} className="paste-results" role="listbox" aria-label={tr("Recent items")} aria-busy={isLoading}>
+          {!isLoading && items.length === 0 ? (
             <div className="paste-empty"><Icon name="copy" size={22} /><strong>{tr("No items found")}</strong><span>{tr("Try another search.")}</span></div>
           ) : items.map((item, index) => {
             const imageAsset = item.assets.find((asset) => ["clipboard_image", "imported_image"].includes(asset.kind) && asset.path);
@@ -160,9 +205,9 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
                 aria-selected={index === selectedIndex}
                 onMouseEnter={() => setSelectedIndex(index)}
                 onClick={() => chooseItem(item)}
-                disabled={isPasting}
+                disabled={isPasting || isLoading}
               >
-                <span className="paste-result-index">{index < 9 ? index + 1 : ""}</span>
+                <span className="paste-result-index">{index + 1}</span>
                 {imageAsset?.path ? (
                   <img className="paste-result-image" src={convertFileSrc(imageAsset.path)} alt="" />
                 ) : (
@@ -178,10 +223,40 @@ function PastePalette({ preview = false }: { preview?: boolean }) {
           })}
         </div>
 
-        <footer className="paste-palette-footer">
-          <span><kbd>↑</kbd><kbd>↓</kbd> {tr("navigate")}</span>
-          <span><kbd>Enter</kbd> {tr("paste")}</span>
-          <span><kbd>Ctrl</kbd><kbd>1–9</kbd> {tr("quick access")}</span>
+        <footer className={`paste-palette-footer ${pageCount > 1 ? "has-pagination" : ""}`}>
+          {pageCount > 1 ? (
+            <nav className="paste-pagination" aria-label={tr("Pagination")}>
+              <button
+                type="button"
+                className="is-previous"
+                disabled={page === 0 || isLoading}
+                onClick={() => { setPage((current) => current - 1); setSelectedIndex(0); }}
+                aria-label={tr("Previous page")}
+                title={tr("Previous page")}
+              >
+                <Icon name="chevron" size={12} />
+              </button>
+              <span aria-label={tr("Showing {start}-{end} of {total}", { start: rangeStart, end: rangeEnd, total })}>
+                {rangeStart}-{rangeEnd} / {total}
+              </span>
+              <button
+                type="button"
+                disabled={page >= pageCount - 1 || isLoading}
+                onClick={() => { setPage((current) => current + 1); setSelectedIndex(0); }}
+                aria-label={tr("Next page")}
+                title={tr("Next page")}
+              >
+                <Icon name="chevron" size={12} />
+              </button>
+            </nav>
+          ) : null}
+          <div className="paste-shortcuts">
+            <span><kbd>↑</kbd><kbd>↓</kbd> {tr("navigate")}</span>
+            <span><kbd>Enter</kbd> {tr("paste")}</span>
+            {pageCount > 1
+              ? <span><kbd>PgUp</kbd><kbd>PgDn</kbd> {tr("pages")}</span>
+              : <span><kbd>Ctrl</kbd><kbd>1–9</kbd> {tr("quick access")}</span>}
+          </div>
         </footer>
       </section>
     </main>
