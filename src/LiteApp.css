@@ -396,8 +396,6 @@
   overflow: auto;
   scrollbar-width: thin;
 }
-.lite-capture-list.is-loading { opacity: .68; }
-
 .lite-capture-row {
   display: grid;
   grid-template-columns: 34px minmax(150px, 1fr) 34px 34px;

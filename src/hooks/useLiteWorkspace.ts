@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/tauri";
-import type { Capture, CaptureErrorEvent, CaptureFilter, Context, LibraryCounts } from "../types";
+import type {
+  Capture,
+  CaptureErrorEvent,
+  CaptureFilter,
+  CaptureUpdatedEvent,
+  Context,
+  LibraryCounts,
+} from "../types";
 import { useTauriEvent } from "./useTauriEvent";
 
 type LiteWorkspaceQuery = {
@@ -79,7 +86,22 @@ export function useLiteWorkspace(query: LiteWorkspaceQuery, onError: (message: s
   }, [query.contextId, query.search, refreshCaptures]);
 
   useTauriEvent("capture-created", () => void refreshAll());
-  useTauriEvent("capture-analysis-updated", () => void refreshCaptures());
+  useTauriEvent<CaptureUpdatedEvent>("capture-analysis-updated", ({ payload }) => {
+    // OCR can change whether a capture matches a text search, so active searches
+    // still need a silent authoritative refresh. In the regular workspace, patch
+    // only the affected capture and keep the rest of the list visually stable.
+    if (queryRef.current.search.trim()) {
+      void refreshCaptures();
+      return;
+    }
+    setCaptures((current) => {
+      const index = current.findIndex((capture) => capture.id === payload.capture.id);
+      if (index < 0) return current;
+      const next = [...current];
+      next[index] = payload.capture;
+      return next;
+    });
+  });
   useTauriEvent("capture-contexts-updated", () => void refreshAll());
   useTauriEvent<CaptureErrorEvent>("capture-error", ({ payload }) => errorHandlerRef.current(payload.message));
   useTauriEvent("data-reset", () => void refreshAll());

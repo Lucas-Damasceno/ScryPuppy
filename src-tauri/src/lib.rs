@@ -5527,7 +5527,7 @@ fn finish_ocr_job(
             ).map_err(err)?;
         }
     }
-    Ok(())
+    transaction.commit().map_err(err)
 }
 
 fn index_ocr_text(conn: &Connection, capture_id: &str, text: &str) -> Result<(), String> {
@@ -7228,6 +7228,60 @@ mod tests {
     }
 
     #[test]
+    fn finishing_ocr_job_commits_terminal_state() {
+        let mut conn = duplicate_test_connection();
+        let timestamp = now();
+        let capture_id = insert_duplicate_test_capture(
+            &conn,
+            "Image capture",
+            &timestamp,
+            CaptureOrigin::ExplicitHotkey,
+        );
+        let asset_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO capture_assets (id, capture_id, kind, path, status, error, created_at)
+             VALUES (?, ?, 'clipboard_image', 'capture.png', 'saved', NULL, ?)",
+            params![asset_id, capture_id, timestamp],
+        )
+        .expect("test asset should insert");
+        conn.execute(
+            "INSERT INTO capture_ocr (capture_id, status, text, error, updated_at)
+             VALUES (?, 'running', NULL, NULL, ?)",
+            params![capture_id, timestamp],
+        )
+        .expect("test OCR state should insert");
+        conn.execute(
+            "INSERT INTO ocr_jobs (
+                capture_id, asset_id, status, attempts, queued_at, started_at
+             ) VALUES (?, ?, 'running', 1, ?, ?)",
+            params![capture_id, asset_id, timestamp, timestamp],
+        )
+        .expect("test OCR job should insert");
+
+        finish_ocr_job(&mut conn, &capture_id, Ok("recognized text".into()))
+            .expect("OCR result should persist");
+
+        let job_status: String = conn
+            .query_row(
+                "SELECT status FROM ocr_jobs WHERE capture_id = ?",
+                [&capture_id],
+                |row| row.get(0),
+            )
+            .expect("OCR job should remain available");
+        let (ocr_status, ocr_text): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, text FROM capture_ocr WHERE capture_id = ?",
+                [&capture_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("OCR state should remain available");
+
+        assert_eq!(job_status, "done");
+        assert_eq!(ocr_status, "done");
+        assert_eq!(ocr_text.as_deref(), Some("recognized text"));
+    }
+
+    #[test]
     fn screenshot_policy_is_independent_by_origin() {
         let mut settings = test_settings();
         assert!(screenshot_enabled(
@@ -7360,7 +7414,7 @@ mod tests {
         text: &str,
         captured_at: &str,
         origin: CaptureOrigin,
-    ) {
+    ) -> String {
         let id = Uuid::new_v4().to_string();
         let metadata = json!({ "capture_origin": origin }).to_string();
         conn.execute(
@@ -7388,5 +7442,6 @@ mod tests {
             ],
         )
         .expect("test capture should insert");
+        id
     }
 }

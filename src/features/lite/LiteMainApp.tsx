@@ -282,7 +282,7 @@ export function LiteMainApp() {
 
         {status && <div className="lite-status"><LiteIcon name="info" /><span>{status}</span><button onClick={() => setStatus(null)}><LiteIcon name="close" /></button></div>}
 
-        <div className={`lite-capture-list ${isLoading ? "is-loading" : ""}`} aria-live="polite">
+        <div className="lite-capture-list" aria-busy={isLoading} aria-live="polite">
           {isLoading && captures.length === 0 ? (
             <LiteEmpty icon="loader" title={tr("Loading your history...")} />
           ) : captures.length === 0 ? (
