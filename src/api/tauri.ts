@@ -49,10 +49,8 @@ export const saveSettings = (settings: Settings) => invoke<Settings>("update_set
 export const askChat = (request: ChatRequest) => invoke<ChatAnswer>("ask_chat", { request });
 export const clearAiApiKey = () => invoke<Settings>("clear_ai_api_key");
 export const deleteAllData = () => invoke<void>("delete_all_data");
-export const listPasteItems = (search: string, page: number, pageSize = 10) => listCapturePage({
-  context_id: null,
+export const listPasteItems = (search: string, page: number, pageSize = 10) => invoke<CapturePage>("list_paste_page", {
   search: search.trim() || null,
-  tag: null,
   limit: pageSize,
   offset: Math.max(0, page) * pageSize,
 });

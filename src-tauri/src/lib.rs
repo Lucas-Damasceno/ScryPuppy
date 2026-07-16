@@ -322,6 +322,8 @@ struct CaptureFilter {
     tag: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    #[serde(default)]
+    exclude_references: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -633,6 +635,7 @@ fn default_capture_filter() -> CaptureFilter {
         tag: None,
         limit: None,
         offset: None,
+        exclude_references: false,
     }
 }
 
@@ -645,6 +648,10 @@ struct CaptureQueryParts {
 fn capture_query_parts(filter: &CaptureFilter) -> CaptureQueryParts {
     let mut args = Vec::new();
     let mut where_parts = Vec::new();
+
+    if filter.exclude_references {
+        where_parts.push("c.capture_kind <> 'reference'".to_string());
+    }
 
     if let Some(context_id) = filter
         .context_id
@@ -802,6 +809,27 @@ fn list_capture_page(
 ) -> CommandResult<CapturePageDto> {
     let conn = open_conn(&state)?;
     let filter = filter.unwrap_or_else(default_capture_filter);
+    let total = count_captures_from_conn(&conn, &filter)?;
+    let items = list_captures_from_conn(&conn, &filter)?;
+    Ok(CapturePageDto { items, total })
+}
+
+#[tauri::command]
+fn list_paste_page(
+    state: State<AppState>,
+    search: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> CommandResult<CapturePageDto> {
+    let conn = open_conn(&state)?;
+    let filter = CaptureFilter {
+        context_id: None,
+        search,
+        tag: None,
+        limit,
+        offset,
+        exclude_references: true,
+    };
     let total = count_captures_from_conn(&conn, &filter)?;
     let items = list_captures_from_conn(&conn, &filter)?;
     Ok(CapturePageDto { items, total })
@@ -6383,6 +6411,10 @@ fn release_hotkey_modifiers(enigo: &mut Enigo) -> Result<(), String> {
 }
 
 fn write_clipboard_text(state: &AppState, text: &str) -> Result<(), String> {
+    // Keep the monitor suppressed until the new Windows sequence number is
+    // recorded. Without this guard, WM_CLIPBOARDUPDATE can win the race and
+    // persist clipboard content written by ScryPuppy as a fresh capture.
+    let _monitor_suppression = state.suppress_clipboard_monitor();
     let result = state.clipboard.write(ClipboardSnapshot::text(text));
     if result.is_ok() {
         mark_current_clipboard_sequence(state);
@@ -6427,6 +6459,7 @@ fn cleanup_clipboard_vault(state: &AppState) -> Result<(), String> {
 }
 
 fn write_clipboard_payload(state: &AppState, payload: &ClipboardPayload) -> Result<(), String> {
+    let _monitor_suppression = state.suppress_clipboard_monitor();
     let result = state.clipboard.write(payload.clone());
     if result.is_ok() {
         mark_current_clipboard_sequence(state);
@@ -7467,6 +7500,7 @@ pub fn run() {
             copy_capture_to_clipboard,
             list_captures,
             list_capture_page,
+            list_paste_page,
             get_capture,
             delete_capture,
             list_contexts,
@@ -7821,6 +7855,7 @@ mod tests {
             tag: None,
             limit: Some(50),
             offset: Some(0),
+            exclude_references: false,
         };
         assert_eq!(
             count_captures_from_conn(&conn, &first_page).expect("capture count should load"),
@@ -7850,6 +7885,7 @@ mod tests {
             tag: None,
             limit: Some(10),
             offset: Some(0),
+            exclude_references: false,
         };
         assert_eq!(
             count_captures_from_conn(&conn, &search_page)
@@ -7862,6 +7898,58 @@ mod tests {
                 .len(),
             7
         );
+    }
+
+    #[test]
+    fn paste_pages_exclude_content_base_references_before_pagination() {
+        let conn = duplicate_test_connection();
+        let timestamp = now();
+        for index in 0..12 {
+            insert_duplicate_test_capture(
+                &conn,
+                &format!("regular capture {index}"),
+                &timestamp,
+                CaptureOrigin::ClipboardMonitor,
+            );
+        }
+        for index in 0..4 {
+            let id = insert_duplicate_test_capture(
+                &conn,
+                &format!("reference {index}"),
+                &timestamp,
+                CaptureOrigin::ExplicitHotkey,
+            );
+            conn.execute(
+                "UPDATE captures SET capture_kind = 'reference', context_id = ? WHERE id = ?",
+                params![CONTENT_BASE_CONTEXT_ID, id],
+            )
+            .expect("test reference should move to Content Base");
+        }
+
+        let first_page = CaptureFilter {
+            context_id: None,
+            search: None,
+            tag: None,
+            limit: Some(10),
+            offset: Some(0),
+            exclude_references: true,
+        };
+        assert_eq!(
+            count_captures_from_conn(&conn, &first_page).expect("paste count should load"),
+            12
+        );
+        let items = list_captures_from_conn(&conn, &first_page).expect("paste page should load");
+        assert_eq!(items.len(), 10);
+        assert!(items.iter().all(|capture| capture.kind != "reference"));
+
+        let second_page = CaptureFilter {
+            offset: Some(10),
+            ..first_page
+        };
+        let items =
+            list_captures_from_conn(&conn, &second_page).expect("second paste page should load");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|capture| capture.kind != "reference"));
     }
 
     #[test]
