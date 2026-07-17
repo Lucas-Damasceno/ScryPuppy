@@ -1,4 +1,4 @@
-name: Automatic beta release
+name: Beta Release
 
 on:
   pull_request:
@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   release:
+    name: Build and publish beta
     if: >-
       github.event.pull_request.merged == true &&
       (

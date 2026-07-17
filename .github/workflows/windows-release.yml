@@ -1,16 +1,6 @@
-name: Windows build and release
+name: Windows Release
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/windows-release.yml"
-      - ".github/workflows/automatic-beta-release.yml"
-      - ".github/dependabot.yml"
-      - "package.json"
-      - "package-lock.json"
-      - "scripts/**"
-      - "src/**"
-      - "src-tauri/**"
   push:
     tags:
       - "v*.*.0-beta.*"
@@ -53,7 +43,7 @@ permissions:
 
 jobs:
   build:
-    name: Validate and build Windows installer
+    name: Build Windows installer
     runs-on: windows-latest
     timeout-minutes: 60
     outputs:
@@ -208,7 +198,7 @@ jobs:
           retention-days: 1
 
   publish:
-    name: Attest and publish GitHub prerelease
+    name: Publish signed beta release
     if: >-
       startsWith(github.ref, 'refs/tags/') ||
       needs.build.outputs.automatic_release == 'true'

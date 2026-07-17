@@ -1,0 +1,28 @@
+name: Windows CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-ci.yml"
+      - ".github/workflows/windows-release.yml"
+      - ".github/workflows/automatic-beta-release.yml"
+      - ".github/dependabot.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - "src/**"
+      - "src-tauri/**"
+
+concurrency:
+  group: windows-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Windows app
+    uses: ./.github/workflows/windows-release.yml
+    permissions:
+      contents: read
