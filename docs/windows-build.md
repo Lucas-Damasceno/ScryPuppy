@@ -1,12 +1,24 @@
-# Windows build and release
+# Windows CI and release
 
 This guide documents the supported ScryPuppy 1.0 Beta packaging path.
 
 ## Supported release path
 
-Public builds are produced by `.github/workflows/windows-release.yml` on a standard
-GitHub-hosted Windows runner. Pull requests that affect the application or release
-pipeline run the complete validation and packaging job without publishing a release.
+The Actions page exposes three workflows with distinct responsibilities:
+
+- **Windows CI** (`.github/workflows/windows-ci.yml`) validates pull requests that
+  affect the application or release pipeline. It builds and smoke-tests an unsigned
+  installer without publishing anything.
+- **Beta Release** (`.github/workflows/automatic-beta-release.yml`) reacts only to
+  merged `feat/` and `fix/` pull requests and queues the next automatic beta.
+- **Windows Release** (`.github/workflows/windows-release.yml`) performs signed
+  packaging and publication for the beta orchestrator. It also provides the manual
+  and tag-based recovery path.
+
+The CI and release workflows deliberately have separate permission boundaries. CI
+has read-only repository access and cannot publish releases; both paths invoke the
+same checked-in validation commands and `scripts/build-windows.ps1` so the installer
+construction and startup probe remain consistent.
 
 Merging a pull request whose source branch starts with `feat/` or `fix/` queues an
 automatic beta release. The workflow increments the beta number, runs the same
@@ -104,6 +116,11 @@ Pull-request validation builds intentionally receive neither secret. They still
 build and smoke-test the installer, but skip distributable updater artifacts.
 Release and automatic post-merge builds fail early if the signing key is absent.
 
+Unsigned builds pass this override to Tauri through a temporary JSON file. Keep it
+as a file path: forwarding inline JSON through PowerShell and npm on Windows strips
+the property-name quotes before Tauri parses the argument. The temporary file is
+removed in a `finally` block even when the build fails.
+
 For a signed local build, load the private key contents and password into the
 environment before running the supported build command:
 
@@ -141,8 +158,8 @@ The current safeguards exist to prevent that class of failure:
 1. Create the pull request from a branch named `feat/<description>` or
    `fix/<description>`.
 2. Review and merge the pull request into `main`.
-3. **Automatic beta release** serializes the request with any other pending release.
-4. **Windows build and release** calculates the next unused beta number and updates
+3. **Beta Release** serializes the request with any other pending release.
+4. **Windows Release** calculates the next unused beta number and updates
    every package manifest plus the current version shown in the README.
 5. The workflow tests and packages the exact merged commit, creates an annotated
    tag associated with the pull request, publishes the `.exe`, `.sha256`, and
@@ -156,7 +173,7 @@ new beta number.
 Manual version tags remain available as a recovery and maintenance path.
 
 For a non-publishing verification run, open a pull request that changes an application
-or release-pipeline file, or manually dispatch the workflow from the Actions page after
-the workflow exists on the default branch.
+or release-pipeline file. Use the manual **Windows Release** dispatch only for release
+recovery or maintenance; it is not the pull-request CI entry point.
 
 Until the beta flag is removed, GitHub releases should remain marked as prereleases and describe privacy defaults, supported Windows versions, and known beta limitations.

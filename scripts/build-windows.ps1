@@ -31,6 +31,7 @@ if (
 }
 $hasSigningKey = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
 $signatureRequired = $env:REQUIRE_UPDATER_SIGNATURE -eq "true"
+$temporaryTauriConfig = $null
 
 Push-Location $repoRoot
 try {
@@ -44,8 +45,17 @@ try {
   if (-not $hasSigningKey) {
     # Pull-request and local validation builds do not need distributable updater
     # artifacts. Release builds always provide a signing key and use the checked-in
-    # createUpdaterArtifacts setting.
-    $tauriBuildArgs += @("--config", '{"bundle":{"createUpdaterArtifacts":false}}')
+    # createUpdaterArtifacts setting. Use a temporary file because inline JSON loses
+    # its quotes when PowerShell forwards it through npm on Windows.
+    $temporaryTauriConfig = Join-Path `
+      ([System.IO.Path]::GetTempPath()) `
+      "scrypuppy-tauri-$([System.Guid]::NewGuid().ToString('N')).json"
+    [System.IO.File]::WriteAllText(
+      $temporaryTauriConfig,
+      '{"bundle":{"createUpdaterArtifacts":false}}',
+      [System.Text.UTF8Encoding]::new($false)
+    )
+    $tauriBuildArgs += @("--config", $temporaryTauriConfig)
   }
   & npm @tauriBuildArgs
   if ($LASTEXITCODE -ne 0) { throw "Tauri build failed with exit code $LASTEXITCODE." }
@@ -114,4 +124,7 @@ try {
   Write-Host "Windows installer created: $installer"
 } finally {
   Pop-Location
+  if ($temporaryTauriConfig -and (Test-Path -LiteralPath $temporaryTauriConfig)) {
+    Remove-Item -LiteralPath $temporaryTauriConfig -Force
+  }
 }
