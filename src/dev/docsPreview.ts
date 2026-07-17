@@ -244,7 +244,7 @@ export function installDocsPreview(): void {
           image_count: imageOnly ? 4 : 3,
           file_count: imageOnly ? 0 : 2,
           reclaimable_bytes: imageOnly ? 8_493_056 : 14_417_920,
-          oldest_captured_at: captures.at(-1)?.captured_at ?? null,
+          oldest_captured_at: captures[captures.length - 1]?.captured_at ?? null,
           newest_captured_at: captures[0].captured_at,
         };
       }
