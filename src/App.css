@@ -2513,39 +2513,54 @@ kbd {
 .magic-engine-options {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 1px;
+  background: var(--settings-section-divider, var(--line-soft));
 }
 
 .magic-engine-card {
   display: grid;
-  gap: 7px;
-  min-height: 92px;
-  padding: 12px;
-  border: 1px solid var(--line-soft);
-  border-radius: 12px;
+  min-width: 0;
+  min-height: 62px;
+  gap: 3px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 0;
   background: var(--settings-section-surface, var(--card-solid));
-  color: var(--text-secondary);
+  color: var(--text-tertiary);
   text-align: left;
   cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, box-shadow 120ms ease;
 }
 
-.magic-engine-card:hover,
+.magic-engine-card:hover {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--settings-section-surface, var(--card-solid)) 94%, var(--control));
+}
+
 .magic-engine-card.is-selected {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 7%, var(--card-solid));
+  color: var(--text-secondary);
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
-.magic-engine-card-title { display: flex; align-items: center; gap: 7px; color: var(--text-primary); }
-.magic-engine-card-title small { margin-left: auto; padding: 2px 6px; border-radius: 999px; background: var(--accent); color: white; font-size: 9px; text-transform: uppercase; }
-.local-model-status { display: grid; gap: 9px; padding: 12px; border: 1px solid var(--line-soft); border-radius: 12px; }
-.local-model-status > div:first-child { display: grid; gap: 3px; }
-.local-model-status span,
-.local-model-status small { color: var(--text-secondary); }
-.local-model-status progress { width: 100%; accent-color: var(--accent); }
-.settings-inline-error { margin: 0; color: var(--danger); font-size: 11px; }
+.magic-engine-card-title { display: flex; min-width: 0; align-items: center; gap: 6px; color: var(--text-secondary); }
+.magic-engine-card-title > svg { color: var(--text-tertiary); }
+.magic-engine-card.is-selected .magic-engine-card-title,
+.magic-engine-card.is-selected .magic-engine-card-title > svg { color: var(--accent-strong); }
+.magic-engine-card-title strong { font-size: 10px; font-weight: 650; }
+.magic-engine-card-title > span { margin-left: auto; padding: 1px 5px; border-radius: 999px; color: var(--accent-strong); background: var(--accent-soft); font-size: 7px; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
+.magic-engine-card > small { color: inherit; font-size: 9px; font-weight: 400; line-height: 1.35; }
+.local-model-status { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; min-height: var(--settings-row-min-height, 42px); gap: 12px; padding: var(--settings-row-padding, 7px 12px); background: var(--settings-section-surface, var(--card-solid)); }
+.local-model-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.local-model-actions .settings-inline-button { display: inline-flex; align-items: center; gap: 5px; }
+.local-model-progress { display: grid; padding: 0 12px 8px; background: var(--settings-section-surface, var(--card-solid)); }
+.local-model-progress progress { width: 100%; height: 4px; accent-color: var(--accent); }
+.settings-dependency-hint.is-error { color: var(--danger); }
 
 @media (max-width: 560px) {
   .magic-engine-options { grid-template-columns: 1fr; }
+  .local-model-status { grid-template-columns: 1fr; }
+  .local-model-actions { justify-content: flex-start; }
 }
 
 .settings-control-stack {

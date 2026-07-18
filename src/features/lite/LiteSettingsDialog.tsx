@@ -85,28 +85,34 @@ export function LiteSettingsDialog({ settings, aiOptions, language, updater, sav
           <AppUpdateSettings updater={updater} language={language} />
           <section className="settings-group magic-engine-settings">
             <div className="settings-group-title"><LiteIcon name="search" /><div><strong>{tr("Magic Search")}</strong><span>{tr("Choose how evidence is retrieved and answers are generated")}</span></div></div>
-            <div className="magic-engine-options">
-              <button type="button" className={`magic-engine-card ${settings.magic_search_engine === "local" ? "is-selected" : ""}`} onClick={() => void onPatch({ magic_search_engine: "local" })}>
-                <span className="magic-engine-card-title"><LiteIcon name="lock" /><strong>{tr("Local beta")}</strong><small>{tr("Beta")}</small></span>
-                <span>{tr("Multilingual semantic search and local answers. Captures never leave this computer.")}</span>
-              </button>
-              <button type="button" className={`magic-engine-card ${settings.magic_search_engine === "provider" ? "is-selected" : ""}`} onClick={() => void onPatch({ magic_search_engine: "provider" })}>
-                <span className="magic-engine-card-title"><LiteIcon name="sparkles" /><strong>{tr("AI provider")}</strong></span>
-                <span>{tr("Searches your local evidence, then may send selected evidence to the configured provider.")}</span>
-              </button>
-            </div>
-            <div className="local-model-status">
-              <div>
-                <strong>{localStatus?.model_name ?? "Multilingual E5 Small"}</strong>
-                <span>{localStatus ? localPhaseLabel(localStatus, tr) : tr("Checking local model...")}</span>
-                {localStatus && localStatus.cache_bytes > 0 && <small>{formatBytes(localStatus.cache_bytes)} {tr("on disk")}</small>}
+            <div className="settings-control-stack magic-engine-control-stack">
+              <div className="magic-engine-options" role="radiogroup" aria-label={tr("Magic Search")}>
+                <button type="button" role="radio" aria-checked={settings.magic_search_engine === "local"} className={`magic-engine-card ${settings.magic_search_engine === "local" ? "is-selected" : ""}`} onClick={() => void onPatch({ magic_search_engine: "local" })}>
+                  <span className="magic-engine-card-title"><LiteIcon name="lock" /><strong>{tr("Local beta")}</strong><span>{tr("Beta")}</span></span>
+                  <small>{tr("Multilingual semantic search and local answers. Captures never leave this computer.")}</small>
+                </button>
+                <button type="button" role="radio" aria-checked={settings.magic_search_engine === "provider"} className={`magic-engine-card ${settings.magic_search_engine === "provider" ? "is-selected" : ""}`} onClick={() => void onPatch({ magic_search_engine: "provider" })}>
+                  <span className="magic-engine-card-title"><LiteIcon name="sparkles" /><strong>{tr("AI provider")}</strong></span>
+                  <small>{tr("Searches your local evidence, then may send selected evidence to the configured provider.")}</small>
+                </button>
               </div>
-              {localStatus?.phase === "indexing" && localStatus.total_count > 0 && <progress value={localStatus.indexed_count} max={localStatus.total_count} />}
-              {localStatus?.error && <p className="settings-inline-error">{formatAppMessage(localStatus.error, tr)}</p>}
-              <div className="settings-actions">
-                {(localStatus?.can_download || localStatus?.can_retry) && <button className="secondary-button" disabled={localActionPending} onClick={() => void prepareLocalSearch()}><LiteIcon name="refresh" />{tr(localStatus.can_retry ? "Retry download" : "Download model")}</button>}
-                {localStatus?.can_remove && <button className="secondary-button danger-action" disabled={localActionPending || localStatus.phase === "downloading" || localStatus.phase === "indexing" || localStatus.phase === "removing"} onClick={() => void removeLocalModel()}><LiteIcon name="trash" />{tr("Remove model")}</button>}
-              </div>
+              {settings.magic_search_engine === "local" && <>
+                <div className="local-model-status">
+                  <span className="settings-control-copy">
+                    <strong>{localStatus?.model_name ?? "Multilingual E5 Small"}</strong>
+                    <small>
+                      {localStatus ? localPhaseLabel(localStatus, tr) : tr("Checking local model...")}
+                      {localStatus && localStatus.cache_bytes > 0 && <>{" \u00b7 "}{formatBytes(localStatus.cache_bytes)} {tr("on disk")}</>}
+                    </small>
+                  </span>
+                  <div className="local-model-actions">
+                    {(localStatus?.can_download || localStatus?.can_retry) && <button className="settings-inline-button" disabled={localActionPending} onClick={() => void prepareLocalSearch()}><LiteIcon name="refresh" />{tr(localStatus.can_retry ? "Retry download" : "Download model")}</button>}
+                    {localStatus?.can_remove && <button className="settings-inline-button is-danger" disabled={localActionPending || localStatus.phase === "downloading" || localStatus.phase === "indexing" || localStatus.phase === "removing"} onClick={() => void removeLocalModel()}><LiteIcon name="trash" />{tr("Remove model")}</button>}
+                  </div>
+                </div>
+                {localStatus?.phase === "indexing" && localStatus.total_count > 0 && <div className="local-model-progress"><progress value={localStatus.indexed_count} max={localStatus.total_count} /></div>}
+                {localStatus?.error && <p className="settings-dependency-hint is-error">{formatAppMessage(localStatus.error, tr)}</p>}
+              </>}
             </div>
           </section>
           <section className="settings-group ai-settings-group">
