@@ -89,6 +89,8 @@ See [prints.md](prints.md) for the complete UI reference and onboarding gallery.
 - Images and screenshots are never sent to AI providers.
 - File bytes, executable contents, complete filesystem paths, and private clipboard formats are never sent to AI providers.
 - Explicit AI requests may include bounded text evidence and relevant locally extracted OCR text. Recognized API keys and tokens are replaced with opaque placeholders before every provider request.
+- Magic Search can instead run entirely locally with Multilingual E5 Small. Selecting local mode does not start a download; the user must explicitly download the model in Settings and wait for the first library index to finish.
+- The main installer does not contain the embedding model. A failed runtime download leaves Local Magic Search unavailable and can be retried later; provider mode remains available.
 - For generated documents, placeholders are restored only after the provider response returns, on the user's device. Local documents and exported Markdown files may therefore contain the original credentials and should be handled carefully.
 - Automatic screenshots and automatic Quick Context prompts remain separate opt-ins.
 
@@ -152,7 +154,10 @@ src-tauri/target/release/bundle/nsis/
 | Frontend | React 19, TypeScript, Vite |
 | Native backend | Rust |
 | Local database | SQLite with bundled SQLCipher |
+| Local semantic retrieval | FastEmbed, Multilingual E5 Small, SQLite FTS5, brute-force cosine search, RRF |
 | Export encryption | AES-256-GCM |
+
+Third-party runtime components and licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 | Credentials | Windows Credential Manager |
 | Clipboard and input | `arboard`, `enigo` |
 | Window capture | `xcap` |

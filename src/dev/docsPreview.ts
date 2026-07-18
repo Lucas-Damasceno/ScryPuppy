@@ -107,6 +107,8 @@ The beta should lead with privacy, fast retrieval, and clear source attribution.
 3. Windows Terminal — Reference: Windows packaging safeguards`,
   provider: "deepseek",
   model: "deepseek-v4-flash",
+  retrieval_engine: "fts5+e5+rrf",
+  retrieval_model: "intfloat/multilingual-e5-small",
   filters: {
     query: "product launch and privacy decisions",
     context_id: null,
@@ -144,6 +146,8 @@ const previewDocumentHistory: MagicSearchListItem[] = [{
   query: previewDocument.query,
   provider: previewDocument.provider,
   model: previewDocument.model,
+  retrieval_engine: previewDocument.retrieval_engine,
+  retrieval_model: previewDocument.retrieval_model,
   evidence_count: previewDocument.evidence_count,
   created_at: previewDocument.created_at,
   response_mode: "document",
