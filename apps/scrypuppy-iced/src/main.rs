@@ -234,7 +234,7 @@ enum Message {
     ToggleTheme,
     ToggleClipboardMonitor,
     ClipboardChanged(u32),
-    ClipboardCaptured(Result<Option<String>, String>),
+    ClipboardCaptured(Result<Option<(String, bool)>, String>),
     ClipboardMonitorSaved(Result<(), String>),
     ToggleQuickPasteStyle,
     ToggleQuickContextStyle,
@@ -614,9 +614,17 @@ impl App {
                 )
             }
             Message::ClipboardCaptured(result) => match result {
-                Ok(Some(_)) => {
+                Ok(Some((id, open_quick_context))) => {
                     self.notice = Some("Captura automática salva.".into());
-                    self.reload()
+                    if open_quick_context {
+                        self.query.clear();
+                        self.context = None;
+                        self.offset = 0;
+                        self.selected_capture = Some(id.clone());
+                        Task::done(Message::OpenQuickContext(id))
+                    } else {
+                        self.reload()
+                    }
                 }
                 Ok(None) => Task::none(),
                 Err(error) if error == "DUPLICATE_CAPTURE_IGNORED" => Task::none(),
@@ -1829,7 +1837,7 @@ fn capture_current_clipboard() -> Result<String, String> {
     scrypuppy_core::capture_store::save_clipboard_capture(&mut conn, &app_dir, &snapshot, "capture")
 }
 
-fn capture_monitored_clipboard() -> Result<Option<String>, String> {
+fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
     if !CLIPBOARD_MONITOR_ENABLED.load(Ordering::Acquire) {
         return Ok(None);
     }
@@ -1846,6 +1854,12 @@ fn capture_monitored_clipboard() -> Result<Option<String>, String> {
         "clipboard_monitor_capture_screenshots",
         false,
     );
+    let prompt_quick_context = read_boolean_setting(&settings_conn, "quick_context_enabled", true)
+        && read_boolean_setting(
+            &settings_conn,
+            "clipboard_monitor_quick_context_enabled",
+            false,
+        );
     drop(settings_conn);
     if !enabled || !CLIPBOARD_MONITOR_ENABLED.load(Ordering::Acquire) {
         return Ok(None);
@@ -1876,7 +1890,7 @@ fn capture_monitored_clipboard() -> Result<Option<String>, String> {
         "capture",
         "clipboard_monitor",
     ) {
-        Ok(id) => Ok(Some(id)),
+        Ok(id) => Ok(Some((id, prompt_quick_context))),
         Err(error)
             if error == "DUPLICATE_CAPTURE_IGNORED"
                 || error == "O clipboard nao retornou conteudo para salvar." =>
@@ -2201,6 +2215,16 @@ mod tests {
         assert!(!read_boolean_setting(
             &write_conn,
             "clipboard_monitor_enabled",
+            false
+        ));
+        assert!(read_boolean_setting(
+            &write_conn,
+            "quick_context_enabled",
+            true
+        ));
+        assert!(!read_boolean_setting(
+            &write_conn,
+            "clipboard_monitor_quick_context_enabled",
             false
         ));
         save_setting_value_in(&write_conn, "clipboard_monitor_enabled", "true").unwrap();
