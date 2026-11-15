@@ -4447,6 +4447,7 @@ dependencies = [
  "image",
  "keyring",
  "raw-window-handle",
+ "rusqlite",
  "scrypuppy-core",
  "tempfile",
  "tray-icon",

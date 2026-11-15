@@ -145,6 +145,8 @@ struct Snapshot {
     total: usize,
     asset_root: PathBuf,
     dark: bool,
+    quick_paste_minimal: bool,
+    quick_context_minimal: bool,
 }
 
 struct App {
@@ -160,6 +162,10 @@ struct App {
     offset: usize,
     selected_capture: Option<String>,
     theme_changed: bool,
+    quick_paste_minimal: bool,
+    quick_context_minimal: bool,
+    quick_paste_style_changed: bool,
+    quick_context_style_changed: bool,
     revision: u64,
     snapshot: Option<Snapshot>,
     loading: bool,
@@ -198,6 +204,8 @@ enum Message {
     FinishQuickContext,
     PasteCapture(String),
     ToggleTheme,
+    ToggleQuickPasteStyle,
+    ToggleQuickContextStyle,
     Loaded(u64, Result<Snapshot, String>),
     Previews(u64, Vec<(String, Vec<u8>)>, Vec<(String, String)>),
     ContextAssigned(u64, Result<(), String>),
@@ -205,6 +213,7 @@ enum Message {
     Captured(u64, Result<String, String>),
     Pasted(Result<(), String>),
     ThemeSaved(Result<(), String>),
+    QuickStyleSaved(Result<(), String>),
 }
 
 impl App {
@@ -228,6 +237,10 @@ impl App {
             offset: 0,
             selected_capture: None,
             theme_changed: false,
+            quick_paste_minimal: true,
+            quick_context_minimal: true,
+            quick_paste_style_changed: false,
+            quick_context_style_changed: false,
             revision: 0,
             snapshot: None,
             loading: true,
@@ -532,10 +545,52 @@ impl App {
                     Message::ThemeSaved,
                 )
             }
+            Message::ToggleQuickPasteStyle => {
+                self.quick_paste_minimal = !self.quick_paste_minimal;
+                self.quick_paste_style_changed = true;
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                let value = if self.quick_paste_minimal {
+                    "minimal"
+                } else {
+                    "normal"
+                };
+                Task::perform(
+                    async move { save_window_style_preference("iced_quick_paste_style", value) },
+                    Message::QuickStyleSaved,
+                )
+            }
+            Message::ToggleQuickContextStyle => {
+                self.quick_context_minimal = !self.quick_context_minimal;
+                self.quick_context_style_changed = true;
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                let value = if self.quick_context_minimal {
+                    "minimal"
+                } else {
+                    "normal"
+                };
+                Task::perform(
+                    async move { save_window_style_preference("iced_quick_context_style", value) },
+                    Message::QuickStyleSaved,
+                )
+            }
             Message::ThemeSaved(result) => {
                 if let Err(error) = result {
                     self.notice = Some(format!(
                         "Tema alterado nesta sessão, mas a preferência não foi salva: {error}"
+                    ));
+                }
+                Task::none()
+            }
+            Message::QuickStyleSaved(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!(
+                        "Estilo alterado nesta sessão, mas a preferência não foi salva: {error}"
                     ));
                 }
                 Task::none()
@@ -548,6 +603,12 @@ impl App {
                         let root = snapshot.asset_root.clone();
                         if !self.theme_changed {
                             self.dark = snapshot.dark;
+                        }
+                        if !self.quick_paste_style_changed {
+                            self.quick_paste_minimal = snapshot.quick_paste_minimal;
+                        }
+                        if !self.quick_context_style_changed {
+                            self.quick_context_minimal = snapshot.quick_context_minimal;
                         }
                         self.snapshot = Some(snapshot);
                         self.thumbnails.clear();
@@ -930,6 +991,7 @@ impl App {
 
     fn quick_view(&self) -> Element<'_, Message> {
         let dark = self.dark;
+        let minimal = self.quick_paste_minimal;
         let search = text_input("Buscar no histórico", &self.query)
             .id(self.quick_search_id.clone())
             .on_input(Message::QueryChanged)
@@ -939,6 +1001,8 @@ impl App {
             row![
                 text("Quick Paste").size(20),
                 Space::new().width(Length::Fill),
+                button(if minimal { "Minimalista" } else { "Normal" })
+                    .on_press(Message::ToggleQuickPasteStyle),
                 button("Fechar").on_press(Message::FinishQuickPaste)
             ]
             .align_y(Alignment::Center),
@@ -1000,7 +1064,13 @@ impl App {
                         container(card)
                             .width(Length::Fill)
                             .padding(12)
-                            .style(move |_| panel_style(dark, false)),
+                            .style(move |_| {
+                                if minimal {
+                                    container::Style::default()
+                                } else {
+                                    panel_style(dark, false)
+                                }
+                            }),
                     )
                     .on_press(Message::PasteCapture(capture.id.clone()))
                     .style(move |_, _| button::Style {
@@ -1045,20 +1115,29 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(14)
-            .style(|_| container::Style {
-                background: None,
-                border: iced::border::rounded(18),
-                ..container::Style::default()
+            .style(move |_| {
+                if minimal {
+                    container::Style {
+                        background: None,
+                        border: iced::border::rounded(18),
+                        ..container::Style::default()
+                    }
+                } else {
+                    panel_style(dark, false)
+                }
             })
             .into()
     }
 
     fn quick_context_view(&self) -> Element<'_, Message> {
         let dark = self.dark;
+        let minimal = self.quick_context_minimal;
         let mut content = column![
             row![
                 text("Organizar capturas").size(20),
                 Space::new().width(Length::Fill),
+                button(if minimal { "Minimalista" } else { "Normal" })
+                    .on_press(Message::ToggleQuickContextStyle),
                 button("Fechar").on_press(Message::FinishQuickContext),
             ]
             .align_y(Alignment::Center),
@@ -1092,7 +1171,7 @@ impl App {
                     button(
                         text(format!(
                             "{} {} · {} · {}",
-                            if selected { "☑" } else { "☐" },
+                            if selected { "[x]" } else { "[ ]" },
                             capture.content_kind.to_uppercase(),
                             source,
                             excerpt
@@ -1197,10 +1276,16 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(16)
-            .style(|_| container::Style {
-                background: None,
-                border: iced::border::rounded(18),
-                ..container::Style::default()
+            .style(move |_| {
+                if minimal {
+                    container::Style {
+                        background: None,
+                        border: iced::border::rounded(18),
+                        ..container::Style::default()
+                    }
+                } else {
+                    panel_style(dark, false)
+                }
             })
             .into()
     }
@@ -1449,6 +1534,8 @@ fn demo_snapshot() -> Snapshot {
         total: 3,
         asset_root: PathBuf::new(),
         dark: true,
+        quick_paste_minimal: true,
+        quick_context_minimal: true,
     }
 }
 
@@ -1486,6 +1573,26 @@ fn save_theme_preference(dark: bool) -> Result<(), String> {
         "INSERT INTO settings (key, value) VALUES ('iced_theme_dark', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [if dark { "true" } else { "false" }],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn save_window_style_preference(key: &str, value: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &database_key)?;
+    save_window_style_preference_in(&conn, key, value)
+}
+
+fn save_window_style_preference_in(
+    conn: &rusqlite::Connection,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -1711,6 +1818,8 @@ fn load_library(
         )
         .map(|value| value != "false")
         .unwrap_or(true);
+    let quick_paste_minimal = read_style_preference(&conn, "iced_quick_paste_style");
+    let quick_context_minimal = read_style_preference(&conn, "iced_quick_context_style");
     Ok(Snapshot {
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
@@ -1720,7 +1829,17 @@ fn load_library(
             .ok_or("Diretório da biblioteca indisponível")?
             .join("assets"),
         dark,
+        quick_paste_minimal,
+        quick_context_minimal,
     })
+}
+
+fn read_style_preference(conn: &rusqlite::Connection, key: &str) -> bool {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .map(|value| value != "normal")
+    .unwrap_or(true)
 }
 
 fn previews(
@@ -1858,12 +1977,25 @@ mod tests {
                 [],
             )
             .unwrap();
+        assert!(read_style_preference(&write_conn, "iced_quick_paste_style"));
+        assert!(read_style_preference(
+            &write_conn,
+            "iced_quick_context_style"
+        ));
+        save_window_style_preference_in(&write_conn, "iced_quick_paste_style", "normal").unwrap();
+        assert!(!read_style_preference(
+            &write_conn,
+            "iced_quick_paste_style"
+        ));
+        assert!(read_style_preference(
+            &write_conn,
+            "iced_quick_context_style"
+        ));
         drop(write_conn);
-        assert!(
-            load_library(&path, &key, "hello".into(), Some("work".into()), 0)
-                .unwrap()
-                .dark
-        );
+        let filtered = load_library(&path, &key, "hello".into(), Some("work".into()), 0).unwrap();
+        assert!(filtered.dark);
+        assert!(!filtered.quick_paste_minimal);
+        assert!(filtered.quick_context_minimal);
         let images = load_library(&path, &key, "image sample".into(), None, 0).unwrap();
         let (rendered, _) = previews(&images.asset_root, &images.captures);
         assert_eq!(rendered.len(), 1);
