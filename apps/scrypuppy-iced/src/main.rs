@@ -151,7 +151,7 @@ struct App {
     main: window::Id,
     quick_window: Option<window::Id>,
     quick_context_window: Option<window::Id>,
-    quick_context_capture: Option<String>,
+    quick_context_selected: Vec<String>,
     quick_search_id: iced::widget::Id,
     paste_target: Option<isize>,
     dark: bool,
@@ -192,6 +192,8 @@ enum Message {
     QuickPasteOpened(window::Id),
     FinishQuickPaste,
     OpenQuickContext(String),
+    ToggleQuickContextCapture(String),
+    AssignQuickContext(String),
     QuickContextOpened(window::Id),
     FinishQuickContext,
     PasteCapture(String),
@@ -217,7 +219,7 @@ impl App {
             main,
             quick_window: None,
             quick_context_window: None,
-            quick_context_capture: None,
+            quick_context_selected: Vec::new(),
             quick_search_id: iced::widget::Id::unique(),
             paste_target: None,
             dark: true,
@@ -306,7 +308,7 @@ impl App {
             }
             Message::Closed(id) if self.quick_context_window == Some(id) => {
                 self.quick_context_window = None;
-                self.quick_context_capture = None;
+                self.quick_context_selected.clear();
                 Task::none()
             }
             Message::Closed(_) => Task::none(),
@@ -344,7 +346,9 @@ impl App {
             }
             Message::OpenQuickContext(capture_id) => {
                 if let Some(id) = self.quick_context_window {
-                    self.quick_context_capture = Some(capture_id);
+                    if !self.quick_context_selected.contains(&capture_id) {
+                        self.quick_context_selected.push(capture_id);
+                    }
                     return Task::batch([window::gain_focus(id), self.reload()]);
                 }
                 let (id, open) = window::open(window::Settings {
@@ -357,17 +361,47 @@ impl App {
                     ..window::Settings::default()
                 });
                 self.quick_context_window = Some(id);
-                self.quick_context_capture = Some(capture_id);
+                self.quick_context_selected = vec![capture_id];
                 Task::batch([open.map(Message::QuickContextOpened), self.reload()])
             }
             Message::QuickContextOpened(id) => window::gain_focus(id),
             Message::FinishQuickContext => {
                 if let Some(id) = self.quick_context_window.take() {
-                    self.quick_context_capture = None;
+                    self.quick_context_selected.clear();
                     window::close(id)
                 } else {
                     Task::none()
                 }
+            }
+            Message::ToggleQuickContextCapture(id) => {
+                if let Some(index) = self
+                    .quick_context_selected
+                    .iter()
+                    .position(|item| item == &id)
+                {
+                    self.quick_context_selected.remove(index);
+                } else {
+                    self.quick_context_selected.push(id);
+                }
+                Task::none()
+            }
+            Message::AssignQuickContext(context_id) => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Gravações desativadas no modo de demonstração.".into());
+                    return Task::none();
+                }
+                if self.action_busy || self.quick_context_selected.is_empty() {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                self.notice = None;
+                let revision = self.revision;
+                let capture_ids = self.quick_context_selected.clone();
+                Task::perform(
+                    async move { assign_captures_to_context(capture_ids, context_id) },
+                    move |result| Message::ContextAssigned(revision, result),
+                )
             }
             Message::PasteCapture(id) => {
                 #[cfg(debug_assertions)]
@@ -557,7 +591,7 @@ impl App {
                     }
                 };
                 if close_quick_context.is_some() {
-                    self.quick_context_capture = None;
+                    self.quick_context_selected.clear();
                 }
                 let reload = self.reload();
                 if let Some(id) = close_quick_context {
@@ -1021,94 +1055,133 @@ impl App {
 
     fn quick_context_view(&self) -> Element<'_, Message> {
         let dark = self.dark;
-        let capture = self.quick_context_capture.as_deref().and_then(|id| {
-            self.snapshot
-                .as_ref()?
-                .captures
-                .iter()
-                .find(|item| item.id == id)
-        });
         let mut content = column![
             row![
-                text("Organizar captura").size(20),
+                text("Organizar capturas").size(20),
                 Space::new().width(Length::Fill),
                 button("Fechar").on_press(Message::FinishQuickContext),
             ]
             .align_y(Alignment::Center),
-            text("Escolha um Contexto para esta captura.").size(12),
+            text(format!(
+                "Selecione uma ou mais capturas para adicionar a um Contexto · {} selecionada(s)",
+                self.quick_context_selected.len()
+            ))
+            .size(12),
         ]
         .spacing(12);
-        if let Some(capture) = capture {
-            let excerpt = self
-                .text_previews
-                .get(&capture.id)
-                .unwrap_or(&capture.content_text)
-                .chars()
-                .take(150)
-                .collect::<String>();
-            let source = capture
-                .source_app_name
-                .as_deref()
-                .unwrap_or("Aplicativo desconhecido");
-            let mut preview = column![text(format!(
-                "{} · {}",
-                capture.content_kind.to_uppercase(),
-                source
-            ))
-            .size(10),]
-            .spacing(8);
-            if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
-                preview = preview.push(
-                    iced_image(thumbnail.clone())
-                        .height(130)
-                        .width(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
-                );
-            } else {
-                preview = preview.push(text(if excerpt.trim().is_empty() {
+        if let Some(snapshot) = &self.snapshot {
+            for capture in &snapshot.captures {
+                let selected = self.quick_context_selected.contains(&capture.id);
+                let source = capture
+                    .source_app_name
+                    .as_deref()
+                    .unwrap_or("Aplicativo desconhecido");
+                let excerpt = self
+                    .text_previews
+                    .get(&capture.id)
+                    .unwrap_or(&capture.content_text)
+                    .chars()
+                    .take(58)
+                    .collect::<String>();
+                let excerpt = if excerpt.trim().is_empty() {
                     preview_fallback_text(capture)
                 } else {
                     excerpt
-                }));
+                };
+                content = content.push(
+                    button(
+                        text(format!(
+                            "{} {} · {} · {}",
+                            if selected { "☑" } else { "☐" },
+                            capture.content_kind.to_uppercase(),
+                            source,
+                            excerpt
+                        ))
+                        .size(11),
+                    )
+                    .on_press(Message::ToggleQuickContextCapture(capture.id.clone()))
+                    .width(Length::Fill),
+                );
             }
-            if let Some(file) = capture.files.first() {
-                preview = preview
-                    .push(text(format!("{} · {}", file.display_name, file.availability)).size(11));
-            }
-            content = content.push(
-                container(preview)
-                    .width(Length::Fill)
-                    .padding(12)
-                    .style(move |_| panel_style(dark, false)),
-            );
-            let available = self
-                .snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .contexts
-                        .iter()
-                        .filter(|context| {
-                            context.id != "inbox"
-                                && context.id != "knowledge-base"
-                                && !capture
+
+            if self.quick_context_selected.is_empty() {
+                content =
+                    content.push(text("Marque ao menos uma captura para continuar.").size(12));
+            } else {
+                let selected_captures = snapshot
+                    .captures
+                    .iter()
+                    .filter(|capture| self.quick_context_selected.contains(&capture.id))
+                    .collect::<Vec<_>>();
+                if let Some(capture) = selected_captures.first() {
+                    let mut preview =
+                        column![
+                            text(format!("Prévia · {}", capture.content_kind.to_uppercase()))
+                                .size(10)
+                        ]
+                        .spacing(6);
+                    if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
+                        preview = preview.push(
+                            iced_image(thumbnail.clone())
+                                .height(88)
+                                .width(Length::Fill)
+                                .content_fit(iced::ContentFit::Contain),
+                        );
+                    } else {
+                        let excerpt = self
+                            .text_previews
+                            .get(&capture.id)
+                            .unwrap_or(&capture.content_text);
+                        preview = preview.push(
+                            text(if excerpt.trim().is_empty() {
+                                preview_fallback_text(capture)
+                            } else {
+                                excerpt.chars().take(100).collect::<String>()
+                            })
+                            .size(11),
+                        );
+                    }
+                    content = content.push(
+                        container(preview)
+                            .width(Length::Fill)
+                            .padding(8)
+                            .style(move |_| panel_style(dark, false)),
+                    );
+                }
+                let available = snapshot
+                    .contexts
+                    .iter()
+                    .filter(|context| {
+                        context.id != "inbox"
+                            && context.id != "knowledge-base"
+                            && selected_captures.iter().any(|capture| {
+                                !capture
                                     .contexts
                                     .iter()
                                     .any(|assigned| assigned.id == context.id)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if available.is_empty() {
-                content = content.push(text("Não há outros Contextos disponíveis.").size(12));
-            }
-            for context in available {
-                content = content.push(
-                    button(text(format!("Adicionar a {}", context.name)))
-                        .on_press(Message::AssignContext(capture.id.clone(), context.id))
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if available.is_empty() {
+                    content = content.push(
+                        text("As capturas selecionadas já estão nos Contextos disponíveis.")
+                            .size(12),
+                    );
+                }
+                for context in available {
+                    content = content.push(
+                        button(text(format!(
+                            "Adicionar {} captura(s) a {}",
+                            selected_captures.len(),
+                            context.name
+                        )))
+                        .on_press_maybe(
+                            (!self.action_busy).then_some(Message::AssignQuickContext(context.id)),
+                        )
                         .width(Length::Fill),
-                );
+                    );
+                }
             }
         } else if self.loading {
             content = content.push(text("Carregando a captura salva…").size(12));
@@ -1120,7 +1193,7 @@ impl App {
             content = content.push(text(notice.as_str()).size(11));
         }
         content = content.push(button("Concluir depois").on_press(Message::FinishQuickContext));
-        container(content)
+        container(scrollable(content).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(16)
@@ -1419,6 +1492,10 @@ fn save_theme_preference(dark: bool) -> Result<(), String> {
 }
 
 fn assign_capture_to_context(capture_id: String, context_id: String) -> Result<(), String> {
+    assign_captures_to_context(vec![capture_id], context_id)
+}
+
+fn assign_captures_to_context(capture_ids: Vec<String>, context_id: String) -> Result<(), String> {
     let appdata = dirs::data_dir().ok_or("Diretório de dados do Windows indisponível.")?;
     let app_dir = appdata.join("com.scryppy.desktop");
     let database_key = keyring::Entry::new("Scryppy", "database-key-v1")
@@ -1429,11 +1506,11 @@ fn assign_capture_to_context(capture_id: String, context_id: String) -> Result<(
         .map_err(|_| "Credencial local indisponível.")?
         .get_password()
         .map_err(|_| "Não foi possível acessar a chave dos Contextos.")?;
-    assign_capture_to_context_in(
+    assign_captures_to_context_in(
         &app_dir,
         &database_key,
         &context_key,
-        &capture_id,
+        &capture_ids,
         &context_id,
     )
 }
@@ -1576,11 +1653,11 @@ fn paste_saved_capture(capture_id: String, target: isize) -> Result<(), String> 
     Ok(())
 }
 
-fn assign_capture_to_context_in(
+fn assign_captures_to_context_in(
     app_dir: &Path,
     database_key: &str,
     context_key: &str,
-    capture_id: &str,
+    capture_ids: &[String],
     context_id: &str,
 ) -> Result<(), String> {
     let path = app_dir.join(DATABASE_FILE);
@@ -1589,14 +1666,11 @@ fn assign_capture_to_context_in(
             "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
         })?;
     let at = chrono::Utc::now().to_rfc3339();
-    scrypuppy_core::contexts::add_captures_to_context(
-        &mut conn,
-        &[capture_id.to_string()],
-        context_id,
-        &at,
-    )
-    .map_err(|error| error.code)?;
-    scrypuppy_core::search_index::refresh_search_document(&conn, capture_id, &at)?;
+    scrypuppy_core::contexts::add_captures_to_context(&mut conn, capture_ids, context_id, &at)
+        .map_err(|error| error.code)?;
+    for capture_id in capture_ids {
+        scrypuppy_core::search_index::refresh_search_document(&conn, capture_id, &at)?;
+    }
 
     let context = scrypuppy_core::context_exports::list_contexts(&conn)
         .map_err(|error| error.to_string())?
@@ -1831,12 +1905,19 @@ mod tests {
             CREATE TABLE capture_contexts(capture_id TEXT, context_id TEXT, assignment_origin TEXT, confidence REAL, created_at TEXT);\
             CREATE TABLE capture_search_documents(capture_id TEXT PRIMARY KEY, content TEXT, ocr TEXT, metadata TEXT, content_hash TEXT, updated_at TEXT);\
             CREATE TABLE capture_embeddings(capture_id TEXT PRIMARY KEY, content_hash TEXT);\
-            INSERT INTO captures VALUES ('capture-1','hello world','2026-01-01','Editor',NULL,NULL,NULL,NULL,NULL,'windows','{}','capture');\
+            INSERT INTO captures VALUES ('capture-1','hello world','2026-01-01','Editor',NULL,NULL,NULL,NULL,NULL,'windows','{}','capture'), ('capture-2','second item','2026-01-02','Browser',NULL,NULL,NULL,NULL,NULL,'windows','{}','capture');\
             INSERT INTO contexts VALUES ('work','Trabalho','trabalho','trabalho','2026','2026');\
         ").unwrap();
         drop(conn);
 
-        assign_capture_to_context_in(dir.path(), &key, &context_key, "capture-1", "work").unwrap();
+        assign_captures_to_context_in(
+            dir.path(),
+            &key,
+            &context_key,
+            &["capture-1".into(), "capture-2".into()],
+            "work",
+        )
+        .unwrap();
 
         let conn = open_existing_read_only(&dir.path().join(DATABASE_FILE), &key).unwrap();
         assert_eq!(
@@ -1850,12 +1931,30 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
+                "SELECT count(*) FROM capture_contexts WHERE capture_id IN ('capture-1', 'capture-2') AND context_id='work'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
                 "SELECT content FROM capture_search_documents WHERE capture_id='capture-1'",
                 [],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
             "hello world"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT content FROM capture_search_documents WHERE capture_id='capture-2'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "second item"
         );
         let export = std::fs::read(dir.path().join("markdown/contexts/trabalho.scryppy")).unwrap();
         assert!(export.starts_with(scrypuppy_core::crypto::CONTEXT_FILE_MAGIC));
