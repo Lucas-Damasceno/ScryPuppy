@@ -14,7 +14,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     thread,
 };
 
@@ -22,6 +25,12 @@ static QUICK_PASTE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static TRAY_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
+static CLIPBOARD_EVENT_SENDER: OnceLock<
+    Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
+> = OnceLock::new();
+static CLIPBOARD_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_COORDINATOR: OnceLock<scrypuppy_core::coordination::CaptureCoordinator> =
+    OnceLock::new();
 #[cfg(windows)]
 thread_local! {
     static TRAY_ICON: std::cell::RefCell<Option<tray_icon::TrayIcon>> = const { std::cell::RefCell::new(None) };
@@ -29,6 +38,20 @@ thread_local! {
 const PAGE_SIZE: usize = 60;
 
 fn main() -> iced::Result {
+    #[cfg(windows)]
+    let debug_demo = cfg!(debug_assertions) && std::env::args_os().any(|arg| arg == "--demo");
+    let clipboard_monitor_handle = scrypuppy_core::monitor::ClipboardMonitorHandle::new();
+    #[cfg(windows)]
+    if !debug_demo {
+        if let Err(error) =
+            scrypuppy_core::monitor::start(clipboard_monitor_handle.clone(), move |sequence| {
+                send_clipboard_message(Message::ClipboardChanged(sequence));
+            })
+        {
+            eprintln!("Não foi possível iniciar o monitor da área de transferência: {error}");
+            clipboard_monitor_handle.shutdown();
+        }
+    }
     let mut hotkey_manager = None;
     match GlobalHotKeyManager::new() {
         Ok(manager) => match HotKey::from_str("ctrl+shift+KeyV") {
@@ -67,9 +90,11 @@ fn main() -> iced::Result {
                 window::close_requests().map(Message::CloseRequested),
                 iced::Subscription::run(hotkey_events),
                 iced::Subscription::run(tray_events),
+                iced::Subscription::run(clipboard_events),
             ])
         })
         .run();
+    clipboard_monitor_handle.shutdown();
     drop(hotkey_manager);
     result
 }
@@ -147,6 +172,7 @@ struct Snapshot {
     dark: bool,
     quick_paste_minimal: bool,
     quick_context_minimal: bool,
+    clipboard_monitor_enabled: bool,
 }
 
 struct App {
@@ -162,6 +188,8 @@ struct App {
     offset: usize,
     selected_capture: Option<String>,
     theme_changed: bool,
+    clipboard_monitor_enabled: bool,
+    clipboard_monitor_changed: bool,
     quick_paste_minimal: bool,
     quick_context_minimal: bool,
     quick_paste_style_changed: bool,
@@ -204,6 +232,10 @@ enum Message {
     FinishQuickContext,
     PasteCapture(String),
     ToggleTheme,
+    ToggleClipboardMonitor,
+    ClipboardChanged(u32),
+    ClipboardCaptured(Result<Option<String>, String>),
+    ClipboardMonitorSaved(Result<(), String>),
     ToggleQuickPasteStyle,
     ToggleQuickContextStyle,
     Loaded(u64, Result<Snapshot, String>),
@@ -237,6 +269,8 @@ impl App {
             offset: 0,
             selected_capture: None,
             theme_changed: false,
+            clipboard_monitor_enabled: false,
+            clipboard_monitor_changed: false,
             quick_paste_minimal: true,
             quick_context_minimal: true,
             quick_paste_style_changed: false,
@@ -545,6 +579,60 @@ impl App {
                     Message::ThemeSaved,
                 )
             }
+            Message::ToggleClipboardMonitor => {
+                self.clipboard_monitor_enabled = !self.clipboard_monitor_enabled;
+                self.clipboard_monitor_changed = true;
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                CLIPBOARD_MONITOR_ENABLED.store(self.clipboard_monitor_enabled, Ordering::Release);
+                let value = if self.clipboard_monitor_enabled {
+                    "true"
+                } else {
+                    "false"
+                };
+                Task::perform(
+                    async move { save_setting_value("clipboard_monitor_enabled", value) },
+                    Message::ClipboardMonitorSaved,
+                )
+            }
+            Message::ClipboardChanged(sequence) => {
+                let coordinator = CAPTURE_COORDINATOR
+                    .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
+                if coordinator.consume_internal_sequence(sequence)
+                    || coordinator.monitor_is_suppressed()
+                {
+                    return Task::none();
+                }
+                if !CLIPBOARD_MONITOR_ENABLED.load(Ordering::Acquire) {
+                    return Task::none();
+                }
+                Task::perform(
+                    async { capture_monitored_clipboard() },
+                    Message::ClipboardCaptured,
+                )
+            }
+            Message::ClipboardCaptured(result) => match result {
+                Ok(Some(_)) => {
+                    self.notice = Some("Captura automática salva.".into());
+                    self.reload()
+                }
+                Ok(None) => Task::none(),
+                Err(error) if error == "DUPLICATE_CAPTURE_IGNORED" => Task::none(),
+                Err(error) => {
+                    self.notice = Some(format!("Falha na captura automática: {error}"));
+                    Task::none()
+                }
+            },
+            Message::ClipboardMonitorSaved(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!(
+                        "Preferência alterada nesta sessão, mas não foi salva: {error}"
+                    ));
+                }
+                Task::none()
+            }
             Message::ToggleQuickPasteStyle => {
                 self.quick_paste_minimal = !self.quick_paste_minimal;
                 self.quick_paste_style_changed = true;
@@ -609,6 +697,11 @@ impl App {
                         }
                         if !self.quick_context_style_changed {
                             self.quick_context_minimal = snapshot.quick_context_minimal;
+                        }
+                        if !self.clipboard_monitor_changed {
+                            self.clipboard_monitor_enabled = snapshot.clipboard_monitor_enabled;
+                            CLIPBOARD_MONITOR_ENABLED
+                                .store(snapshot.clipboard_monitor_enabled, Ordering::Release);
                         }
                         self.snapshot = Some(snapshot);
                         self.thumbnails.clear();
@@ -752,6 +845,12 @@ impl App {
                 "Capturar clipboard"
             })
             .on_press(Message::CaptureClipboard),
+            button(if self.clipboard_monitor_enabled {
+                "Auto: ligada"
+            } else {
+                "Auto: desligada"
+            })
+            .on_press(Message::ToggleClipboardMonitor),
             button(if self.dark {
                 "Tema claro"
             } else {
@@ -768,6 +867,11 @@ impl App {
             search
         ]
         .spacing(18);
+        if self.clipboard_monitor_enabled {
+            content = content.push(
+                text("Capturas novas são salvas localmente; imagens seguem a preferência de captura de telas.").size(11),
+            );
+        }
         if self.loading {
             content = content.push(text("Carregando biblioteca…"));
         } else if let Some(error) = &self.error {
@@ -1345,6 +1449,32 @@ fn tray_events() -> impl iced::futures::Stream<Item = Message> {
     )
 }
 
+fn clipboard_events() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        8,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::{channel::mpsc, sink::SinkExt, StreamExt};
+            let (sender, mut receiver) = mpsc::unbounded();
+            let _ = CLIPBOARD_EVENT_SENDER.set(Mutex::new(Some(sender)));
+            while let Some(message) = receiver.next().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
+fn send_clipboard_message(message: Message) {
+    if let Some(sender) = CLIPBOARD_EVENT_SENDER.get() {
+        if let Ok(sender) = sender.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.unbounded_send(message);
+            }
+        }
+    }
+}
+
 fn send_tray_message(message: Message) {
     if let Some(sender) = TRAY_EVENT_SENDER.get() {
         if let Ok(sender) = sender.lock() {
@@ -1536,6 +1666,7 @@ fn demo_snapshot() -> Snapshot {
         dark: true,
         quick_paste_minimal: true,
         quick_context_minimal: true,
+        clipboard_monitor_enabled: false,
     }
 }
 
@@ -1579,12 +1710,16 @@ fn save_theme_preference(dark: bool) -> Result<(), String> {
 }
 
 fn save_window_style_preference(key: &str, value: &str) -> Result<(), String> {
-    let (path, database_key) = default_database_credentials()?;
-    let conn = open_existing_read_write(&path, &database_key)?;
-    save_window_style_preference_in(&conn, key, value)
+    save_setting_value(key, value)
 }
 
-fn save_window_style_preference_in(
+fn save_setting_value(key: &str, value: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &database_key)?;
+    save_setting_value_in(&conn, key, value)
+}
+
+fn save_setting_value_in(
     conn: &rusqlite::Connection,
     key: &str,
     value: &str,
@@ -1673,6 +1808,9 @@ fn remove_capture_from_context_in(
 }
 
 fn capture_current_clipboard() -> Result<String, String> {
+    let _capture_session = CAPTURE_COORDINATOR
+        .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+        .begin()?;
     let appdata = dirs::data_dir().ok_or("Diretório de dados do Windows indisponível.")?;
     let app_dir = appdata.join("com.scryppy.desktop");
     let database_key = keyring::Entry::new("Scryppy", "database-key-v1")
@@ -1691,6 +1829,64 @@ fn capture_current_clipboard() -> Result<String, String> {
     scrypuppy_core::capture_store::save_clipboard_capture(&mut conn, &app_dir, &snapshot, "capture")
 }
 
+fn capture_monitored_clipboard() -> Result<Option<String>, String> {
+    if !CLIPBOARD_MONITOR_ENABLED.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let _capture_session = CAPTURE_COORDINATOR
+        .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+        .begin()?;
+    let Ok((path, database_key)) = default_database_credentials() else {
+        return Ok(None);
+    };
+    let settings_conn = open_existing_read_only(&path, &database_key)?;
+    let enabled = read_boolean_setting(&settings_conn, "clipboard_monitor_enabled", false);
+    let include_images = read_boolean_setting(
+        &settings_conn,
+        "clipboard_monitor_capture_screenshots",
+        false,
+    );
+    drop(settings_conn);
+    if !enabled || !CLIPBOARD_MONITOR_ENABLED.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+
+    let clipboard = scrypuppy_core::clipboard::ClipboardService::start()?;
+    let read = clipboard.read();
+    clipboard.shutdown();
+    let Some(mut snapshot) = read? else {
+        return Ok(None);
+    };
+    if !include_images {
+        snapshot.representations.retain(|representation| {
+            !matches!(
+                representation,
+                scrypuppy_core::clipboard::ClipboardRepresentation::Image(_)
+            )
+        });
+    }
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    match scrypuppy_core::capture_store::save_clipboard_capture_with_origin(
+        &mut conn,
+        app_dir,
+        &snapshot,
+        "capture",
+        "clipboard_monitor",
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(error)
+            if error == "DUPLICATE_CAPTURE_IGNORED"
+                || error == "O clipboard nao retornou conteudo para salvar." =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn paste_saved_capture(capture_id: String, target: isize) -> Result<(), String> {
     if target == 0 {
         return Err("Janela de destino indisponível; abra o Quick Paste pelo atalho no aplicativo de origem.".into());
@@ -1706,8 +1902,18 @@ fn paste_saved_capture(capture_id: String, target: isize) -> Result<(), String> 
     let capture = scrypuppy_core::library::get_capture_by_id(&conn, &capture_id)?;
     let snapshot = scrypuppy_core::restore::snapshot_from_capture(&capture)?;
     let clipboard = scrypuppy_core::clipboard::ClipboardService::start()?;
+    let coordinator =
+        CAPTURE_COORDINATOR.get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
+    let suppression = coordinator.suppress_monitor();
     let write = clipboard.write(snapshot);
     clipboard.shutdown();
+    if write.is_ok() {
+        #[cfg(windows)]
+        coordinator.mark_internal_sequence(unsafe {
+            windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+        });
+    }
+    drop(suppression);
     write?;
 
     #[cfg(windows)]
@@ -1820,6 +2026,7 @@ fn load_library(
         .unwrap_or(true);
     let quick_paste_minimal = read_style_preference(&conn, "iced_quick_paste_style");
     let quick_context_minimal = read_style_preference(&conn, "iced_quick_context_style");
+    let clipboard_monitor_enabled = read_boolean_setting(&conn, "clipboard_monitor_enabled", false);
     Ok(Snapshot {
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
@@ -1831,6 +2038,7 @@ fn load_library(
         dark,
         quick_paste_minimal,
         quick_context_minimal,
+        clipboard_monitor_enabled,
     })
 }
 
@@ -1840,6 +2048,14 @@ fn read_style_preference(conn: &rusqlite::Connection, key: &str) -> bool {
     })
     .map(|value| value != "normal")
     .unwrap_or(true)
+}
+
+fn read_boolean_setting(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .map(|value| value == "true")
+    .unwrap_or(default)
 }
 
 fn previews(
@@ -1982,7 +2198,18 @@ mod tests {
             &write_conn,
             "iced_quick_context_style"
         ));
-        save_window_style_preference_in(&write_conn, "iced_quick_paste_style", "normal").unwrap();
+        assert!(!read_boolean_setting(
+            &write_conn,
+            "clipboard_monitor_enabled",
+            false
+        ));
+        save_setting_value_in(&write_conn, "clipboard_monitor_enabled", "true").unwrap();
+        assert!(read_boolean_setting(
+            &write_conn,
+            "clipboard_monitor_enabled",
+            false
+        ));
+        save_setting_value_in(&write_conn, "iced_quick_paste_style", "normal").unwrap();
         assert!(!read_style_preference(
             &write_conn,
             "iced_quick_paste_style"

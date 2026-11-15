@@ -47,6 +47,16 @@ pub fn save_clipboard_capture(
     snapshot: &ClipboardSnapshot,
     capture_kind: &str,
 ) -> Result<String, String> {
+    save_clipboard_capture_with_origin(conn, app_dir, snapshot, capture_kind, "explicit_hotkey")
+}
+
+pub fn save_clipboard_capture_with_origin(
+    conn: &mut Connection,
+    app_dir: &Path,
+    snapshot: &ClipboardSnapshot,
+    capture_kind: &str,
+    capture_origin: &str,
+) -> Result<String, String> {
     let content_text = snapshot.content_text();
     if snapshot.is_empty()
         || (content_text.trim().is_empty()
@@ -87,7 +97,7 @@ pub fn save_clipboard_capture(
         committed: false,
     };
     let metadata = json!({
-        "capture_origin": "explicit_hotkey",
+        "capture_origin": capture_origin,
         "capture_source": "iced",
         "image_dimensions": snapshot.image_dimensions(),
     });
@@ -428,8 +438,16 @@ mod tests {
             ],
             formats: vec![],
         };
-        let id = save_clipboard_capture(&mut conn, dir.path(), &snapshot, "capture").unwrap();
+        let id = save_clipboard_capture_with_origin(
+            &mut conn,
+            dir.path(),
+            &snapshot,
+            "capture",
+            "clipboard_monitor",
+        )
+        .unwrap();
         let capture = get_capture_by_id(&conn, &id).unwrap();
+        assert_eq!(capture.metadata["capture_origin"], "clipboard_monitor");
         assert_eq!(capture.content_text, "report.txt");
         assert_eq!(capture.representations.len(), 4);
         assert_eq!(
