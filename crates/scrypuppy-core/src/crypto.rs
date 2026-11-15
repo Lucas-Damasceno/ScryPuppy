@@ -5,10 +5,10 @@ use aes_gcm::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub(crate) const CONTEXT_FILE_MAGIC: &[u8] = b"CLIPSCRY-CONTEXT-1\0";
+pub const CONTEXT_FILE_MAGIC: &[u8] = b"CLIPSCRY-CONTEXT-1\0";
 const CONTEXT_FILE_AAD: &[u8] = b"Scryppy encrypted context v1";
 
-pub(crate) fn encrypt_context_file(markdown: &str, hex_key: &str) -> Result<Vec<u8>, String> {
+pub fn encrypt_context_file(markdown: &str, hex_key: &str) -> Result<Vec<u8>, String> {
     let key = hex_key_to_bytes(hex_key)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|error| error.to_string())?;
     let uuid = Uuid::new_v4();
@@ -29,7 +29,7 @@ pub(crate) fn encrypt_context_file(markdown: &str, hex_key: &str) -> Result<Vec<
     Ok(output)
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 

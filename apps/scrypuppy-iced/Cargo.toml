@@ -1,0 +1,21 @@
+[package]
+name = "scrypuppy-iced"
+version = "1.0.0-beta.12"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = "0.4"
+dirs = "6"
+enigo = "0.2.1"
+global-hotkey = "=0.8.0"
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs"] }
+keyring = "4.1.4"
+scrypuppy-core = { path = "../../crates/scrypuppy-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+tempfile = "3"

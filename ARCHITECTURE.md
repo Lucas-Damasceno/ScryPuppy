@@ -62,8 +62,8 @@ Each secondary window has a minimal capability file in `src-tauri/capabilities/`
 - `src-tauri/src/lib.rs` — commands, database initialization, migrations, capture orchestration, OCR scheduling, Windows integration, and window lifecycle.
 - `src-tauri/src/app_error.rs` — serializable command errors, non-error notices, safe parameters, and the isolated legacy domain-error bridge.
 - `src-tauri/src/clipboard_monitor.rs` — Windows message-only listener, sequence handling, queue, and persistence worker.
-- `src-tauri/src/ai.rs` — provider catalog and AI adapters.
-- `src-tauri/src/crypto.rs` — export encryption and hashing helpers.
+- `crates/scrypuppy-core` — UI-independent clipboard service and models, library read queries, SQLCipher connection setup, provider adapters, error contracts, encryption, preview primitives, and local search model management. The Tauri shell and the in-development Iced workspace share this crate.
+- `apps/scrypuppy-iced` — in-development Iced workspace. It opens the existing encrypted library, supports paged search, capture, clipboard restore, Context assignment changes, local image/TXT previews, and a persisted theme preference. It does not yet replace the shipping application; the remaining parity and release blockers are tracked in its README.
 - `src-tauri/src/main.rs` — process entry point.
 
 The frontend deliberately uses React state and hooks rather than a second global state framework.

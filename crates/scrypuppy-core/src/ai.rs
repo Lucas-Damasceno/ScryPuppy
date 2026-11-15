@@ -5,19 +5,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct ProviderOption {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) models: Vec<ModelOption>,
+pub struct ProviderOption {
+    pub id: String,
+    pub name: String,
+    pub models: Vec<ModelOption>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct ModelOption {
-    pub(crate) id: String,
-    pub(crate) name: String,
+pub struct ModelOption {
+    pub id: String,
+    pub name: String,
 }
 
-pub(crate) fn provider_options() -> Vec<ProviderOption> {
+pub fn provider_options() -> Vec<ProviderOption> {
     vec![
         provider(
             "deepseek",
@@ -80,7 +80,7 @@ pub(crate) fn provider_options() -> Vec<ProviderOption> {
     ]
 }
 
-pub(crate) fn default_model(provider_id: &str) -> String {
+pub fn default_model(provider_id: &str) -> String {
     provider_options()
         .into_iter()
         .find(|provider| provider.id == provider_id)
@@ -88,7 +88,7 @@ pub(crate) fn default_model(provider_id: &str) -> String {
         .unwrap_or_else(|| "deepseek-v4-flash".into())
 }
 
-pub(crate) fn call_provider(
+pub fn call_provider(
     provider: &str,
     api_key: &str,
     model: &str,

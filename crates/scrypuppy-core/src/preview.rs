@@ -1,0 +1,391 @@
+//! Bounded, local-only primitives for rendering clipboard previews.
+//!
+//! Image decoding and text extraction operate on bytes. Managed asset reads are
+//! bounded and must run on a worker; no function intentionally accesses the network.
+use std::{
+    fs,
+    io::{Cursor, Read},
+    path::{Component, Path},
+};
+
+use image::{ImageFormat, ImageReader, Limits};
+
+pub const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+const THUMBNAIL_BOUND: u32 = 512;
+const TEXT_CHARACTERS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewError {
+    TooLarge,
+    InvalidText,
+    UnsupportedImage,
+    InvalidDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePreview {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Read only an application-managed asset from a local, non-reparse path.
+/// Original file references and UNC paths are intentionally excluded.
+pub fn read_managed_asset(root: &Path, path: &Path) -> Result<Vec<u8>, PreviewError> {
+    if !root.is_absolute()
+        || !path.is_absolute()
+        || crate::clipboard::is_network_path(root)
+        || crate::clipboard::is_network_path(path)
+        || !local_drive(root)
+    {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    // Inspect ancestors first so a junction/symlink cannot direct a normal asset
+    // lookup into a network location or another directory.
+    for ancestor in root.ancestors().filter(|p| p.parent().is_some()) {
+        reject_reparse(ancestor)?;
+    }
+    let mut checked = root.to_path_buf();
+    for part in relative.components() {
+        checked.push(part);
+        reject_reparse(&checked)?;
+    }
+    let file = fs::File::open(path).map_err(|_| PreviewError::UnsupportedImage)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    if !metadata.is_file() {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    if metadata.len() > MAX_INPUT_BYTES as u64 {
+        return Err(PreviewError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Read a bounded local file reference for an on-device preview. Network paths,
+/// reparse points, relative paths, and non-local drives are rejected.
+pub fn read_local_file_preview(path: &Path) -> Result<Vec<u8>, PreviewError> {
+    if !path.is_absolute()
+        || crate::clipboard::is_network_path(path)
+        || !local_drive(path)
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    for ancestor in path.ancestors().filter(|part| part.parent().is_some()) {
+        reject_reparse(ancestor)?;
+    }
+    let file = fs::File::open(path).map_err(|_| PreviewError::UnsupportedImage)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    if !metadata.is_file() {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    if metadata.len() > MAX_INPUT_BYTES as u64 {
+        return Err(PreviewError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+fn reject_reparse(path: &Path) -> Result<(), PreviewError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| PreviewError::UnsupportedImage)?;
+    if metadata.file_type().is_symlink() {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PreviewError::UnsupportedImage);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn local_drive(path: &Path) -> bool {
+    use std::{os::windows::ffi::OsStrExt, path::Prefix};
+    use windows::{core::PCWSTR, Win32::Storage::FileSystem::GetDriveTypeW};
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => d,
+        _ => return false,
+    };
+    let root = std::ffi::OsString::from(format!("{}:\\", drive as char));
+    let wide: Vec<u16> = root.encode_wide().chain(Some(0)).collect();
+    // Unknown, missing, and remote drives fail closed.
+    !matches!(unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) }, 0 | 1 | 4)
+}
+
+#[cfg(not(windows))]
+fn local_drive(_: &Path) -> bool {
+    true
+}
+
+/// Generate a UTF-8 text excerpt without splitting a character.
+pub fn text_excerpt(bytes: &[u8]) -> Result<String, PreviewError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| PreviewError::InvalidText)?;
+    Ok(text
+        .trim_start_matches('\u{feff}')
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .take(TEXT_CHARACTERS)
+        .collect())
+}
+
+/// Extract a short local text preview from the main WordprocessingML document
+/// in a DOCX archive. Both the archive and its expanded document part are bounded.
+pub fn docx_excerpt(bytes: &[u8]) -> Result<String, PreviewError> {
+    const MAX_DOCUMENT_XML_BYTES: usize = 2 * 1024 * 1024;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| PreviewError::InvalidDocument)?;
+    let document = archive
+        .by_name("word/document.xml")
+        .map_err(|_| PreviewError::InvalidDocument)?;
+    if document.size() > MAX_DOCUMENT_XML_BYTES as u64 {
+        return Err(PreviewError::TooLarge);
+    }
+    let mut xml = Vec::with_capacity(document.size() as usize);
+    document
+        .take(MAX_DOCUMENT_XML_BYTES as u64 + 1)
+        .read_to_end(&mut xml)
+        .map_err(|_| PreviewError::InvalidDocument)?;
+    if xml.len() > MAX_DOCUMENT_XML_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut excerpt = String::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Text(text)) => {
+                let decoded = text.decode().map_err(|_| PreviewError::InvalidDocument)?;
+                excerpt.push_str(&decoded);
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                if let Some(character) = reference
+                    .resolve_char_ref()
+                    .map_err(|_| PreviewError::InvalidDocument)?
+                {
+                    excerpt.push(character);
+                } else {
+                    let entity = reference
+                        .decode()
+                        .map_err(|_| PreviewError::InvalidDocument)?;
+                    if let Some(replacement) = quick_xml::escape::resolve_predefined_entity(&entity)
+                    {
+                        excerpt.push_str(replacement);
+                    } else {
+                        return Err(PreviewError::InvalidDocument);
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::CData(text)) => {
+                let decoded = text.decode().map_err(|_| PreviewError::InvalidDocument)?;
+                excerpt.push_str(&decoded);
+            }
+            Ok(quick_xml::events::Event::End(tag)) => {
+                let name = tag.name();
+                let local = name
+                    .as_ref()
+                    .rsplit(|byte| *byte == b':')
+                    .next()
+                    .unwrap_or_default();
+                if local == b"p" && !excerpt.ends_with('\n') {
+                    excerpt.push('\n');
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(tag)) => {
+                let name = tag.name();
+                let local = name
+                    .as_ref()
+                    .rsplit(|byte| *byte == b':')
+                    .next()
+                    .unwrap_or_default();
+                if local == b"tab" {
+                    excerpt.push('\t');
+                } else if local == b"br" {
+                    excerpt.push('\n');
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => return Err(PreviewError::InvalidDocument),
+            _ => {}
+        }
+        if excerpt.chars().count() > 1024 {
+            break;
+        }
+        buffer.clear();
+    }
+    Ok(excerpt
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .take(TEXT_CHARACTERS)
+        .collect())
+}
+
+/// Decode an image with strict allocation/dimension bounds and emit a PNG thumbnail.
+pub fn image_thumbnail(bytes: &[u8]) -> Result<ImagePreview, PreviewError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    reader.limits(limits);
+    let original = reader
+        .decode()
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    let image = if original.width() <= THUMBNAIL_BOUND && original.height() <= THUMBNAIL_BOUND {
+        original
+    } else {
+        original.thumbnail(THUMBNAIL_BOUND, THUMBNAIL_BOUND)
+    };
+    let (width, height) = (image.width(), image.height());
+    let mut output = Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    Ok(ImagePreview {
+        png: output.into_inner(),
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, RgbaImage};
+
+    #[test]
+    fn text_is_bounded_and_unicode_safe() {
+        let input = format!("\u{feff}{}\0end", "á".repeat(600));
+        let output = text_excerpt(input.as_bytes()).unwrap();
+        assert_eq!(output.chars().count(), 512);
+        assert!(output.chars().all(|c| c == 'á'));
+        assert_eq!(text_excerpt(&[0xff]), Err(PreviewError::InvalidText));
+    }
+
+    #[test]
+    fn docx_preview_extracts_bounded_paragraph_text_and_unescapes_xml() {
+        use zip::{write::SimpleFileOptions, ZipWriter};
+
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(
+            &mut archive,
+            r#"<w:document xmlns:w="urn:w"><w:body><w:p><w:r><w:t>Olá &amp; bem-vinda</w:t></w:r></w:p><w:p><w:r><w:tab/><w:t>segunda linha</w:t></w:r></w:p></w:body></w:document>"#
+                .as_bytes(),
+        )
+        .unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        assert_eq!(
+            docx_excerpt(&bytes).unwrap(),
+            "Olá & bem-vinda\n\tsegunda linha\n"
+        );
+        assert_eq!(
+            docx_excerpt(b"not a docx"),
+            Err(PreviewError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn large_and_malformed_inputs_are_rejected() {
+        let input = vec![0; MAX_INPUT_BYTES + 1];
+        assert_eq!(text_excerpt(&input), Err(PreviewError::TooLarge));
+        assert_eq!(image_thumbnail(&input), Err(PreviewError::TooLarge));
+        assert_eq!(
+            image_thumbnail(b"not an image"),
+            Err(PreviewError::UnsupportedImage)
+        );
+    }
+
+    #[test]
+    fn image_preview_preserves_aspect_ratio_and_is_png() {
+        let original = DynamicImage::ImageRgba8(RgbaImage::new(1024, 256));
+        let mut bytes = Cursor::new(Vec::new());
+        original.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let preview = image_thumbnail(bytes.get_ref()).unwrap();
+        assert_eq!((preview.width, preview.height), (512, 128));
+        assert_eq!(image::guess_format(&preview.png).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn ico_favicon_is_converted_to_png() {
+        let original = DynamicImage::ImageRgba8(RgbaImage::new(32, 32));
+        let mut bytes = Cursor::new(Vec::new());
+        original.write_to(&mut bytes, ImageFormat::Ico).unwrap();
+        let preview = image_thumbnail(bytes.get_ref()).unwrap();
+        assert_eq!((preview.width, preview.height), (32, 32));
+        assert_eq!(image::guess_format(&preview.png).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn only_reads_bounded_files_within_the_managed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("assets");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("saved.png");
+        fs::write(&path, b"example").unwrap();
+        assert_eq!(read_managed_asset(&root, &path).unwrap(), b"example");
+        assert_eq!(read_local_file_preview(&path).unwrap(), b"example");
+        assert!(read_local_file_preview(Path::new(r"\\server\share\document.docx")).is_err());
+        let outside = dir.path().join("outside.png");
+        fs::write(&outside, b"secret").unwrap();
+        assert!(read_managed_asset(&root, &outside).is_err());
+        assert!(read_managed_asset(&root, &root.join("..").join("outside.png")).is_err());
+        let huge = fs::File::create(root.join("huge.png")).unwrap();
+        huge.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
+        assert_eq!(
+            read_managed_asset(&root, &root.join("huge.png")),
+            Err(PreviewError::TooLarge)
+        );
+    }
+}

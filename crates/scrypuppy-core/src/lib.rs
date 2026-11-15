@@ -1,0 +1,18 @@
+//! Domain services independent of the desktop UI runtime.
+pub mod ai;
+pub mod app_error;
+pub mod capture_store;
+pub mod clipboard;
+pub mod context_exports;
+pub mod contexts;
+pub mod coordination;
+pub mod crypto;
+pub mod library;
+pub mod link_fetch;
+pub mod link_metadata;
+pub mod local_search;
+pub mod monitor;
+pub mod preview;
+pub mod restore;
+pub mod search_index;
+pub mod storage;

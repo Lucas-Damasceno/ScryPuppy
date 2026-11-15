@@ -4,14 +4,11 @@ compile_error!(
 );
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    fs::{self, File, OpenOptions},
+    collections::{HashMap, HashSet},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex,
-    },
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::Duration,
 };
@@ -33,24 +30,29 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindowBuilder, WindowEven
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, ShortcutState};
 use uuid::Uuid;
 
-mod ai;
-mod app_error;
-mod clipboard;
 mod clipboard_monitor;
-mod crypto;
-mod local_search;
 use ai::ProviderOption as AiProviderOption;
 use app_error::{command_result, AppError, AppNotice, CommandResult};
 use clipboard::{
-    ClipboardFile, ClipboardFileAvailability, ClipboardFileKind, ClipboardImage,
-    ClipboardRepresentation, ClipboardRepresentationKind, ClipboardService, ClipboardSnapshot,
+    ClipboardFile, ClipboardFileAvailability, ClipboardFileKind, ClipboardRepresentation,
+    ClipboardRepresentationKind, ClipboardService, ClipboardSnapshot,
 };
 use clipboard_monitor::ClipboardMonitorHandle;
-use crypto::{encrypt_context_file, sha256_hex};
+use crypto::sha256_hex;
 use local_search::{
     cosine_similarity, decode_embedding, encode_embedding, normalize_embedding, LocalSearchManager,
     LocalSearchPhase, LocalSearchStatus, INDEX_VERSION, MODEL_DIMENSIONS, MODEL_ID,
 };
+use scrypuppy_core::context_exports;
+use scrypuppy_core::contexts::{validate_capture_exists, validate_user_context_exists};
+use scrypuppy_core::coordination::{CaptureCoordinator, ClipboardMonitorSuppression};
+use scrypuppy_core::library::{
+    capture_base_from_row, count_captures_from_conn, default_capture_filter, get_capture_by_id,
+    hydrate_captures, list_captures_from_conn, CaptureAssetDto, CaptureDto, CaptureFilter,
+    CaptureOcrDto, CapturePageDto, CategoryDto, ContextDto,
+};
+use scrypuppy_core::storage::apply_database_key;
+use scrypuppy_core::{ai, app_error, clipboard, crypto, local_search};
 
 #[cfg(target_os = "windows")]
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -115,9 +117,7 @@ struct AppState {
     app_dir: PathBuf,
     database_key: String,
     context_key: String,
-    capture_gate: Arc<Mutex<CaptureGate>>,
-    ignored_clipboard_sequences: Arc<Mutex<SequenceSuppression>>,
-    clipboard_monitor_suppressions: Arc<AtomicUsize>,
+    capture_coordinator: CaptureCoordinator,
     clipboard: Arc<ClipboardService>,
     clipboard_monitor: Arc<ClipboardMonitorHandle>,
     ocr_worker_running: Arc<Mutex<bool>>,
@@ -125,85 +125,18 @@ struct AppState {
     local_search: Arc<LocalSearchManager>,
 }
 
-struct CaptureGate {
-    in_progress: bool,
-}
-
-#[derive(Default)]
-struct SequenceSuppression {
-    values: VecDeque<u32>,
-}
-
-impl SequenceSuppression {
-    const MAX_VALUES: usize = 64;
-
-    fn record(&mut self, sequence: u32) {
-        self.values.retain(|value| *value != sequence);
-        self.values.push_back(sequence);
-        while self.values.len() > Self::MAX_VALUES {
-            self.values.pop_front();
-        }
-    }
-
-    fn consume(&mut self, sequence: u32) -> bool {
-        let Some(index) = self.values.iter().position(|value| *value == sequence) else {
-            return false;
-        };
-        self.values.remove(index);
-        true
-    }
-}
-
 impl AppState {
     fn ignore_clipboard_sequence(&self, sequence: u32) {
-        if let Ok(mut values) = self.ignored_clipboard_sequences.lock() {
-            values.record(sequence);
-        }
+        self.capture_coordinator.mark_internal_sequence(sequence);
     }
-
     fn consume_ignored_clipboard_sequence(&self, sequence: u32) -> bool {
-        self.ignored_clipboard_sequences
-            .lock()
-            .map(|mut values| values.consume(sequence))
-            .unwrap_or(false)
+        self.capture_coordinator.consume_internal_sequence(sequence)
     }
-
     fn suppress_clipboard_monitor(&self) -> ClipboardMonitorSuppression {
-        ClipboardMonitorSuppression::acquire(self.clipboard_monitor_suppressions.clone())
+        self.capture_coordinator.suppress_monitor()
     }
-
     fn clipboard_monitor_is_suppressed(&self) -> bool {
-        self.clipboard_monitor_suppressions.load(Ordering::Acquire) > 0
-    }
-}
-
-struct ClipboardMonitorSuppression {
-    count: Arc<AtomicUsize>,
-}
-
-impl ClipboardMonitorSuppression {
-    fn acquire(count: Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
-        Self { count }
-    }
-}
-
-impl Drop for ClipboardMonitorSuppression {
-    fn drop(&mut self) {
-        let previous = self.count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "clipboard monitor suppression underflow");
-    }
-}
-
-struct CaptureSession {
-    gate: Arc<Mutex<CaptureGate>>,
-}
-
-impl Drop for CaptureSession {
-    fn drop(&mut self) {
-        if let Ok(mut gate) = self.gate.lock() {
-            gate.in_progress = false;
-        }
+        self.capture_coordinator.monitor_is_suppressed()
     }
 }
 
@@ -227,126 +160,6 @@ impl AppState {
     fn clipboard_files_dir(&self) -> PathBuf {
         self.app_dir.join("assets").join("clipboard-files")
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ContextDto {
-    id: String,
-    name: String,
-    normalized_name: String,
-    slug: String,
-    created_at: String,
-    updated_at: String,
-    capture_count: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ContextAssignmentDto {
-    id: String,
-    name: String,
-    normalized_name: String,
-    slug: String,
-    created_at: String,
-    updated_at: String,
-    capture_count: i64,
-    assignment_origin: String,
-    confidence: Option<f64>,
-    assigned_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CategoryDto {
-    tag: String,
-    capture_count: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureAssetDto {
-    id: String,
-    kind: String,
-    path: Option<String>,
-    status: String,
-    error: Option<String>,
-    created_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureRepresentationDto {
-    id: String,
-    kind: String,
-    format_name: String,
-    mime_type: Option<String>,
-    text_content: Option<String>,
-    asset_path: Option<String>,
-    size_bytes: Option<i64>,
-    sha256: Option<String>,
-    restorable: bool,
-    metadata: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureFileDto {
-    id: String,
-    representation_id: String,
-    ordinal: i64,
-    display_name: String,
-    original_path: Option<String>,
-    local_path: Option<String>,
-    entry_kind: String,
-    extension: Option<String>,
-    size_bytes: Option<i64>,
-    sha256: Option<String>,
-    availability: String,
-    metadata: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureClipboardFormatDto {
-    id: i64,
-    name: String,
-    supported: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureDto {
-    id: String,
-    content_text: String,
-    captured_at: String,
-    source_app_name: Option<String>,
-    source_app_id: Option<String>,
-    source_process_id: Option<i64>,
-    source_process_path: Option<String>,
-    window_title: Option<String>,
-    window_id: Option<String>,
-    platform: String,
-    kind: String,
-    content_kind: String,
-    metadata: Value,
-    assets: Vec<CaptureAssetDto>,
-    representations: Vec<CaptureRepresentationDto>,
-    files: Vec<CaptureFileDto>,
-    clipboard_formats: Vec<CaptureClipboardFormatDto>,
-    tags: Vec<String>,
-    entities: Vec<CaptureEntityDto>,
-    ocr: Option<CaptureOcrDto>,
-    contexts: Vec<ContextAssignmentDto>,
-}
-
-#[derive(Debug, Serialize)]
-struct CapturePageDto {
-    items: Vec<CaptureDto>,
-    total: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct CaptureFilter {
-    context_id: Option<String>,
-    search: Option<String>,
-    tag: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    #[serde(default)]
-    exclude_references: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -570,23 +383,6 @@ struct CaptureErrorEvent {
     error: AppError,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureEntityDto {
-    id: String,
-    kind: String,
-    value: String,
-    source: String,
-    confidence: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CaptureOcrDto {
-    status: String,
-    text: Option<String>,
-    error: Option<String>,
-    updated_at: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct CategorizeRequest {
     days: Option<i64>,
@@ -763,168 +559,6 @@ async fn copy_capture_to_clipboard(state: State<'_, AppState>, id: String) -> Co
     )
 }
 
-fn default_capture_filter() -> CaptureFilter {
-    CaptureFilter {
-        context_id: None,
-        search: None,
-        tag: None,
-        limit: None,
-        offset: None,
-        exclude_references: false,
-    }
-}
-
-struct CaptureQueryParts {
-    where_clause: String,
-    args: Vec<String>,
-    search_pattern: Option<String>,
-}
-
-fn capture_query_parts(filter: &CaptureFilter) -> CaptureQueryParts {
-    let mut args = Vec::new();
-    let mut where_parts = Vec::new();
-
-    if filter.exclude_references {
-        where_parts.push("c.capture_kind <> 'reference'".to_string());
-    }
-
-    if let Some(context_id) = filter
-        .context_id
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        if context_id == INBOX_CONTEXT_ID {
-            where_parts.push("c.capture_kind <> 'reference' AND NOT EXISTS (SELECT 1 FROM capture_contexts icc WHERE icc.capture_id = c.id)".to_string());
-        } else if context_id == KNOWLEDGE_BASE_CONTEXT_ID {
-            where_parts.push("c.capture_kind = 'reference'".to_string());
-        } else {
-            where_parts.push("EXISTS (SELECT 1 FROM capture_contexts fcc WHERE fcc.capture_id = c.id AND fcc.context_id = ?)".to_string());
-            args.push(context_id.clone());
-        }
-    }
-
-    let mut search_pattern = None;
-    if let Some(search) = filter
-        .search
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        where_parts.push(
-            "(c.content_text LIKE ?
-              OR EXISTS (SELECT 1 FROM capture_representations sr WHERE sr.capture_id = c.id AND sr.text_content LIKE ?)
-              OR EXISTS (SELECT 1 FROM capture_file_entries sf WHERE sf.capture_id = c.id AND (sf.display_name LIKE ? OR sf.extension LIKE ?))
-              OR o.text LIKE ?
-              OR c.source_app_name LIKE ?
-              OR c.window_title LIKE ?
-              OR EXISTS (SELECT 1 FROM capture_tags st WHERE st.capture_id = c.id AND st.tag LIKE ?)
-              OR EXISTS (SELECT 1 FROM capture_entities se WHERE se.capture_id = c.id AND se.value LIKE ?)
-              OR EXISTS (SELECT 1 FROM capture_contexts scc
-                         JOIN contexts sco ON sco.id = scc.context_id
-                         WHERE scc.capture_id = c.id AND sco.name LIKE ?))"
-                .to_string(),
-        );
-        let pattern = format!("%{}%", search.trim());
-        for _ in 0..10 {
-            args.push(pattern.clone());
-        }
-        search_pattern = Some(pattern);
-    }
-
-    if let Some(tag) = filter.tag.as_ref().filter(|value| !value.trim().is_empty()) {
-        where_parts.push(
-            "EXISTS (SELECT 1 FROM capture_tags ct WHERE ct.capture_id = c.id AND ct.tag = ?)"
-                .to_string(),
-        );
-        args.push(tag.clone());
-    }
-
-    CaptureQueryParts {
-        where_clause: if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        },
-        args,
-        search_pattern,
-    }
-}
-
-fn list_captures_from_conn(
-    conn: &Connection,
-    filter: &CaptureFilter,
-) -> Result<Vec<CaptureDto>, String> {
-    let limit = filter.limit.unwrap_or(200).clamp(1, 500);
-    let offset = filter.offset.unwrap_or(0);
-
-    let mut sql = String::from(
-        "SELECT c.id, c.content_text, c.captured_at,
-                c.source_app_name, c.source_app_id, c.source_process_id,
-                c.source_process_path, c.window_title, c.window_id, c.platform,
-                c.metadata_json, c.capture_kind
-         FROM captures c
-         LEFT JOIN capture_ocr o ON o.capture_id = c.id",
-    );
-    let parts = capture_query_parts(filter);
-    sql.push_str(&parts.where_clause);
-    let mut args = parts.args;
-
-    if let Some(pattern) = parts.search_pattern {
-        sql.push_str(
-            " ORDER BY CASE
-                WHEN lower(c.content_text) LIKE lower(?)
-                  OR EXISTS (SELECT 1 FROM capture_representations rr WHERE rr.capture_id = c.id AND lower(rr.text_content) LIKE lower(?))
-                  OR EXISTS (SELECT 1 FROM capture_file_entries rf WHERE rf.capture_id = c.id AND (lower(rf.display_name) LIKE lower(?) OR lower(rf.extension) LIKE lower(?))) THEN 5
-                WHEN lower(o.text) LIKE lower(?) THEN 4
-                WHEN lower(c.source_app_name) LIKE lower(?) OR lower(c.window_title) LIKE lower(?) THEN 3
-                WHEN EXISTS (SELECT 1 FROM capture_tags ot WHERE ot.capture_id = c.id AND lower(ot.tag) LIKE lower(?))
-                  OR EXISTS (SELECT 1 FROM capture_entities oe WHERE oe.capture_id = c.id AND lower(oe.value) LIKE lower(?)) THEN 2
-                WHEN EXISTS (SELECT 1 FROM capture_contexts occ
-                             JOIN contexts oco ON oco.id = occ.context_id
-                             WHERE occ.capture_id = c.id AND lower(oco.name) LIKE lower(?)) THEN 1
-                ELSE 0 END DESC, c.captured_at DESC",
-        );
-        for _ in 0..10 {
-            args.push(pattern.clone());
-        }
-    } else {
-        sql.push_str(" ORDER BY c.captured_at DESC");
-    }
-    sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
-
-    let arg_refs: Vec<&dyn rusqlite::ToSql> = args
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    let mut stmt = conn.prepare(&sql).map_err(err)?;
-    let mut captures = stmt
-        .query_map(&arg_refs[..], capture_base_from_row)
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    hydrate_captures(conn, &mut captures)?;
-
-    Ok(captures)
-}
-
-fn count_captures_from_conn(conn: &Connection, filter: &CaptureFilter) -> Result<usize, String> {
-    let parts = capture_query_parts(filter);
-    let sql = format!(
-        "SELECT COUNT(DISTINCT c.id)
-         FROM captures c
-         LEFT JOIN capture_ocr o ON o.capture_id = c.id{}",
-        parts.where_clause
-    );
-    let arg_refs: Vec<&dyn rusqlite::ToSql> = parts
-        .args
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    let count = conn
-        .query_row(&sql, &arg_refs[..], |row| row.get::<_, i64>(0))
-        .map_err(err)?;
-    Ok(count.max(0) as usize)
-}
-
 #[tauri::command]
 fn list_captures(
     state: State<AppState>,
@@ -1017,34 +651,7 @@ fn delete_capture(state: State<AppState>, id: String) -> CommandResult<()> {
 #[tauri::command]
 fn list_contexts(state: State<AppState>) -> CommandResult<Vec<ContextDto>> {
     let conn = open_conn(&state)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT co.id, co.name, co.normalized_name, co.slug, co.created_at, co.updated_at,
-                    COUNT(cc.capture_id) AS capture_count
-             FROM contexts co
-             LEFT JOIN capture_contexts cc ON cc.context_id = co.id
-             WHERE co.id NOT IN ('inbox', 'knowledge-base')
-             GROUP BY co.id
-             ORDER BY lower(co.name)",
-        )
-        .map_err(err)?;
-
-    let contexts = stmt
-        .query_map([], |row| {
-            Ok(ContextDto {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                normalized_name: row.get(2)?,
-                slug: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                capture_count: row.get(6)?,
-            })
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    Ok(contexts)
+    command_result(scrypuppy_core::library::list_contexts_from_conn(&conn))
 }
 
 #[tauri::command]
@@ -2236,20 +1843,7 @@ fn add_capture_contexts(
     context_ids: Vec<String>,
 ) -> CommandResult<()> {
     let mut conn = open_conn(&state)?;
-    let transaction = conn.transaction().map_err(err)?;
-    validate_capture_exists(&transaction, &capture_id)?;
-    for context_id in &context_ids {
-        validate_user_context_exists(&transaction, context_id)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO capture_contexts
-             (capture_id, context_id, assignment_origin, confidence, created_at)
-             VALUES (?, ?, 'manual', NULL, ?)",
-                params![&capture_id, context_id, now()],
-            )
-            .map_err(err)?;
-    }
-    transaction.commit().map_err(err)?;
+    scrypuppy_core::contexts::add_capture_contexts(&mut conn, &capture_id, &context_ids, now)?;
     sync_contexts_best_effort(&state, &context_ids);
     app.emit("capture-contexts-updated", &capture_id)
         .map_err(err)?;
@@ -2269,24 +1863,12 @@ fn add_captures_to_context(
     }
 
     let mut conn = open_conn(&state)?;
-    let transaction = conn.transaction().map_err(err)?;
-    validate_user_context_exists(&transaction, &context_id)?;
-    let assigned_at = now();
-    let mut added_count = 0;
-
-    for capture_id in &capture_ids {
-        validate_capture_exists(&transaction, capture_id)?;
-        added_count += transaction
-            .execute(
-                "INSERT OR IGNORE INTO capture_contexts
-                 (capture_id, context_id, assignment_origin, confidence, created_at)
-                 VALUES (?, ?, 'manual', NULL, ?)",
-                params![capture_id, &context_id, &assigned_at],
-            )
-            .map_err(err)?;
-    }
-
-    transaction.commit().map_err(err)?;
+    let added_count = scrypuppy_core::contexts::add_captures_to_context(
+        &mut conn,
+        &capture_ids,
+        &context_id,
+        &now(),
+    )?;
     sync_contexts_best_effort(&state, std::slice::from_ref(&context_id));
     app.emit("capture-contexts-updated", &context_id)
         .map_err(err)?;
@@ -2302,40 +1884,12 @@ fn remove_capture_context(
     context_id: String,
 ) -> CommandResult<()> {
     let conn = open_conn(&state)?;
-    validate_capture_exists(&conn, &capture_id)?;
-    conn.execute(
-        "DELETE FROM capture_contexts WHERE capture_id = ? AND context_id = ?",
-        params![capture_id, context_id],
-    )
-    .map_err(err)?;
+    scrypuppy_core::contexts::remove_capture_context(&conn, &capture_id, &context_id)?;
     sync_contexts_best_effort(&state, &[context_id]);
     app.emit("capture-contexts-updated", &capture_id)
         .map_err(err)?;
     refresh_search_index_best_effort(&app, &state, &capture_id);
     Ok(())
-}
-
-fn validate_capture_exists(conn: &Connection, capture_id: &str) -> CommandResult<()> {
-    let exists = conn
-        .query_row("SELECT 1 FROM captures WHERE id = ?", [capture_id], |_| {
-            Ok(())
-        })
-        .optional()
-        .map_err(err)?;
-    exists.ok_or_else(|| AppError::new("capture.not_found"))
-}
-
-fn validate_user_context_exists(conn: &Connection, context_id: &str) -> CommandResult<()> {
-    if context_id == INBOX_CONTEXT_ID || context_id == KNOWLEDGE_BASE_CONTEXT_ID {
-        return Err(AppError::new("context.reserved_collection"));
-    }
-    let exists = conn
-        .query_row("SELECT 1 FROM contexts WHERE id = ?", [context_id], |_| {
-            Ok(())
-        })
-        .optional()
-        .map_err(err)?;
-    exists.ok_or_else(|| AppError::new("context.not_found"))
 }
 
 #[tauri::command]
@@ -2966,98 +2520,8 @@ fn copy_capture_to_clipboard_core(state: &AppState, id: &str) -> Result<(), Stri
 }
 
 fn write_capture_to_clipboard(state: &AppState, capture: &CaptureDto) -> Result<(), String> {
-    let mut representations = Vec::new();
-    for representation in capture
-        .representations
-        .iter()
-        .filter(|representation| representation.restorable)
-    {
-        match representation.kind.as_str() {
-            "plain_text" => {
-                if let Some(value) = &representation.text_content {
-                    representations.push(ClipboardRepresentation::PlainText(value.clone()));
-                }
-            }
-            "html" => {
-                if let Some(value) = &representation.text_content {
-                    representations.push(ClipboardRepresentation::Html(value.clone()));
-                }
-            }
-            "rich_text" => {
-                if let Some(value) = &representation.text_content {
-                    representations.push(ClipboardRepresentation::RichText(value.clone()));
-                }
-            }
-            "url" => {
-                if let Some(value) = &representation.text_content {
-                    representations.push(ClipboardRepresentation::Url(value.clone()));
-                }
-            }
-            "image" => {
-                if let Some(path) = &representation.asset_path {
-                    let image = image::open(path).map_err(err)?.to_rgba8();
-                    let (width, height) = image.dimensions();
-                    representations.push(ClipboardRepresentation::Image(ClipboardImage {
-                        width: width as usize,
-                        height: height as usize,
-                        rgba: image.into_raw(),
-                    }));
-                }
-            }
-            "files" => {
-                let files = capture
-                    .files
-                    .iter()
-                    .filter(|file| file.representation_id == representation.id)
-                    .filter_map(clipboard_file_from_dto)
-                    .collect::<Vec<_>>();
-                if !files.is_empty() {
-                    representations.push(ClipboardRepresentation::Files(files));
-                }
-            }
-            _ => {}
-        }
-    }
-    if representations.is_empty() {
-        return Err("This capture has no restorable clipboard representation.".into());
-    }
-    write_clipboard_payload(
-        state,
-        &ClipboardSnapshot {
-            representations,
-            formats: Vec::new(),
-        },
-    )
-}
-
-fn clipboard_file_from_dto(file: &CaptureFileDto) -> Option<ClipboardFile> {
-    let path = file
-        .local_path
-        .as_deref()
-        .or(file.original_path.as_deref())
-        .map(PathBuf::from)?;
-    let kind = match file.entry_kind.as_str() {
-        "directory" => ClipboardFileKind::Directory,
-        "application" => ClipboardFileKind::Application,
-        "shortcut" => ClipboardFileKind::Shortcut,
-        "virtual_file" => ClipboardFileKind::VirtualFile,
-        _ => ClipboardFileKind::File,
-    };
-    let availability = if clipboard::is_network_path(&path) {
-        ClipboardFileAvailability::Unverified
-    } else if path.exists() {
-        ClipboardFileAvailability::Available
-    } else {
-        return None;
-    };
-    Some(ClipboardFile {
-        display_name: file.display_name.clone(),
-        original_path: Some(path),
-        kind,
-        size_bytes: file.size_bytes.map(|value| value.max(0) as u64),
-        bytes: None,
-        availability,
-    })
+    let snapshot = scrypuppy_core::restore::snapshot_from_capture(capture)?;
+    write_clipboard_payload(state, &snapshot)
 }
 
 fn show_paste_palette(app: &AppHandle, state: &AppState) -> Result<(), String> {
@@ -3393,7 +2857,7 @@ fn persist_clipboard_payload(
     capture_kind: &str,
     context_id: &str,
 ) -> Result<CaptureDto, String> {
-    let _session = begin_capture(&state)?;
+    let _session = state.capture_coordinator.begin()?;
     let content_text = payload.content_text();
     if payload.is_empty()
         || (payload.content_text().trim().is_empty()
@@ -3544,23 +3008,6 @@ fn screenshot_enabled(settings: &SettingsDto, origin: CaptureOrigin, capture_kin
     match origin {
         CaptureOrigin::ExplicitHotkey | CaptureOrigin::FileImport => settings.capture_screenshots,
         CaptureOrigin::ClipboardMonitor => settings.clipboard_monitor_capture_screenshots,
-    }
-}
-
-fn begin_capture(state: &AppState) -> Result<CaptureSession, String> {
-    loop {
-        let mut gate = state
-            .capture_gate
-            .lock()
-            .map_err(|_| "Nao foi possivel controlar o estado da captura.".to_string())?;
-        if !gate.in_progress {
-            gate.in_progress = true;
-            return Ok(CaptureSession {
-                gate: state.capture_gate.clone(),
-            });
-        }
-        drop(gate);
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -4775,139 +4222,8 @@ fn render_tag_document_markdown(
     markdown
 }
 
-struct CanonicalSearchDocument {
-    content: String,
-    ocr: String,
-    metadata: String,
-    content_hash: String,
-}
-
-fn bounded_search_text(value: &str) -> String {
-    value.chars().take(32_000).collect()
-}
-
-fn canonical_search_document(capture: &CaptureDto) -> CanonicalSearchDocument {
-    let mut seen = HashSet::new();
-    let mut content_parts = Vec::new();
-    for value in std::iter::once(Some(capture.content_text.as_str())).chain(
-        capture
-            .representations
-            .iter()
-            .map(|representation| representation.text_content.as_deref()),
-    ) {
-        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        if seen.insert(value.to_string()) {
-            content_parts.push(value);
-        }
-    }
-    let content = bounded_search_text(&content_parts.join("\n"));
-    let ocr = bounded_search_text(
-        capture
-            .ocr
-            .as_ref()
-            .and_then(|value| value.text.as_deref())
-            .unwrap_or_default(),
-    );
-    let metadata = bounded_search_text(
-        &[
-            capture
-                .source_app_name
-                .as_deref()
-                .unwrap_or_default()
-                .to_string(),
-            capture
-                .source_app_id
-                .as_deref()
-                .unwrap_or_default()
-                .to_string(),
-            capture
-                .window_title
-                .as_deref()
-                .unwrap_or_default()
-                .to_string(),
-            context_names(capture).join(" "),
-            capture.tags.join(" "),
-            capture
-                .entities
-                .iter()
-                .map(|entity| format!("{} {}", entity.kind, entity.value))
-                .collect::<Vec<_>>()
-                .join(" "),
-            capture
-                .files
-                .iter()
-                .map(|file| {
-                    format!(
-                        "{} {} {}",
-                        file.display_name,
-                        file.extension.as_deref().unwrap_or_default(),
-                        file.original_path.as_deref().unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        ]
-        .join("\n"),
-    );
-    let content_hash = sha256_hex(format!("{content}\0{ocr}\0{metadata}").as_bytes());
-    CanonicalSearchDocument {
-        content,
-        ocr,
-        metadata,
-        content_hash,
-    }
-}
-
 fn refresh_search_document(conn: &Connection, capture_id: &str) -> Result<(), String> {
-    let exists = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM captures WHERE id = ?)",
-            [capture_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(err)?
-        != 0;
-    if !exists {
-        conn.execute(
-            "DELETE FROM capture_search_documents WHERE capture_id = ?",
-            [capture_id],
-        )
-        .map_err(err)?;
-        return Ok(());
-    }
-    let capture = get_capture_by_id(conn, capture_id)?;
-    let document = canonical_search_document(&capture);
-    conn.execute(
-        "INSERT INTO capture_search_documents
-         (capture_id, content, ocr, metadata, content_hash, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(capture_id) DO UPDATE SET
-            content = excluded.content,
-            ocr = excluded.ocr,
-            metadata = excluded.metadata,
-            content_hash = excluded.content_hash,
-            updated_at = excluded.updated_at",
-        params![
-            capture_id,
-            document.content,
-            document.ocr,
-            document.metadata,
-            document.content_hash,
-            now()
-        ],
-    )
-    .map_err(err)?;
-    conn.execute(
-        "DELETE FROM capture_embeddings
-         WHERE capture_id = ? AND content_hash <> (
-            SELECT content_hash FROM capture_search_documents WHERE capture_id = ?
-         )",
-        params![capture_id, capture_id],
-    )
-    .map_err(err)?;
-    Ok(())
+    scrypuppy_core::search_index::refresh_search_document(conn, capture_id, &now())
 }
 
 fn reconcile_search_documents(conn: &Connection) -> Result<usize, String> {
@@ -6383,12 +5699,7 @@ fn build_ai_prompt(query: &str, local_answer: &ChatAnswer, portuguese: bool) -> 
 }
 
 fn open_conn(state: &AppState) -> Result<Connection, String> {
-    fs::create_dir_all(&state.app_dir).map_err(err)?;
-    let conn = Connection::open(state.db_path()).map_err(err)?;
-    apply_database_key(&conn, &state.database_key)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
-        .map_err(err)?;
-    Ok(conn)
+    scrypuppy_core::storage::open_or_create(&state.app_dir, &state.database_key)
 }
 
 fn initialize_database(state: &AppState, new_install: bool) -> Result<(), String> {
@@ -6492,14 +5803,6 @@ fn register_windows_context_menu() -> Result<(), String> {
         command_key.set_value("", &command).map_err(err)?;
     }
     Ok(())
-}
-
-fn apply_database_key(conn: &Connection, key: &str) -> Result<(), String> {
-    if key.len() != 64 || !key.chars().all(|character| character.is_ascii_hexdigit()) {
-        return Err("Chave local do banco inválida.".into());
-    }
-    conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
-        .map_err(err)
 }
 
 fn ensure_encrypted_database(state: &AppState) -> Result<(), String> {
@@ -6608,22 +5911,7 @@ fn delete_credential(name: &str) -> Result<(), String> {
 }
 
 fn secure_remove_file(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if path.is_file() {
-        let len = fs::metadata(path).map_err(err)?.len();
-        let mut file = OpenOptions::new().write(true).open(path).map_err(err)?;
-        let zeros = [0u8; 8192];
-        let mut remaining = len;
-        while remaining > 0 {
-            let amount = remaining.min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..amount]).map_err(err)?;
-            remaining -= amount as u64;
-        }
-        file.sync_all().map_err(err)?;
-    }
-    fs::remove_file(path).map_err(err)
+    context_exports::secure_remove_file(path)
 }
 
 fn secure_remove_dir(path: &Path) -> Result<(), String> {
@@ -7127,352 +6415,6 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
         }
     }
     Ok(false)
-}
-
-fn capture_base_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureDto> {
-    let id: String = row.get(0)?;
-    let metadata_json: String = row.get(10)?;
-    Ok(CaptureDto {
-        id,
-        content_text: row.get(1)?,
-        captured_at: row.get(2)?,
-        source_app_name: row.get(3)?,
-        source_app_id: row.get(4)?,
-        source_process_id: row.get(5)?,
-        source_process_path: row.get(6)?,
-        window_title: row.get(7)?,
-        window_id: row.get(8)?,
-        platform: row.get(9)?,
-        kind: row.get(11)?,
-        content_kind: "unknown".into(),
-        metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
-        assets: Vec::new(),
-        representations: Vec::new(),
-        files: Vec::new(),
-        clipboard_formats: Vec::new(),
-        tags: Vec::new(),
-        entities: Vec::new(),
-        ocr: None,
-        contexts: Vec::new(),
-    })
-}
-
-fn hydrate_captures(conn: &Connection, captures: &mut [CaptureDto]) -> Result<(), String> {
-    if captures.is_empty() {
-        return Ok(());
-    }
-    let indexes = captures
-        .iter()
-        .enumerate()
-        .map(|(index, capture)| (capture.id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let ids = captures
-        .iter()
-        .map(|capture| capture.id.clone())
-        .collect::<Vec<_>>();
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let args = ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect::<Vec<_>>();
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, id, kind, path, status, error, created_at
-         FROM capture_assets WHERE capture_id IN ({placeholders}) ORDER BY created_at"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureAssetDto {
-                    id: row.get(1)?,
-                    kind: row.get(2)?,
-                    path: row.get(3)?,
-                    status: row.get(4)?,
-                    error: row.get(5)?,
-                    created_at: row.get(6)?,
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, asset) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].assets.push(asset);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, id, kind, format_name, mime_type, text_content,
-                    asset_path, size_bytes, sha256, restorable, metadata_json
-             FROM capture_representations
-             WHERE capture_id IN ({placeholders}) ORDER BY capture_id, ordinal"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            let metadata_json: String = row.get(10)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureRepresentationDto {
-                    id: row.get(1)?,
-                    kind: row.get(2)?,
-                    format_name: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    text_content: row.get(5)?,
-                    asset_path: row.get(6)?,
-                    size_bytes: row.get(7)?,
-                    sha256: row.get(8)?,
-                    restorable: row.get::<_, i64>(9)? != 0,
-                    metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, representation) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].representations.push(representation);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, id, representation_id, ordinal, display_name, original_path,
-                    local_path, entry_kind, extension, size_bytes, sha256, availability,
-                    metadata_json
-             FROM capture_file_entries
-             WHERE capture_id IN ({placeholders}) ORDER BY capture_id, ordinal"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            let metadata_json: String = row.get(12)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureFileDto {
-                    id: row.get(1)?,
-                    representation_id: row.get(2)?,
-                    ordinal: row.get(3)?,
-                    display_name: row.get(4)?,
-                    original_path: row.get(5)?,
-                    local_path: row.get(6)?,
-                    entry_kind: row.get(7)?,
-                    extension: row.get(8)?,
-                    size_bytes: row.get(9)?,
-                    sha256: row.get(10)?,
-                    availability: row.get(11)?,
-                    metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, file) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            let mut file = file;
-            if matches!(file.availability.as_str(), "available" | "missing") {
-                if let Some(path) = file.local_path.as_deref().or(file.original_path.as_deref()) {
-                    let path = Path::new(path);
-                    if !clipboard::is_network_path(path) {
-                        file.availability = if path.exists() {
-                            "available".into()
-                        } else {
-                            "missing".into()
-                        };
-                    }
-                }
-            }
-            captures[*index].files.push(file);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, format_id, format_name, supported
-             FROM capture_clipboard_formats
-             WHERE capture_id IN ({placeholders}) ORDER BY capture_id, format_id"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureClipboardFormatDto {
-                    id: row.get(1)?,
-                    name: row.get(2)?,
-                    supported: row.get::<_, i64>(3)? != 0,
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, format) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].clipboard_formats.push(format);
-        }
-    }
-
-    for capture in captures.iter_mut() {
-        capture.content_kind = ["files", "image", "html", "rich_text", "url", "plain_text"]
-            .into_iter()
-            .find(|kind| {
-                capture
-                    .representations
-                    .iter()
-                    .any(|item| item.kind == *kind)
-            })
-            .unwrap_or("unknown")
-            .to_string();
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-        "SELECT capture_id, tag FROM capture_tags WHERE capture_id IN ({placeholders}) ORDER BY tag"
-    ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, tag) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].tags.push(tag);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, id, kind, value, source, confidence FROM capture_entities
-         WHERE capture_id IN ({placeholders}) ORDER BY kind, value"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureEntityDto {
-                    id: row.get(1)?,
-                    kind: row.get(2)?,
-                    value: row.get(3)?,
-                    source: row.get(4)?,
-                    confidence: row.get(5)?,
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, entity) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].entities.push(entity);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT capture_id, status, text, error, updated_at FROM capture_ocr
-         WHERE capture_id IN ({placeholders})"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                CaptureOcrDto {
-                    status: row.get(1)?,
-                    text: row.get(2)?,
-                    error: row.get(3)?,
-                    updated_at: row.get(4)?,
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for (capture_id, ocr) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].ocr = Some(ocr);
-        }
-    }
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT cc.capture_id, co.id, co.name, co.normalized_name, co.slug,
-                co.created_at, co.updated_at,
-                (SELECT COUNT(*) FROM capture_contexts all_cc WHERE all_cc.context_id = co.id),
-                cc.assignment_origin, cc.confidence, cc.created_at
-         FROM capture_contexts cc
-         JOIN contexts co ON co.id = cc.context_id
-         WHERE cc.capture_id IN ({placeholders}) ORDER BY lower(co.name)"
-        ))
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(&args[..], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                ContextAssignmentDto {
-                    id: row.get(1)?,
-                    name: row.get(2)?,
-                    normalized_name: row.get(3)?,
-                    slug: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    capture_count: row.get(7)?,
-                    assignment_origin: row.get(8)?,
-                    confidence: row.get(9)?,
-                    assigned_at: row.get(10)?,
-                },
-            ))
-        })
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    for (capture_id, context) in rows {
-        if let Some(index) = indexes.get(&capture_id) {
-            captures[*index].contexts.push(context);
-        }
-    }
-    Ok(())
-}
-
-fn get_capture_by_id(conn: &Connection, id: &str) -> Result<CaptureDto, String> {
-    let capture = conn
-        .query_row(
-            "SELECT c.id, c.content_text, c.captured_at,
-                c.source_app_name, c.source_app_id, c.source_process_id,
-                c.source_process_path, c.window_title, c.window_id, c.platform,
-                c.metadata_json, c.capture_kind
-         FROM captures c
-         WHERE c.id = ?",
-            [id],
-            capture_base_from_row,
-        )
-        .map_err(err)?;
-    let mut captures = vec![capture];
-    hydrate_captures(conn, &mut captures)?;
-    captures
-        .pop()
-        .ok_or_else(|| "Captura nao encontrada.".into())
 }
 
 fn context_ids_for_capture(conn: &Connection, capture_id: &str) -> Result<Vec<String>, String> {
@@ -8806,9 +7748,14 @@ fn sync_markdown(state: &AppState) -> std::io::Result<()> {
         }
     }
 
-    let contexts = list_contexts_for_markdown(&conn).map_err(io_other)?;
+    let contexts = context_exports::list_contexts(&conn).map_err(io_other)?;
     for context in contexts {
-        write_context_export(state, &conn, &context)?;
+        context_exports::write_context_export(
+            &conn,
+            &state.markdown_dir(),
+            &context,
+            &state.context_key,
+        )?;
     }
 
     Ok(())
@@ -8820,12 +7767,17 @@ fn sync_contexts(state: &AppState, context_ids: &[String]) -> std::io::Result<()
     }
     let conn = open_conn(state).map_err(io_other)?;
     fs::create_dir_all(state.markdown_dir())?;
-    let contexts = list_contexts_for_markdown(&conn).map_err(io_other)?;
+    let contexts = context_exports::list_contexts(&conn).map_err(io_other)?;
     for context in contexts
         .iter()
         .filter(|context| context_ids.iter().any(|id| id == &context.id))
     {
-        write_context_export(state, &conn, context)?;
+        context_exports::write_context_export(
+            &conn,
+            &state.markdown_dir(),
+            context,
+            &state.context_key,
+        )?;
     }
     Ok(())
 }
@@ -8852,27 +7804,6 @@ fn recover_interrupted_ocr_jobs(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn write_context_export(
-    state: &AppState,
-    conn: &Connection,
-    context: &ContextDto,
-) -> std::io::Result<()> {
-    let captures = captures_for_context(conn, &context.id).map_err(io_other)?;
-    let markdown = render_context_markdown(context, &captures);
-    let encrypted = encrypt_context_file(&markdown, &state.context_key).map_err(io_other)?;
-    let path = state
-        .markdown_dir()
-        .join(format!("{}.scryppy", context.slug));
-    let temporary = state
-        .markdown_dir()
-        .join(format!(".{}.{}.tmp", context.slug, Uuid::new_v4()));
-    fs::write(&temporary, encrypted)?;
-    if path.exists() {
-        secure_remove_file(&path).map_err(io_other)?;
-    }
-    fs::rename(temporary, path)
-}
-
 fn remove_context_export(state: &AppState, slug: &str) -> Result<(), String> {
     secure_remove_file(&state.markdown_dir().join(format!("{slug}.scryppy")))
 }
@@ -8881,166 +7812,6 @@ fn remove_context_export_best_effort(state: &AppState, slug: &str) {
     if let Err(error) = remove_context_export(state, slug) {
         eprintln!("Falha ao remover exportacao de contexto: {error}");
     }
-}
-
-fn list_contexts_for_markdown(conn: &Connection) -> rusqlite::Result<Vec<ContextDto>> {
-    let mut stmt = conn.prepare(
-        "SELECT co.id, co.name, co.normalized_name, co.slug, co.created_at, co.updated_at,
-                COUNT(cc.capture_id) AS capture_count
-         FROM contexts co
-         LEFT JOIN capture_contexts cc ON cc.context_id = co.id
-         WHERE co.id NOT IN ('inbox', 'knowledge-base')
-         GROUP BY co.id
-         ORDER BY lower(co.name)",
-    )?;
-
-    let contexts = stmt
-        .query_map([], |row| {
-            Ok(ContextDto {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                normalized_name: row.get(2)?,
-                slug: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                capture_count: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(contexts)
-}
-
-fn captures_for_context(conn: &Connection, context_id: &str) -> Result<Vec<CaptureDto>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.id, c.content_text, c.captured_at,
-                c.source_app_name, c.source_app_id, c.source_process_id,
-                c.source_process_path, c.window_title, c.window_id, c.platform,
-                c.metadata_json, c.capture_kind
-         FROM captures c
-         JOIN capture_contexts cc ON cc.capture_id = c.id
-         WHERE cc.context_id = ?
-         ORDER BY c.captured_at DESC",
-        )
-        .map_err(err)?;
-
-    let mut captures = stmt
-        .query_map([context_id], capture_base_from_row)
-        .map_err(err)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(err)?;
-    hydrate_captures(conn, &mut captures)?;
-    Ok(captures)
-}
-
-fn render_context_markdown(context: &ContextDto, captures: &[CaptureDto]) -> String {
-    let mut markdown = String::new();
-    markdown.push_str(
-        "<!-- Generated by ScryPuppy. Do not edit manually; changes can be overwritten. -->\n\n",
-    );
-    markdown.push_str(&format!("# {}\n\n", context.name));
-    markdown.push_str(&format!("- Context ID: `{}`\n", context.id));
-    markdown.push_str(&format!("- Captures: `{}`\n\n", captures.len()));
-
-    for capture in captures {
-        markdown.push_str("---\n\n");
-        markdown.push_str(&format!("## {}\n\n", capture.captured_at));
-        markdown.push_str(&format!("- Capture ID: `{}`\n", capture.id));
-        markdown.push_str(&format!("- Type: `{}`\n", capture.kind));
-        if !capture.contexts.is_empty() {
-            markdown.push_str(&format!(
-                "- Contexts: `{}`\n",
-                capture
-                    .contexts
-                    .iter()
-                    .map(|context| context.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        markdown.push_str(&format!(
-            "- Application: `{}`\n",
-            optional_md(&capture.source_app_name)
-        ));
-        markdown.push_str(&format!(
-            "- Application ID: `{}`\n",
-            optional_md(&capture.source_app_id)
-        ));
-        markdown.push_str(&format!(
-            "- Process ID: `{}`\n",
-            capture
-                .source_process_id
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        ));
-        markdown.push_str(&format!(
-            "- Process Path: `{}`\n",
-            optional_md(&capture.source_process_path)
-        ));
-        markdown.push_str(&format!(
-            "- Window Title: `{}`\n",
-            optional_md(&capture.window_title)
-        ));
-        markdown.push_str(&format!(
-            "- Window ID: `{}`\n",
-            optional_md(&capture.window_id)
-        ));
-        markdown.push_str(&format!("- Platform: `{}`\n", capture.platform));
-
-        for asset in &capture.assets {
-            markdown.push_str(&format!(
-                "- Asset {}: status `{}`, path `{}`{}\n",
-                asset.kind,
-                asset.status,
-                optional_md(&asset.path),
-                asset
-                    .error
-                    .as_ref()
-                    .map(|error| format!(", error `{}`", escape_ticks(error)))
-                    .unwrap_or_default()
-            ));
-        }
-
-        if !capture.tags.is_empty() {
-            markdown.push_str(&format!("- Tags: `{}`\n", capture.tags.join("`, `")));
-        }
-
-        if let Some(ocr) = &capture.ocr {
-            markdown.push_str(&format!("- OCR local: `{}`", ocr.status));
-            if let Some(error) = &ocr.error {
-                markdown.push_str(&format!(" ({})", escape_ticks(error)));
-            }
-            markdown.push('\n');
-        }
-
-        markdown.push_str("\n```text\n");
-        markdown.push_str(&capture.content_text);
-        if !capture.content_text.ends_with('\n') {
-            markdown.push('\n');
-        }
-        markdown.push_str("```\n\n");
-        markdown.push_str("<details>\n<summary>Metadata JSON</summary>\n\n```json\n");
-        markdown.push_str(
-            &serde_json::to_string_pretty(&capture.metadata).unwrap_or_else(|_| "{}".into()),
-        );
-        markdown.push_str("\n```\n</details>\n\n");
-
-        if !capture.entities.is_empty() {
-            markdown.push_str("<details>\n<summary>Local Entities</summary>\n\n");
-            for entity in &capture.entities {
-                markdown.push_str(&format!(
-                    "- `{}`: `{}` (source `{}`, confidence `{:.2}`)\n",
-                    entity.kind,
-                    escape_ticks(&entity.value),
-                    entity.source,
-                    entity.confidence
-                ));
-            }
-            markdown.push_str("\n</details>\n\n");
-        }
-    }
-
-    markdown
 }
 
 fn unique_slug(
@@ -9115,13 +7886,6 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
-fn optional_md(value: &Option<String>) -> String {
-    value
-        .as_ref()
-        .map(|value| escape_ticks(value))
-        .unwrap_or_else(|| "unknown".into())
-}
-
 fn escape_ticks(value: &str) -> String {
     value.replace('`', "'")
 }
@@ -9173,9 +7937,7 @@ pub fn run() {
                 app_dir,
                 database_key,
                 context_key,
-                capture_gate: Arc::new(Mutex::new(CaptureGate { in_progress: false })),
-                ignored_clipboard_sequences: Arc::new(Mutex::new(SequenceSuppression::default())),
-                clipboard_monitor_suppressions: Arc::new(AtomicUsize::new(0)),
+                capture_coordinator: CaptureCoordinator::default(),
                 clipboard,
                 clipboard_monitor: monitor_handle.clone(),
                 ocr_worker_running: Arc::new(Mutex::new(false)),
@@ -9697,7 +8459,8 @@ mod tests {
     fn context_files_do_not_contain_plaintext() {
         let key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let markdown = "# Projeto confidencial\nToken super-secreto";
-        let encrypted = encrypt_context_file(markdown, &key).expect("context should encrypt");
+        let encrypted =
+            crypto::encrypt_context_file(markdown, &key).expect("context should encrypt");
 
         assert!(encrypted.starts_with(crypto::CONTEXT_FILE_MAGIC));
         assert!(!encrypted
@@ -9773,30 +8536,6 @@ mod tests {
         assert!(saved.clipboard_monitor_enabled);
         assert!(saved.clipboard_monitor_capture_screenshots);
         assert!(saved.clipboard_monitor_quick_context_enabled);
-    }
-
-    #[test]
-    fn sequence_suppression_is_consumed_once() {
-        let mut suppression = SequenceSuppression::default();
-        suppression.record(42);
-        assert!(suppression.consume(42));
-        assert!(!suppression.consume(42));
-    }
-
-    #[test]
-    fn clipboard_monitor_suppression_is_scoped_and_nestable() {
-        let count = Arc::new(AtomicUsize::new(0));
-        let first = ClipboardMonitorSuppression::acquire(count.clone());
-        assert_eq!(count.load(Ordering::Acquire), 1);
-
-        {
-            let _second = ClipboardMonitorSuppression::acquire(count.clone());
-            assert_eq!(count.load(Ordering::Acquire), 2);
-        }
-
-        assert_eq!(count.load(Ordering::Acquire), 1);
-        drop(first);
-        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -10264,9 +9003,7 @@ mod tests {
             app_dir: PathBuf::from("test-data"),
             database_key: String::new(),
             context_key: String::new(),
-            capture_gate: Arc::new(Mutex::new(CaptureGate { in_progress: false })),
-            ignored_clipboard_sequences: Arc::new(Mutex::new(SequenceSuppression::default())),
-            clipboard_monitor_suppressions: Arc::new(AtomicUsize::new(0)),
+            capture_coordinator: CaptureCoordinator::default(),
             clipboard: Arc::new(ClipboardService::start().expect("test clipboard service")),
             clipboard_monitor: ClipboardMonitorHandle::new(),
             ocr_worker_running: Arc::new(Mutex::new(false)),

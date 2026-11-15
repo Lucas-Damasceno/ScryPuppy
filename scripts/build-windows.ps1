@@ -97,7 +97,7 @@ try {
     throw "Close every running ScryPuppy instance before building so the release startup check can run."
   }
 
-  $startupProbe = Start-Process -FilePath $cleanBinary -PassThru
+  $startupProbe = Start-Process -FilePath $cleanBinary -PassThru -WindowStyle Hidden
   try {
     if ($startupProbe.WaitForExit(12000)) {
       throw "The release executable exited during the 12-second startup check (exit code $($startupProbe.ExitCode))."
