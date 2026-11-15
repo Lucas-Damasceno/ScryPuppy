@@ -4,6 +4,7 @@ use iced::widget::{
     button, column, container, image as iced_image, row, scrollable, text, text_input, Space,
 };
 use iced::{window, Alignment, Color, Element, Length, Size, Task, Theme};
+use keyring::{Entry as CredentialEntry, Error as CredentialError};
 use scrypuppy_core::library::{
     count_captures_from_conn, list_captures_from_conn, list_contexts_from_conn, CaptureDto,
     CaptureFilter, ContextDto,
@@ -22,6 +23,7 @@ use std::{
 };
 
 static QUICK_PASTE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
+static CAPTURE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static TRAY_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
@@ -54,18 +56,29 @@ fn main() -> iced::Result {
     }
     let mut hotkey_manager = None;
     match GlobalHotKeyManager::new() {
-        Ok(manager) => match HotKey::from_str("ctrl+shift+KeyV") {
-            Ok(hotkey) => match manager.register(hotkey) {
-                Ok(()) => {
-                    let _ = QUICK_PASTE_HOTKEY_ID.set(hotkey.id());
-                    hotkey_manager = Some(manager);
+        Ok(manager) => {
+            let mut registered = false;
+            for (shortcut, label, id_slot) in [
+                ("ctrl+shift+KeyV", "Quick Paste", &QUICK_PASTE_HOTKEY_ID),
+                ("ctrl+shift+KeyC", "captura", &CAPTURE_HOTKEY_ID),
+            ] {
+                match HotKey::from_str(shortcut) {
+                    Ok(hotkey) => match manager.register(hotkey) {
+                        Ok(()) => {
+                            let _ = id_slot.set(hotkey.id());
+                            registered = true;
+                        }
+                        Err(error) => eprintln!(
+                            "Não foi possível registrar o atalho global de {label}: {error}"
+                        ),
+                    },
+                    Err(error) => eprintln!("Atalho global de {label} inválido: {error}"),
                 }
-                Err(error) => {
-                    eprintln!("Não foi possível registrar o atalho global do Quick Paste: {error}")
-                }
-            },
-            Err(error) => eprintln!("Atalho global do Quick Paste inválido: {error}"),
-        },
+            }
+            if registered {
+                hotkey_manager = Some(manager);
+            }
+        }
         Err(error) => eprintln!("Atalhos globais indisponíveis: {error}"),
     }
     let result = iced::daemon(App::new, App::update, App::view)
@@ -1409,12 +1422,22 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
         |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             use iced::futures::{channel::mpsc, sink::SinkExt, StreamExt};
             let (sender, mut receiver) = mpsc::unbounded();
-            let expected_id = QUICK_PASTE_HOTKEY_ID.get().copied();
+            let quick_paste_id = QUICK_PASTE_HOTKEY_ID.get().copied();
+            let capture_id = CAPTURE_HOTKEY_ID.get().copied();
             let _ = thread::Builder::new()
                 .name("scrypuppy-hotkey-events".into())
                 .spawn(move || {
                     while let Ok(event) = GlobalHotKeyEvent::receiver().recv() {
-                        if Some(event.id) != expected_id || event.state != HotKeyState::Pressed {
+                        if event.state != HotKeyState::Pressed {
+                            continue;
+                        }
+                        if Some(event.id) == capture_id {
+                            if sender.unbounded_send(Message::CaptureClipboard).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if Some(event.id) != quick_paste_id {
                             continue;
                         }
                         #[cfg(windows)]
@@ -1690,19 +1713,71 @@ fn load_default_library(
 
 fn default_database_credentials() -> Result<(PathBuf, String), String> {
     let appdata = dirs::data_dir().ok_or("Diretório de dados do Windows indisponível.")?;
-    let path = appdata.join("com.scryppy.desktop").join(DATABASE_FILE);
-    if !path.is_file() {
-        return Err(
-            "Biblioteca existente não encontrada. A versão Iced ainda não cria novas bibliotecas."
-                .into(),
-        );
-    }
-    let entry = keyring::Entry::new("Scryppy", "database-key-v1")
+    let app_dir = appdata.join("com.scryppy.desktop");
+    let path = app_dir.join(DATABASE_FILE);
+    let allow_create = !path.exists();
+    std::fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
+
+    let database_entry = CredentialEntry::new("Scryppy", "database-key-v1")
         .map_err(|_| "Credencial local indisponível.")?;
-    let key = entry
-        .get_password()
-        .map_err(|_| "Não foi possível acessar a chave da biblioteca existente.")?;
-    Ok((path, key))
+    let database_key = match database_entry.get_password() {
+        Ok(key) if !key.trim().is_empty() => key,
+        Ok(_) | Err(CredentialError::NoEntry) if allow_create => {
+            let key = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            database_entry.set_password(&key).map_err(|_| {
+                "Não foi possível salvar a chave no Gerenciador de Credenciais do Windows."
+            })?;
+            key
+        }
+        Ok(_) => return Err("A credencial da biblioteca existente está vazia.".into()),
+        Err(CredentialError::NoEntry) => {
+            return Err("A chave da biblioteca existente não foi encontrada no Gerenciador de Credenciais do Windows.".into());
+        }
+        Err(_) => return Err("Não foi possível acessar a chave da biblioteca existente.".into()),
+    };
+
+    let context_entry = CredentialEntry::new("Scryppy", "context-key-v1")
+        .map_err(|_| "Credencial local indisponível.")?;
+    match context_entry.get_password() {
+        Ok(key) if !key.trim().is_empty() => {}
+        Ok(_) | Err(CredentialError::NoEntry) if allow_create => {
+            let key = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            context_entry
+                .set_password(&key)
+                .map_err(|_| "Não foi possível salvar a chave dos Contextos no Gerenciador de Credenciais do Windows.")?;
+        }
+        Ok(_) => return Err("A credencial de Contextos existente está vazia.".into()),
+        Err(CredentialError::NoEntry) => {
+            return Err("A chave dos Contextos não foi encontrada no Gerenciador de Credenciais do Windows.".into());
+        }
+        Err(_) => return Err("Não foi possível acessar a chave dos Contextos.".into()),
+    }
+
+    let conn = scrypuppy_core::storage::open_or_create(&app_dir, &database_key)?;
+    scrypuppy_core::schema::migrate(&conn).map_err(|error| error.to_string())?;
+    if conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'magic_search_engine'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .is_err()
+    {
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('magic_search_engine', 'local')",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok((path, database_key))
 }
 
 fn save_theme_preference(dark: bool) -> Result<(), String> {
@@ -2148,6 +2223,12 @@ mod tests {
     #[test]
     fn quick_paste_shortcut_is_registered_as_ctrl_shift_v() {
         let hotkey = HotKey::from_str("ctrl+shift+KeyV").unwrap();
+        assert_ne!(hotkey.id(), 0);
+    }
+
+    #[test]
+    fn capture_shortcut_matches_the_existing_default() {
+        let hotkey = HotKey::from_str("ctrl+shift+KeyC").unwrap();
         assert_ne!(hotkey.id(), 0);
     }
 

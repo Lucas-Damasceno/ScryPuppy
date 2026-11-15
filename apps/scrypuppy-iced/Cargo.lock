@@ -4451,6 +4451,7 @@ dependencies = [
  "scrypuppy-core",
  "tempfile",
  "tray-icon",
+ "uuid",
  "windows 0.61.3",
 ]
 

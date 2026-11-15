@@ -16,3 +16,4 @@ pub mod preview;
 pub mod restore;
 pub mod search_index;
 pub mod storage;
+pub mod schema;
