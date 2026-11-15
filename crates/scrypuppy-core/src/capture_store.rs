@@ -57,6 +57,36 @@ pub fn save_clipboard_capture_with_origin(
     capture_kind: &str,
     capture_origin: &str,
 ) -> Result<String, String> {
+    save_clipboard_capture_with_window_metadata(
+        conn,
+        app_dir,
+        snapshot,
+        capture_kind,
+        capture_origin,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Save a capture with the active-window provenance sampled by the desktop shell.
+/// Window metadata is optional and remains local to the encrypted library.
+pub fn save_clipboard_capture_with_window_metadata(
+    conn: &mut Connection,
+    app_dir: &Path,
+    snapshot: &ClipboardSnapshot,
+    capture_kind: &str,
+    capture_origin: &str,
+    source_app_name: Option<&str>,
+    source_app_id: Option<&str>,
+    source_process_id: Option<i64>,
+    source_process_path: Option<&str>,
+    window_title: Option<&str>,
+    window_id: Option<&str>,
+) -> Result<String, String> {
     let content_text = snapshot.content_text();
     if snapshot.is_empty()
         || (content_text.trim().is_empty()
@@ -100,6 +130,14 @@ pub fn save_clipboard_capture_with_origin(
         "capture_origin": capture_origin,
         "capture_source": "iced",
         "image_dimensions": snapshot.image_dimensions(),
+        "active_window": {
+            "app_name": source_app_name,
+            "app_id": source_app_id,
+            "process_id": source_process_id,
+            "process_path": source_process_path,
+            "title": window_title,
+            "window_id": window_id,
+        },
     });
     let transaction = conn.transaction().map_err(err)?;
     transaction
@@ -108,12 +146,18 @@ pub fn save_clipboard_capture_with_origin(
             id, context_id, content_text, content_hash, captured_at,
             source_app_name, source_app_id, source_process_id, source_process_path,
             window_title, window_id, platform, metadata_json, capture_kind, created_at
-        ) VALUES (?, 'inbox', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?)",
+        ) VALUES (?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 capture_id,
                 content_text,
                 hash,
                 captured_at,
+                source_app_name,
+                source_app_id,
+                source_process_id,
+                source_process_path,
+                window_title,
+                window_id,
                 std::env::consts::OS,
                 metadata.to_string(),
                 capture_kind,
@@ -438,16 +482,26 @@ mod tests {
             ],
             formats: vec![],
         };
-        let id = save_clipboard_capture_with_origin(
+        let id = save_clipboard_capture_with_window_metadata(
             &mut conn,
             dir.path(),
             &snapshot,
             "capture",
-            "clipboard_monitor",
+            "explicit_hotkey",
+            Some("Editor"),
+            Some("editor.exe"),
+            Some(123),
+            Some("C:/Editor/editor.exe"),
+            Some("Notes — Draft"),
+            Some("window-123"),
         )
         .unwrap();
         let capture = get_capture_by_id(&conn, &id).unwrap();
-        assert_eq!(capture.metadata["capture_origin"], "clipboard_monitor");
+        assert_eq!(capture.metadata["capture_origin"], "explicit_hotkey");
+        assert_eq!(capture.source_app_name.as_deref(), Some("Editor"));
+        assert_eq!(capture.source_app_id.as_deref(), Some("editor.exe"));
+        assert_eq!(capture.source_process_id, Some(123));
+        assert_eq!(capture.window_title.as_deref(), Some("Notes — Draft"));
         assert_eq!(capture.content_text, "report.txt");
         assert_eq!(capture.representations.len(), 4);
         assert_eq!(

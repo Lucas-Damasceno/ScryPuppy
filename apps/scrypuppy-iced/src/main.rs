@@ -1894,22 +1894,70 @@ fn capture_current_clipboard() -> Result<String, String> {
     let _capture_session = CAPTURE_COORDINATOR
         .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
         .begin()?;
-    let appdata = dirs::data_dir().ok_or("Diretório de dados do Windows indisponível.")?;
-    let app_dir = appdata.join("com.scryppy.desktop");
-    let database_key = keyring::Entry::new("Scryppy", "database-key-v1")
-        .map_err(|_| "Credencial local indisponível.")?
-        .get_password()
-        .map_err(|_| "Não foi possível acessar a chave da biblioteca existente.")?;
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let settings_conn = open_existing_read_only(&path, &database_key)?;
+    let include_images = read_boolean_setting(&settings_conn, "capture_screenshots", true);
+    drop(settings_conn);
     let clipboard = scrypuppy_core::clipboard::ClipboardService::start()?;
     let read = clipboard.read();
     clipboard.shutdown();
-    let snapshot = read?.ok_or("O clipboard está vazio ou indisponível.")?;
-    let path = app_dir.join(DATABASE_FILE);
+    let mut snapshot = read?.ok_or("O clipboard está vazio ou indisponível.")?;
+    if !include_images {
+        snapshot.representations.retain(|representation| {
+            !matches!(
+                representation,
+                scrypuppy_core::clipboard::ClipboardRepresentation::Image(_)
+            )
+        });
+    }
+    let active = active_window_metadata();
     let mut conn = scrypuppy_core::storage::open_existing_read_write(&path, &database_key)
         .map_err(|_| {
             "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
         })?;
-    scrypuppy_core::capture_store::save_clipboard_capture(&mut conn, &app_dir, &snapshot, "capture")
+    scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
+        &mut conn,
+        app_dir,
+        &snapshot,
+        "capture",
+        "explicit_hotkey",
+        active.app_name.as_deref(),
+        active.app_id.as_deref(),
+        active.process_id,
+        active.process_path.as_deref(),
+        active.window_title.as_deref(),
+        active.window_id.as_deref(),
+    )
+}
+
+#[derive(Default)]
+struct ActiveWindowMetadata {
+    app_name: Option<String>,
+    app_id: Option<String>,
+    process_id: Option<i64>,
+    process_path: Option<String>,
+    window_title: Option<String>,
+    window_id: Option<String>,
+}
+
+fn active_window_metadata() -> ActiveWindowMetadata {
+    #[cfg(windows)]
+    {
+        if let Ok(window) = active_win_pos_rs::get_active_window() {
+            return ActiveWindowMetadata {
+                app_name: (!window.app_name.trim().is_empty()).then_some(window.app_name),
+                app_id: None,
+                process_id: Some(window.process_id as i64),
+                process_path: Some(window.process_path.display().to_string()),
+                window_title: (!window.title.trim().is_empty()).then_some(window.title),
+                window_id: Some(window.window_id),
+            };
+        }
+    }
+    ActiveWindowMetadata::default()
 }
 
 fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
@@ -1958,12 +2006,19 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
     let app_dir = path
         .parent()
         .ok_or("Diretório da biblioteca indisponível.")?;
-    match scrypuppy_core::capture_store::save_clipboard_capture_with_origin(
+    let active = active_window_metadata();
+    match scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
         &mut conn,
         app_dir,
         &snapshot,
         "capture",
         "clipboard_monitor",
+        active.app_name.as_deref(),
+        active.app_id.as_deref(),
+        active.process_id,
+        active.process_path.as_deref(),
+        active.window_title.as_deref(),
+        active.window_id.as_deref(),
     ) {
         Ok(id) => Ok(Some((id, prompt_quick_context))),
         Err(error)
