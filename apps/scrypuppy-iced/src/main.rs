@@ -1,6 +1,8 @@
 //! Native Iced UI for the ScryPuppy migration.
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Space};
+use iced::widget::{
+    button, column, container, image as iced_image, row, scrollable, text, text_input, Space,
+};
 use iced::{window, Alignment, Color, Element, Length, Size, Task, Theme};
 use scrypuppy_core::library::{
     count_captures_from_conn, list_captures_from_conn, list_contexts_from_conn, CaptureDto,
@@ -12,11 +14,18 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     thread,
 };
 
 static QUICK_PASTE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
+static TRAY_EVENT_SENDER: OnceLock<
+    Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
+> = OnceLock::new();
+#[cfg(windows)]
+thread_local! {
+    static TRAY_ICON: std::cell::RefCell<Option<tray_icon::TrayIcon>> = const { std::cell::RefCell::new(None) };
+}
 const PAGE_SIZE: usize = 60;
 
 fn main() -> iced::Result {
@@ -55,7 +64,9 @@ fn main() -> iced::Result {
         .subscription(|_: &App| {
             iced::Subscription::batch([
                 window::close_events().map(Message::Closed),
+                window::close_requests().map(Message::CloseRequested),
                 iced::Subscription::run(hotkey_events),
+                iced::Subscription::run(tray_events),
             ])
         })
         .run();
@@ -155,7 +166,7 @@ struct App {
     action_busy: bool,
     error: Option<String>,
     notice: Option<String>,
-    thumbnails: HashMap<String, image::Handle>,
+    thumbnails: HashMap<String, iced_image::Handle>,
     text_previews: HashMap<String, String>,
     #[cfg(debug_assertions)]
     demo: bool,
@@ -163,7 +174,11 @@ struct App {
 
 #[derive(Clone, Debug)]
 enum Message {
+    CloseRequested(window::Id),
     Closed(window::Id),
+    MainOpened(window::Id),
+    ShowMain,
+    QuitFromTray,
     QueryChanged(String),
     Search,
     PreviousPage,
@@ -195,6 +210,7 @@ impl App {
         let (main, open) = window::open(window::Settings {
             size: Size::new(1100.0, 720.0),
             min_size: Some(Size::new(920.0, 560.0)),
+            exit_on_close_request: false,
             ..window::Settings::default()
         });
         let mut app = Self {
@@ -226,10 +242,10 @@ impl App {
             app.demo = true;
             app.snapshot = Some(demo_snapshot());
             app.loading = false;
-            return (app, open.discard());
+            return (app, open.map(Message::MainOpened));
         }
         let load = app.reload();
-        (app, Task::batch([open.discard(), load]))
+        (app, Task::batch([open.map(Message::MainOpened), load]))
     }
 
     fn reload(&mut self) -> Task<Message> {
@@ -272,7 +288,17 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Closed(id) if id == self.main => iced::exit(),
+            Message::CloseRequested(id) if id == self.main => hide_window(id),
+            Message::CloseRequested(_) => Task::none(),
+            Message::MainOpened(id) if id == self.main => window::run(id, |_| {
+                #[cfg(windows)]
+                initialize_tray();
+            })
+            .discard(),
+            Message::MainOpened(_) => Task::none(),
+            Message::ShowMain => show_window(self.main),
+            Message::QuitFromTray => iced::exit(),
+            Message::Closed(id) if id == self.main => Task::none(),
             Message::Closed(id) if self.quick_window == Some(id) => {
                 self.quick_window = None;
                 self.paste_target = None;
@@ -509,7 +535,7 @@ impl App {
                 if revision == self.revision {
                     self.thumbnails = images
                         .into_iter()
-                        .map(|(id, data)| (id, image::Handle::from_bytes(data)))
+                        .map(|(id, data)| (id, iced_image::Handle::from_bytes(data)))
                         .collect();
                     self.text_previews = text.into_iter().collect();
                 }
@@ -692,7 +718,7 @@ impl App {
                         column![text(capture.content_kind.to_uppercase()).size(10)].spacing(9);
                     if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                         body = body.push(
-                            image(thumbnail.clone())
+                            iced_image(thumbnail.clone())
                                 .height(80)
                                 .width(Length::Fill)
                                 .content_fit(iced::ContentFit::Contain),
@@ -913,7 +939,7 @@ impl App {
                 .spacing(7);
                 if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                     card = card.push(
-                        image(thumbnail.clone())
+                        iced_image(thumbnail.clone())
                             .height(96)
                             .width(Length::Fill)
                             .content_fit(iced::ContentFit::Contain),
@@ -1033,7 +1059,7 @@ impl App {
             .spacing(8);
             if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                 preview = preview.push(
-                    image(thumbnail.clone())
+                    iced_image(thumbnail.clone())
                         .height(130)
                         .width(Length::Fill)
                         .content_fit(iced::ContentFit::Contain),
@@ -1143,6 +1169,158 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
             }
         },
     )
+}
+
+fn tray_events() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        8,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::{channel::mpsc, sink::SinkExt, StreamExt};
+            let (sender, mut receiver) = mpsc::unbounded();
+            let _ = TRAY_EVENT_SENDER.set(Mutex::new(Some(sender)));
+            while let Some(message) = receiver.next().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
+fn send_tray_message(message: Message) {
+    if let Some(sender) = TRAY_EVENT_SENDER.get() {
+        if let Ok(sender) = sender.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.unbounded_send(message);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn initialize_tray() {
+    use tray_icon::{
+        menu::{Menu, MenuEvent, MenuItem},
+        Icon, TrayIconBuilder, TrayIconEvent,
+    };
+
+    TRAY_ICON.with(|slot| {
+        if slot.borrow().is_some() {
+            return;
+        }
+        let icon =
+            match ::image::load_from_memory(include_bytes!("../../../src-tauri/icons/icon.png")) {
+                Ok(icon) => icon.to_rgba8(),
+                Err(error) => {
+                    eprintln!("Não foi possível carregar o ícone da bandeja: {error}");
+                    return;
+                }
+            };
+        let (width, height) = icon.dimensions();
+        let icon = match Icon::from_rgba(icon.into_raw(), width, height) {
+            Ok(icon) => icon,
+            Err(error) => {
+                eprintln!("Ícone da bandeja inválido: {error}");
+                return;
+            }
+        };
+        let menu = Menu::new();
+        let open = MenuItem::with_id("tray-open", "Abrir ScryPuppy", true, None);
+        let quit = MenuItem::with_id("tray-quit", "Sair", true, None);
+        if menu.append(&open).is_err() || menu.append(&quit).is_err() {
+            eprintln!("Não foi possível criar o menu da bandeja.");
+            return;
+        }
+        let tray = match TrayIconBuilder::new()
+            .with_id("scrypuppy-main")
+            .with_tooltip("ScryPuppy")
+            .with_icon(icon)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()
+        {
+            Ok(tray) => tray,
+            Err(error) => {
+                eprintln!("Não foi possível criar o ícone da bandeja: {error}");
+                return;
+            }
+        };
+        MenuEvent::set_event_handler(Some(|event: MenuEvent| {
+            if event.id() == "tray-open" {
+                send_tray_message(Message::ShowMain);
+            } else if event.id() == "tray-quit" {
+                send_tray_message(Message::QuitFromTray);
+            }
+        }));
+        TrayIconEvent::set_event_handler(Some(|event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                }
+            ) {
+                send_tray_message(Message::ShowMain);
+            }
+        }));
+        *slot.borrow_mut() = Some(tray);
+    });
+}
+
+#[cfg(windows)]
+fn hide_window(id: window::Id) -> Task<Message> {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::ShowWindow};
+
+    if !TRAY_ICON.with(|slot| slot.borrow().is_some()) {
+        return window::close(id);
+    }
+    window::run(id, |window| {
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+                unsafe {
+                    let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                }
+            }
+        }
+    })
+    .discard()
+}
+
+#[cfg(not(windows))]
+fn hide_window(id: window::Id) -> Task<Message> {
+    window::close(id)
+}
+
+#[cfg(windows)]
+fn show_window(id: window::Id) -> Task<Message> {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::ShowWindow};
+
+    Task::batch([
+        window::run(id, |window| {
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                    let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+                    unsafe {
+                        let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+                    }
+                }
+            }
+        })
+        .discard(),
+        window::gain_focus(id),
+    ])
+}
+
+#[cfg(not(windows))]
+fn show_window(id: window::Id) -> Task<Message> {
+    window::gain_focus(id)
 }
 
 #[cfg(debug_assertions)]

@@ -11,11 +11,13 @@ enigo = "0.2.1"
 global-hotkey = "=0.8.0"
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs"] }
 keyring = "4.1.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 scrypuppy-core = { path = "../../crates/scrypuppy-core" }
 
 [target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+tray-icon = "=0.21.2"
 windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3"
