@@ -600,6 +600,68 @@ fn generate_ai_answer(
     )
 }
 
+/// Generates a source-grounded Markdown document from the already scoped chat evidence.
+/// The provider is only called on this explicit action and receives redacted values.
+pub fn generate_document_markdown(
+    settings: &AssistantSettings,
+    query: &str,
+    answer: &ChatAnswer,
+) -> Result<String, String> {
+    if settings.api_key.trim().is_empty() {
+        return Err("Configure uma chave de API antes de gerar documentos com IA.".into());
+    }
+    if answer.evidence.is_empty() {
+        return Err("Não há fontes suficientes para gerar este documento.".into());
+    }
+    let portuguese = settings.language == "pt-BR";
+    let evidence = answer
+        .evidence
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            format!(
+                "Fonte {} [capture:{}]\nData: {}\nContexto: {}\nAplicativo: {}\nJanela: {}\nTrecho: {}",
+                index + 1,
+                item.capture_id,
+                item.captured_at,
+                item.context_names.join(", "),
+                item.app_name.as_deref().unwrap_or("desconhecido"),
+                item.window_title.as_deref().unwrap_or("desconhecida"),
+                redact_sensitive_values(&item.excerpt),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let (system, prompt) = if portuguese {
+        (
+            "Escreva em português brasileiro um documento Markdown claro, bem estruturado e útil. Use apenas as fontes fornecidas. Não invente fatos. Identifique afirmações com as referências [capture:ID] correspondentes e termine com uma seção Fontes.",
+            format!(
+                "Pedido: {}\n\nSíntese preliminar: {}\n\nEvidências locais:\n{}\n\nGere o documento final com título e subtítulos quando forem úteis.",
+                redact_sensitive_values(query),
+                redact_sensitive_values(&answer.answer),
+                evidence
+            ),
+        )
+    } else {
+        (
+            "Write a clear, useful, well-structured Markdown document in English. Use only the supplied evidence. Do not invent facts. Mark claims with matching [capture:ID] references and end with a Sources section.",
+            format!(
+                "Request: {}\n\nPreliminary synthesis: {}\n\nLocal evidence:\n{}\n\nWrite the final document with a title and useful section headings.",
+                redact_sensitive_values(query),
+                redact_sensitive_values(&answer.answer),
+                evidence
+            ),
+        )
+    };
+    crate::ai::call_provider(
+        &settings.provider,
+        &settings.api_key,
+        &settings.model,
+        &redact_sensitive_values(system),
+        &redact_sensitive_values(&prompt),
+    )
+}
+
 fn query_terms(query: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
         "qual",
@@ -867,7 +929,9 @@ fn secret_pattern() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::{answer_chat, AssistantSettings, ChatRequest};
+    use super::{
+        answer_chat, generate_document_markdown, AssistantSettings, ChatAnswer, ChatRequest,
+    };
     use crate::{
         capture_store::save_clipboard_capture,
         clipboard::{ClipboardRepresentation, ClipboardSnapshot},
@@ -992,5 +1056,30 @@ mod tests {
         .unwrap();
         assert!(no_match.evidence.is_empty());
         assert!(!no_match.answer.contains("provider failed"));
+    }
+
+    #[test]
+    fn document_generation_requires_a_key_and_evidence_before_network_access() {
+        let answer = ChatAnswer {
+            answer: "Síntese local".into(),
+            confidence: "low".into(),
+            evidence: Vec::new(),
+        };
+        let settings = AssistantSettings {
+            provider: "invalid-provider".into(),
+            api_key: "configured".into(),
+            ..AssistantSettings::default()
+        };
+        assert!(generate_document_markdown(&settings, "Pedido", &answer)
+            .unwrap_err()
+            .contains("fontes suficientes"));
+
+        let no_key = AssistantSettings {
+            api_key: String::new(),
+            ..settings
+        };
+        assert!(generate_document_markdown(&no_key, "Pedido", &answer)
+            .unwrap_err()
+            .contains("chave de API"));
     }
 }

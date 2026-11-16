@@ -353,6 +353,8 @@ enum Message {
     AssistantAnswered(u64, Result<scrypuppy_core::assistant::ChatAnswer, String>),
     SaveAnswerAsDocument,
     AnswerSavedAsDocument(Result<scrypuppy_core::documents::Document, String>),
+    GenerateAiDocument,
+    AiDocumentGenerated(Result<scrypuppy_core::documents::Document, String>),
     OpenSavedDocument(String),
     SavedDocumentLoaded(Result<scrypuppy_core::documents::Document, String>),
     EditDocument(text_editor::Action),
@@ -849,6 +851,42 @@ impl App {
                 match result {
                     Ok(document) => {
                         self.notice = Some(format!("Documento salvo: {}", document.title));
+                        return self.reload();
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::GenerateAiDocument => {
+                let (Some(answer), query) = (
+                    self.assistant_answer.clone(),
+                    self.assistant_query.trim().to_string(),
+                ) else {
+                    return Task::none();
+                };
+                if self.is_demo_mode() {
+                    self.notice = Some("Geração com IA desativada no modo de demonstração.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move {
+                        let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                        thread::spawn(move || {
+                            let _ = sender.send(generate_ai_document_as_document(&query, &answer));
+                        });
+                        receiver.await.unwrap_or_else(|_| {
+                            Err("A geração do documento foi interrompida.".into())
+                        })
+                    },
+                    Message::AiDocumentGenerated,
+                )
+            }
+            Message::AiDocumentGenerated(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(document) => {
+                        self.notice = Some(format!("Documento gerado: {}", document.title));
                         return self.reload();
                     }
                     Err(error) => self.error = Some(error),
@@ -2416,10 +2454,17 @@ impl App {
                     .size(10),
                 ]
                 .spacing(8);
-                answer_content =
-                    answer_content.push(button("Salvar resposta como documento").on_press_maybe(
-                        (!self.action_busy).then_some(Message::SaveAnswerAsDocument),
-                    ));
+                answer_content = answer_content.push(
+                    row![
+                        button("Salvar resposta como documento").on_press_maybe(
+                            (!self.action_busy).then_some(Message::SaveAnswerAsDocument),
+                        ),
+                        button("Gerar documento com IA").on_press_maybe(
+                            (!self.action_busy).then_some(Message::GenerateAiDocument),
+                        ),
+                    ]
+                    .spacing(8),
+                );
                 for evidence in &answer.evidence {
                     let context = if evidence.context_names.is_empty() {
                         "Inbox".to_string()
@@ -3781,6 +3826,43 @@ fn save_answer_as_document(
     let mut conn = open_existing_read_write(&path, &database_key)?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
     let document = scrypuppy_core::documents::save_answer(&transaction, query, answer, None)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(document)
+}
+
+fn generate_ai_document_as_document(
+    query: &str,
+    answer: &scrypuppy_core::assistant::ChatAnswer,
+) -> Result<scrypuppy_core::documents::Document, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let setting = |key: &str, fallback: &str| {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_or_else(|_| fallback.into())
+    };
+    let provider = setting("ai_provider", "deepseek");
+    let model = setting("ai_model", &scrypuppy_core::ai::default_model(&provider));
+    let api_key = CredentialEntry::new(CREDENTIAL_SERVICE, AI_KEY_CREDENTIAL)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .unwrap_or_default();
+    let settings = scrypuppy_core::assistant::AssistantSettings {
+        language: setting("language", "en"),
+        provider,
+        model,
+        api_key,
+    };
+    let markdown = scrypuppy_core::assistant::generate_document_markdown(&settings, query, answer)?;
+    let generated_answer = scrypuppy_core::assistant::ChatAnswer {
+        answer: markdown,
+        confidence: answer.confidence.clone(),
+        evidence: answer.evidence.clone(),
+    };
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let document =
+        scrypuppy_core::documents::save_answer(&transaction, query, &generated_answer, None)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(document)
 }
