@@ -113,6 +113,13 @@ pub fn answer_chat_with_ranked_ids(
         .into_iter()
         .enumerate()
         .map(|(index, capture)| score_capture(capture, &terms, intent, broad_query, index))
+        .map(|mut item| {
+            if let Some(rank) = indexed_ranks.get(&item.capture.id) {
+                item.score = item.score.max(1.0 / (*rank + 1) as f64);
+                push_field(&mut item.matched_fields, "índice local");
+            }
+            item
+        })
         .filter(|item| {
             item.score > 0.0
                 || broad_query
@@ -1150,7 +1157,18 @@ mod tests {
             rusqlite::params![late_today_id, format!("{today}T23:59:59{offset}")],
         )
         .unwrap();
-
+        let semantic_id = save_clipboard_capture(
+            &mut conn,
+            dir.path(),
+            &ClipboardSnapshot {
+                representations: vec![ClipboardRepresentation::PlainText(
+                    "Calendário da equipe para organizar entregas".into(),
+                )],
+                formats: Vec::new(),
+            },
+            "capture",
+        )
+        .unwrap();
         let settings = AssistantSettings {
             language: "pt-BR".into(),
             ..AssistantSettings::default()
@@ -1181,6 +1199,7 @@ mod tests {
         assert!(!original_evidence.excerpt.contains("sk-proj-"));
 
         let ranked = vec![
+            semantic_id.clone(),
             archived_id.clone(),
             capture_id.clone(),
             late_today_id.clone(),
@@ -1190,7 +1209,7 @@ mod tests {
             &settings,
             &ChatRequest {
                 query: "planejamento".into(),
-                context_id: Some("work".into()),
+                context_id: None,
                 app: None,
                 date_from: None,
                 date_to: None,
@@ -1199,7 +1218,10 @@ mod tests {
             Some(&ranked),
         )
         .unwrap();
-        assert_eq!(hybrid_answer.evidence[0].capture_id, archived_id);
+        assert_eq!(hybrid_answer.evidence[0].capture_id, semantic_id);
+        assert!(hybrid_answer.evidence[0]
+            .matched_fields
+            .contains(&"índice local".into()));
 
         let filtered = answer_chat(
             &conn,
