@@ -539,6 +539,13 @@ mod tests {
         assert_eq!(capture.files.len(), 1);
         let materialized = capture.files[0].local_path.as_deref().unwrap();
         assert_eq!(fs::read(materialized).unwrap(), b"data");
+        // The deduplication window is intentionally short. Refresh the fixture
+        // timestamp so parallel test load cannot make this assertion flaky.
+        conn.execute(
+            "UPDATE captures SET captured_at = ? WHERE id = ?",
+            params![Utc::now().to_rfc3339(), id],
+        )
+        .unwrap();
         assert!(save_clipboard_capture(&mut conn, dir.path(), &snapshot, "capture").is_err());
         assert_eq!(
             conn.query_row("SELECT count(*) FROM captures", [], |row| row

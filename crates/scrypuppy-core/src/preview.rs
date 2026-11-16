@@ -484,6 +484,31 @@ mod tests {
     }
 
     #[test]
+    fn common_attached_image_formats_are_normalized_to_png_previews() {
+        for format in [ImageFormat::WebP, ImageFormat::Gif, ImageFormat::Tiff] {
+            let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([40, 80, 120, 255]),
+            ));
+            let mut encoded = Cursor::new(Vec::new());
+            source.write_to(&mut encoded, format).unwrap();
+
+            let preview = image_thumbnail(encoded.get_ref()).unwrap();
+
+            assert_eq!(preview.width, 2);
+            assert_eq!(preview.height, 2);
+            assert_eq!(
+                ImageReader::new(Cursor::new(preview.png))
+                    .with_guessed_format()
+                    .unwrap()
+                    .format(),
+                Some(ImageFormat::Png)
+            );
+        }
+    }
+
+    #[test]
     fn docx_preview_extracts_bounded_paragraph_text_and_unescapes_xml() {
         use zip::{write::SimpleFileOptions, ZipWriter};
 

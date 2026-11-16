@@ -7750,6 +7750,27 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
             } else {
                 continue;
             };
+            if matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "bmp" | "ico" | "webp" | "gif" | "tif" | "tiff"
+            ) {
+                if let Ok(bytes) = bytes {
+                    if let Ok(preview) = scrypuppy_core::preview::cached_preview(
+                        &cache_root,
+                        &capture.id,
+                        "attached-image-thumbnail",
+                        &bytes,
+                        12 * 1024 * 1024,
+                        || {
+                            scrypuppy_core::preview::image_thumbnail(&bytes)
+                                .map(|preview| preview.png)
+                        },
+                    ) {
+                        images.push((capture.id.clone(), preview));
+                    }
+                }
+                continue;
+            }
             if extension.eq_ignore_ascii_case("pdf") {
                 if let Some(path) = file.local_path.as_deref().map(Path::new) {
                     if let Ok(source) = read_managed_asset(root, path) {

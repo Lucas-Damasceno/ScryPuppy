@@ -10,7 +10,7 @@ arboard = "=3.6.1"
 chrono = "0.4"
 fastembed = { version = "=5.17.3", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 html5ever = "0.38.0"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico", "bmp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico", "bmp", "webp", "gif", "tiff"] }
 quick-xml = "0.41.0"
 regex = "1.13.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
