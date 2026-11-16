@@ -604,7 +604,7 @@ enum Message {
     ReopenOnboarding,
     ClipboardChanged(u32),
     OcrUpdated(String),
-    ScreenshotSaved(String, Result<(), String>),
+    ScreenshotSaved(Result<(), String>),
     ClipboardCaptured(Result<Option<(String, bool)>, String>),
     ClipboardMonitorSaved(Result<(), String>),
     ToggleQuickPasteStyle,
@@ -2659,11 +2659,9 @@ impl App {
                 let refresh = self.refresh_local_search();
                 Task::batch([self.reload(), refresh])
             }
-            Message::ScreenshotSaved(capture_id, result) => {
+            Message::ScreenshotSaved(result) => {
                 if let Err(error) = result {
                     self.notice = Some(format!("Screenshot não disponível: {error}"));
-                } else if self.selected_capture.as_deref() != Some(capture_id.as_str()) {
-                    return Task::none();
                 }
                 self.reload()
             }
@@ -6821,7 +6819,7 @@ fn queue_window_screenshot(capture_id: String, active: ActiveWindowMetadata) {
                 }
                 Ok(())
             })();
-            send_clipboard_message(Message::ScreenshotSaved(capture_id, result));
+            send_clipboard_message(Message::ScreenshotSaved(result));
         });
 }
 
