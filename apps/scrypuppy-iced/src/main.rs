@@ -289,6 +289,7 @@ struct App {
     assistant_answer: Option<scrypuppy_core::assistant::ChatAnswer>,
     assistant_capture: Option<CaptureDto>,
     selected_document: Option<scrypuppy_core::documents::Document>,
+    pending_delete_document: Option<String>,
     document_editor: text_editor::Content,
     context: Option<String>,
     new_context_name: String,
@@ -374,6 +375,10 @@ enum Message {
     AiDocumentGenerated(Result<scrypuppy_core::documents::Document, String>),
     OpenSavedDocument(String),
     SavedDocumentLoaded(Result<scrypuppy_core::documents::Document, String>),
+    RequestDeleteDocument,
+    CancelDeleteDocument,
+    DeleteDocument(String),
+    DocumentDeleted(String, Result<(), String>),
     EditDocument(text_editor::Action),
     SaveEditedDocument,
     EditedDocumentSaved(Result<(), String>),
@@ -517,6 +522,7 @@ impl App {
             assistant_answer: None,
             assistant_capture: None,
             selected_document: None,
+            pending_delete_document: None,
             document_editor: text_editor::Content::new(),
             context: None,
             new_context_name: String::new(),
@@ -1007,10 +1013,55 @@ impl App {
                 Message::SavedDocumentLoaded,
             ),
             Message::SavedDocumentLoaded(result) => {
+                self.pending_delete_document = None;
                 match result {
                     Ok(document) => {
                         self.document_editor = text_editor::Content::with_text(&document.markdown);
                         self.selected_document = Some(document);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::RequestDeleteDocument => {
+                self.pending_delete_document = self
+                    .selected_document
+                    .as_ref()
+                    .map(|document| document.root_id.clone());
+                Task::none()
+            }
+            Message::CancelDeleteDocument => {
+                self.pending_delete_document = None;
+                Task::none()
+            }
+            Message::DeleteDocument(root_id) => {
+                if self.pending_delete_document.as_deref() != Some(root_id.as_str()) {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { delete_saved_document_root(&root_id).map(|()| root_id.clone()) },
+                    |result| match result {
+                        Ok(root_id) => Message::DocumentDeleted(root_id, Ok(())),
+                        Err(error) => Message::DocumentDeleted(String::new(), Err(error)),
+                    },
+                )
+            }
+            Message::DocumentDeleted(root_id, result) => {
+                self.action_busy = false;
+                self.pending_delete_document = None;
+                match result {
+                    Ok(()) => {
+                        if self
+                            .selected_document
+                            .as_ref()
+                            .is_some_and(|document| document.root_id == root_id)
+                        {
+                            self.selected_document = None;
+                            self.document_editor = text_editor::Content::new();
+                        }
+                        self.notice = Some("Documento e versões excluídos.".into());
+                        return self.reload();
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -2676,9 +2727,31 @@ impl App {
                     .on_press_maybe((!self.action_busy).then_some(Message::SaveEditedDocument),),
                     button("Exportar Markdown")
                         .on_press_maybe((!self.action_busy).then_some(Message::ExportDocument)),
+                    button("Excluir documento e versões").on_press_maybe(
+                        (!self.action_busy).then_some(Message::RequestDeleteDocument)
+                    ),
                     text(format!("{} fonte(s) vinculada(s)", document.evidence.len())).size(11),
                 ]
                 .spacing(8);
+                if self.pending_delete_document.as_deref() == Some(document.root_id.as_str()) {
+                    document_content = document_content.push(
+                        text(format!(
+                            "Excluir {} e todas as versões? Esta ação não pode ser desfeita.",
+                            document.title
+                        ))
+                        .size(12),
+                    );
+                    document_content = document_content.push(
+                        row![
+                            button("Confirmar exclusão das versões").on_press_maybe(
+                                (!self.action_busy)
+                                    .then_some(Message::DeleteDocument(document.root_id.clone()))
+                            ),
+                            button("Cancelar").on_press(Message::CancelDeleteDocument),
+                        ]
+                        .spacing(8),
+                    );
+                }
                 for evidence in &document.evidence {
                     let source = format!(
                         "{} · {} · {}",
@@ -4087,6 +4160,14 @@ fn save_document_markdown(id: &str, markdown: &str) -> Result<(), String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_write(&path, &database_key)?;
     scrypuppy_core::documents::update_markdown(&conn, id, markdown)
+}
+
+fn delete_saved_document_root(root_id: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    scrypuppy_core::documents::delete_root(&transaction, root_id)?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn document_export_filename(document: &scrypuppy_core::documents::Document) -> String {
