@@ -51,6 +51,15 @@ type TextPreview = (String, String);
 fn main() -> iced::Result {
     #[cfg(windows)]
     let debug_demo = cfg!(debug_assertions) && std::env::args_os().any(|arg| arg == "--demo");
+    #[cfg(windows)]
+    let _single_instance_guard = match acquire_single_instance() {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            eprintln!("Não foi possível verificar outra instância: {error}");
+            None
+        }
+    };
     let clipboard_monitor_handle = scrypuppy_core::monitor::ClipboardMonitorHandle::new();
     #[cfg(windows)]
     if !debug_demo {
@@ -127,6 +136,88 @@ fn main() -> iced::Result {
     clipboard_monitor_handle.shutdown();
     drop(hotkey_manager);
     result
+}
+
+#[cfg(windows)]
+struct SingleInstanceGuard(std::ptr::NonNull<std::ffi::c_void>);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            close_kernel_handle(self.0.as_ptr());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CreateMutexW"]
+    fn create_named_mutex(
+        attributes: *mut std::ffi::c_void,
+        initial_owner: i32,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    #[link_name = "GetLastError"]
+    fn get_last_error() -> u32;
+    #[link_name = "CloseHandle"]
+    fn close_kernel_handle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "FindWindowW"]
+    fn find_window_w(class_name: *const u16, window_name: *const u16) -> *mut std::ffi::c_void;
+    #[link_name = "ShowWindow"]
+    fn show_native_window(window: *mut std::ffi::c_void, command: i32) -> i32;
+    #[link_name = "SetForegroundWindow"]
+    fn set_foreground_window(window: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
+    use std::{os::windows::ffi::OsStrExt, ptr::NonNull};
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name = std::ffi::OsStr::new("Local\\ScryPuppy-Iced-SingleInstance-v1")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe { create_named_mutex(std::ptr::null_mut(), 1, name.as_ptr()) };
+    let Some(handle) = NonNull::new(handle) else {
+        return Err("Windows não criou o mutex de instância única.".into());
+    };
+
+    if unsafe { get_last_error() } == ERROR_ALREADY_EXISTS {
+        unsafe { close_kernel_handle(handle.as_ptr()) };
+        activate_existing_instance();
+        return Ok(None);
+    }
+
+    Ok(Some(SingleInstanceGuard(handle)))
+}
+
+#[cfg(windows)]
+fn activate_existing_instance() {
+    use std::{os::windows::ffi::OsStrExt, time::Duration};
+
+    let title = std::ffi::OsStr::new("ScryPuppy — Iced")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    for _ in 0..20 {
+        let window = unsafe { find_window_w(std::ptr::null(), title.as_ptr()) };
+        if !window.is_null() {
+            unsafe {
+                show_native_window(window, 9);
+                set_foreground_window(window);
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn app_theme_variant(dark: bool, transparent: bool) -> Theme {
