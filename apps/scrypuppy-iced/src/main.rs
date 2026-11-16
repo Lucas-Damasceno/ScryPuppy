@@ -235,6 +235,7 @@ fn localized_ui_text(value: &str, english: bool) -> String {
         "Prévia da primeira página do PDF indisponível." => "PDF first-page preview unavailable.".into(),
         "Prévia visual do documento Word indisponível." => "Word document visual preview unavailable.".into(),
         "Prévia de texto do documento Word indisponível." => "Word document text preview unavailable.".into(),
+        "Miniatura da imagem indisponível." => "Image thumbnail unavailable.".into(),
         "Prévia do arquivo de texto indisponível." => "Text file preview unavailable.".into(),
         "Prévia do site indisponível; o link continua identificado." => "Website preview unavailable; the link is still identified.".into(),
         "Prévia indisponível para este tipo de captura." => "Preview unavailable for this capture type.".into(),
@@ -8200,6 +8201,9 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
         "doc" => "Prévia de texto do documento Word indisponível.".into(),
         "docx" => "Prévia de texto do documento Word indisponível.".into(),
         "txt" => "Prévia do arquivo de texto indisponível.".into(),
+        "png" | "jpg" | "jpeg" | "bmp" | "ico" | "webp" | "gif" | "tif" | "tiff" => {
+            "Miniatura da imagem indisponível.".into()
+        }
         _ if capture.content_kind == "image" => "Miniatura da imagem indisponível.".into(),
         _ if capture.content_kind == "url" => {
             "Prévia do site indisponível; o link continua identificado.".into()
@@ -8303,6 +8307,14 @@ mod tests {
         image_capture.files[0].display_name = "sample.webp".into();
         image_capture.files[0].local_path = Some(image_source.to_string_lossy().into_owned());
         image_capture.files[0].extension = Some("webp".into());
+        assert_eq!(
+            preview_fallback_text(&image_capture),
+            "Miniatura da imagem indisponível."
+        );
+        assert_eq!(
+            localized_ui_text(&preview_fallback_text(&image_capture), true),
+            "Image thumbnail unavailable."
+        );
 
         let (images, text) = previews(&asset_root, &[capture, image_capture]);
 
