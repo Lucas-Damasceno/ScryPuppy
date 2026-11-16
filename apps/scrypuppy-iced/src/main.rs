@@ -7771,7 +7771,10 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                 }
                 continue;
             }
-            if !extension.eq_ignore_ascii_case("txt") && !extension.eq_ignore_ascii_case("docx") {
+            if !extension.eq_ignore_ascii_case("txt")
+                && !extension.eq_ignore_ascii_case("doc")
+                && !extension.eq_ignore_ascii_case("docx")
+            {
                 continue;
             }
             if let Ok(bytes) = bytes {
@@ -7789,6 +7792,8 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                 }
                 let kind = if extension.eq_ignore_ascii_case("txt") {
                     "plain-text-excerpt"
+                } else if extension.eq_ignore_ascii_case("doc") {
+                    "doc-text-excerpt"
                 } else {
                     "docx-text-excerpt"
                 };
@@ -7801,6 +7806,8 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                     || {
                         let excerpt = if extension.eq_ignore_ascii_case("txt") {
                             scrypuppy_core::preview::text_excerpt(&bytes)
+                        } else if extension.eq_ignore_ascii_case("doc") {
+                            scrypuppy_core::preview::doc_first_page_excerpt(&bytes)
                         } else {
                             scrypuppy_core::preview::docx_excerpt(&bytes)
                         }?;
@@ -8013,7 +8020,7 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
         .to_ascii_lowercase();
     match extension.as_str() {
         "pdf" => "Prévia da primeira página do PDF indisponível.".into(),
-        "doc" => "Prévia visual do documento Word indisponível.".into(),
+        "doc" => "Prévia de texto do documento Word indisponível.".into(),
         "docx" => "Prévia de texto do documento Word indisponível.".into(),
         "txt" => "Prévia do arquivo de texto indisponível.".into(),
         _ if capture.content_kind == "image" => "Miniatura da imagem indisponível.".into(),

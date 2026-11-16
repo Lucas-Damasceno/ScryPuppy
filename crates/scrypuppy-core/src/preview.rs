@@ -392,6 +392,24 @@ pub fn docx_excerpt(bytes: &[u8]) -> Result<String, PreviewError> {
         .collect())
 }
 
+/// Extract a bounded first-page text preview from a legacy Word binary file.
+/// The parser is isolated from malformed-input panics so bad files degrade to
+/// the same unavailable-preview state as other unsupported documents.
+pub fn doc_first_page_excerpt(bytes: &[u8]) -> Result<String, PreviewError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let document =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unword::parse_doc(bytes)))
+            .map_err(|_| PreviewError::InvalidDocument)?
+            .map_err(|_| PreviewError::InvalidDocument)?;
+    let first_page = document
+        .body_text
+        .split_once("\n---\n")
+        .map_or(document.body_text.as_str(), |(page, _)| page);
+    text_excerpt(first_page.as_bytes())
+}
+
 /// Decode an image with strict allocation/dimension bounds and emit a PNG thumbnail.
 pub fn image_thumbnail(bytes: &[u8]) -> Result<ImagePreview, PreviewError> {
     if bytes.len() > MAX_INPUT_BYTES {
@@ -487,6 +505,22 @@ mod tests {
         assert_eq!(
             docx_excerpt(b"not a docx"),
             Err(PreviewError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn legacy_doc_preview_extracts_only_first_page_and_rejects_bad_input() {
+        let bytes = include_bytes!("../tests/fixtures/legacy-word-sample.doc");
+        let excerpt = doc_first_page_excerpt(bytes).unwrap();
+        assert!(excerpt.contains("Concert du soir"));
+        assert!(!excerpt.contains("---"));
+        assert_eq!(
+            doc_first_page_excerpt(b"not a Word document"),
+            Err(PreviewError::InvalidDocument)
+        );
+        assert_eq!(
+            doc_first_page_excerpt(&vec![0; MAX_INPUT_BYTES + 1]),
+            Err(PreviewError::TooLarge)
         );
     }
 
