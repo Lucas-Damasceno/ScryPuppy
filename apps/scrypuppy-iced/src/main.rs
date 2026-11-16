@@ -178,6 +178,25 @@ fn navigation_style(dark: bool, selected: bool, status: button::Status) -> butto
     }
 }
 
+fn context_rule_field_label(field: &str) -> &'static str {
+    match field {
+        "application" => "Aplicativo",
+        "window_title" => "Título da janela",
+        "content_type" => "Tipo de conteúdo",
+        "file_extension" => "Extensão do arquivo",
+        "file_path" => "Caminho do arquivo",
+        _ => "Texto",
+    }
+}
+
+fn context_rule_operator_label(operator: &str) -> &'static str {
+    match operator {
+        "equals" => "é igual a",
+        "matches" => "corresponde à expressão regular",
+        _ => "contém",
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Snapshot {
     contexts: Vec<ContextDto>,
@@ -922,7 +941,16 @@ impl App {
                 let match_mode = self.new_rule_match_mode.clone();
                 let field = self.new_rule_field.clone();
                 let operator = self.new_rule_operator.clone();
-                if name.is_empty() || conditions.iter().any(String::is_empty) || self.action_busy {
+                if name.is_empty() || name.chars().count() > 80 {
+                    self.notice =
+                        Some("Informe um nome para a regra com até 80 caracteres.".into());
+                    return Task::none();
+                }
+                if conditions.iter().any(String::is_empty) {
+                    self.notice = Some("Preencha todas as condições da regra.".into());
+                    return Task::none();
+                }
+                if self.action_busy {
                     return Task::none();
                 }
                 self.action_busy = true;
@@ -1823,16 +1851,22 @@ impl App {
                                 .padding(8),
                         )
                         .push(
-                            button(text(format!("Campo: {}", self.new_rule_field)))
-                                .on_press(Message::CycleRuleField),
+                            button(text(format!(
+                                "Campo: {}",
+                                context_rule_field_label(&self.new_rule_field)
+                            )))
+                            .on_press(Message::CycleRuleField),
                         )
                         .push(
-                            button(text(format!("Operador: {}", self.new_rule_operator)))
-                                .on_press(Message::CycleRuleOperator),
+                            button(text(format!(
+                                "Operador: {}",
+                                context_rule_operator_label(&self.new_rule_operator)
+                            )))
+                            .on_press(Message::CycleRuleOperator),
                         );
                     for (index, condition) in self.new_rule_conditions.iter().enumerate() {
                         navigation = navigation.push(
-                            text_input(&format!("Texto {} contém", index + 1), condition)
+                            text_input(&format!("Condição {}", index + 1), condition)
                                 .on_input(move |value| {
                                     Message::NewRuleConditionChanged(index, value)
                                 })
