@@ -1018,10 +1018,40 @@ mod tests {
             "capture",
         )
         .unwrap();
+        let archived_id = save_clipboard_capture(
+            &mut conn,
+            dir.path(),
+            &ClipboardSnapshot {
+                representations: vec![ClipboardRepresentation::PlainText(
+                    "Nota sobre planejamento arquivada".into(),
+                )],
+                formats: Vec::new(),
+            },
+            "capture",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO capture_contexts (capture_id, context_id, assignment_origin, confidence, created_at)
              VALUES (?1, 'work', 'manual', 1, 'now')",
             [&capture_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_contexts (capture_id, context_id, assignment_origin, confidence, created_at)
+             VALUES (?1, 'work', 'manual', 1, 'now')",
+            [&archived_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-15T10:00:00Z'
+             WHERE id = ?1",
+            [&capture_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-14T10:00:00Z'
+             WHERE id = ?1",
+            [&archived_id],
         )
         .unwrap();
 
@@ -1043,12 +1073,28 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(answer.evidence.len(), 1);
+        assert_eq!(answer.evidence.len(), 2);
         assert_eq!(answer.evidence[0].capture_id, capture_id);
         assert!(answer.answer.contains("Encontrei"));
         assert_eq!(answer.evidence[0].context_names, ["Trabalho"]);
         assert!(answer.evidence[0].excerpt.contains("[redigido]"));
         assert!(!answer.evidence[0].excerpt.contains("sk-proj-"));
+
+        let filtered = answer_chat(
+            &conn,
+            &settings,
+            &ChatRequest {
+                query: "planejamento".into(),
+                context_id: Some("work".into()),
+                app: Some("Visual Studio".into()),
+                date_from: Some("2026-11-15T00:00:00".into()),
+                date_to: Some("2026-11-15T23:59:59.999999999".into()),
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.evidence.len(), 1);
+        assert_eq!(filtered.evidence[0].capture_id, capture_id);
 
         let summary = answer_chat(
             &conn,
@@ -1064,7 +1110,7 @@ mod tests {
         )
         .unwrap();
         assert!(summary.answer.starts_with("Resumo local"));
-        assert_eq!(summary.evidence.len(), 1);
+        assert_eq!(summary.evidence.len(), 2);
 
         let daily = answer_chat(
             &conn,
