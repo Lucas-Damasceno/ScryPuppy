@@ -26,6 +26,7 @@ use std::{
 
 static QUICK_PASTE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static CAPTURE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
+static REFERENCE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static TRAY_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
@@ -81,6 +82,7 @@ fn main() -> iced::Result {
             for (shortcut, label, id_slot) in [
                 ("ctrl+shift+KeyV", "Quick Paste", &QUICK_PASTE_HOTKEY_ID),
                 ("ctrl+shift+KeyC", "captura", &CAPTURE_HOTKEY_ID),
+                ("ctrl+shift+KeyS", "referência", &REFERENCE_HOTKEY_ID),
             ] {
                 match HotKey::from_str(shortcut) {
                     Ok(hotkey) => match manager.register(hotkey) {
@@ -564,6 +566,7 @@ enum Message {
     AssignContext(String, String),
     RemoveContext(String, String),
     CaptureClipboard,
+    CaptureReference,
     OpenQuickPaste(isize),
     QuickPasteOpened(window::Id),
     FinishQuickPaste,
@@ -601,6 +604,7 @@ enum Message {
     ContextAssigned(u64, Result<(), String>),
     ContextRemoved(u64, Result<(), String>),
     Captured(u64, Result<String, String>),
+    ReferenceCaptured(u64, Result<String, String>),
     Pasted(Result<(), String>),
     ThemeSaved(Result<(), String>),
     QuickStyleSaved(Result<(), String>),
@@ -2298,6 +2302,25 @@ impl App {
                     Message::Captured(revision, result)
                 })
             }
+            Message::CaptureReference => {
+                if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                    return Task::none();
+                }
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Captura desativada no modo de demonstração.".into());
+                    return Task::none();
+                }
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                self.notice = None;
+                let revision = self.revision;
+                Task::perform(async move { capture_selected_reference() }, move |result| {
+                    Message::ReferenceCaptured(revision, result)
+                })
+            }
             Message::ToggleTheme => {
                 self.dark = !self.dark;
                 self.theme_changed = true;
@@ -2878,6 +2901,22 @@ impl App {
                                 refresh,
                             ]);
                         }
+                        return Task::batch([self.reload(), refresh]);
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.reload()
+            }
+            Message::ReferenceCaptured(revision, result) => {
+                self.action_busy = false;
+                if revision != self.revision {
+                    return Task::none();
+                }
+                match result {
+                    Ok(id) => {
+                        self.notice = Some("Referência salva na Knowledge Base.".into());
+                        self.selected_capture = Some(id);
+                        let refresh = self.refresh_local_search();
                         return Task::batch([self.reload(), refresh]);
                     }
                     Err(error) => self.notice = Some(error),
@@ -4313,6 +4352,7 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
             let (sender, mut receiver) = mpsc::unbounded();
             let quick_paste_id = QUICK_PASTE_HOTKEY_ID.get().copied();
             let capture_id = CAPTURE_HOTKEY_ID.get().copied();
+            let reference_id = REFERENCE_HOTKEY_ID.get().copied();
             let _ = thread::Builder::new()
                 .name("scrypuppy-hotkey-events".into())
                 .spawn(move || {
@@ -4322,6 +4362,12 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
                         }
                         if Some(event.id) == capture_id {
                             if sender.unbounded_send(Message::CaptureClipboard).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if Some(event.id) == reference_id {
+                            if sender.unbounded_send(Message::CaptureReference).is_err() {
                                 break;
                             }
                             continue;
@@ -6376,6 +6422,143 @@ fn capture_current_clipboard() -> Result<String, String> {
     Ok(id)
 }
 
+fn capture_selected_reference() -> Result<String, String> {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    use std::{thread, time::Duration};
+
+    let coordinator =
+        CAPTURE_COORDINATOR.get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
+    let _capture_session = coordinator.begin()?;
+    if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+        return Err("A limpeza da biblioteca está em andamento.".into());
+    }
+    let suppression = coordinator.suppress_monitor();
+    let clipboard = scrypuppy_core::clipboard::ClipboardService::start()?;
+    let previous = clipboard.read().ok().flatten();
+    let marker = format!("__SCRY_PUPPY_REFERENCE_MARKER_{}__", uuid::Uuid::new_v4());
+    if let Err(error) = clipboard.write(scrypuppy_core::clipboard::ClipboardSnapshot::text(&marker))
+    {
+        clipboard.shutdown();
+        return Err(error);
+    }
+
+    let copy_result = (|| {
+        let mut enigo = Enigo::new(&Settings::default()).map_err(|error| error.to_string())?;
+        for key in [
+            Key::Shift,
+            Key::LShift,
+            Key::RShift,
+            Key::Control,
+            Key::LControl,
+            Key::RControl,
+            Key::Meta,
+            Key::Alt,
+        ] {
+            let _ = enigo.key(key, Direction::Release);
+        }
+        thread::sleep(Duration::from_millis(120));
+        #[cfg(target_os = "macos")]
+        let modifier = Key::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let modifier = Key::Control;
+        enigo
+            .key(modifier, Direction::Press)
+            .map_err(|error| error.to_string())?;
+        let copy = enigo.key(Key::Unicode('c'), Direction::Click);
+        let release = enigo.key(modifier, Direction::Release);
+        copy.map_err(|error| error.to_string())?;
+        release.map_err(|error| error.to_string())?;
+
+        for _ in 0..8 {
+            thread::sleep(Duration::from_millis(50));
+            if let Some(snapshot) = clipboard.read()? {
+                if snapshot.plain_text() == Some(marker.as_str())
+                    && snapshot.representations.len() == 1
+                {
+                    continue;
+                }
+                return Ok(snapshot);
+            }
+        }
+        Err("Nenhum conteúdo foi copiado. Selecione texto ou uma imagem antes do atalho.".into())
+    })();
+
+    let snapshot = match copy_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Some(previous) = previous.as_ref() {
+                let _ = clipboard.write(previous.clone());
+            }
+            clipboard.shutdown();
+            return Err(error);
+        }
+    };
+    clipboard.shutdown();
+    if snapshot.files().is_some() {
+        if let Some(previous) = previous.as_ref() {
+            let _ = restore_reference_clipboard(previous);
+        }
+        return Err("A Knowledge Base aceita texto e imagens selecionados, não arquivos.".into());
+    }
+    if snapshot.content_text().trim().is_empty() && snapshot.image().is_none() {
+        if let Some(previous) = previous.as_ref() {
+            let _ = restore_reference_clipboard(previous);
+        }
+        return Err("Selecione texto ou uma imagem antes do atalho de referência.".into());
+    }
+
+    #[cfg(windows)]
+    coordinator.mark_internal_sequence(unsafe {
+        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    });
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let active = active_window_metadata();
+    let mut conn = open_existing_read_write(&path, &database_key).map_err(|_| {
+        "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
+    })?;
+    let id = scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
+        &mut conn,
+        app_dir,
+        &snapshot,
+        "reference",
+        scrypuppy_core::capture_store::CaptureSourceMetadata {
+            capture_origin: "explicit_hotkey",
+            source_app_name: active.app_name.as_deref(),
+            source_app_id: active.app_id.as_deref(),
+            source_process_id: active.process_id,
+            source_process_path: active.process_path.as_deref(),
+            window_title: active.window_title.as_deref(),
+            window_id: active.window_id.as_deref(),
+        },
+    )?;
+    let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
+    sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+    if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
+        start_ocr_worker();
+    }
+    drop(suppression);
+    Ok(id)
+}
+
+fn restore_reference_clipboard(
+    snapshot: &scrypuppy_core::clipboard::ClipboardSnapshot,
+) -> Result<(), String> {
+    let service = scrypuppy_core::clipboard::ClipboardService::start()?;
+    let result = service.write(snapshot.clone());
+    service.shutdown();
+    result?;
+    #[cfg(windows)]
+    CAPTURE_COORDINATOR
+        .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+        .mark_internal_sequence(unsafe {
+            windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+        });
+    Ok(())
+}
+
 #[derive(Default)]
 struct ActiveWindowMetadata {
     app_name: Option<String>,
@@ -7243,6 +7426,12 @@ mod tests {
     #[test]
     fn capture_shortcut_matches_the_existing_default() {
         let hotkey = HotKey::from_str("ctrl+shift+KeyC").unwrap();
+        assert_ne!(hotkey.id(), 0);
+    }
+
+    #[test]
+    fn reference_shortcut_is_registered_as_ctrl_shift_s() {
+        let hotkey = HotKey::from_str("ctrl+shift+KeyS").unwrap();
         assert_ne!(hotkey.id(), 0);
     }
 

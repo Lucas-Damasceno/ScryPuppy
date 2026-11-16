@@ -110,13 +110,18 @@ pub fn save_clipboard_capture_with_window_metadata(
     let captured_at = now.to_rfc3339();
     let threshold = (now - Duration::seconds(2)).to_rfc3339();
     let hash = snapshot.content_hash();
+    let context_id = if capture_kind == "reference" {
+        "knowledge-base"
+    } else {
+        "inbox"
+    };
     let duplicate = conn
         .query_row(
             "SELECT EXISTS(
             SELECT 1 FROM captures WHERE content_hash = ? AND captured_at >= ?
-              AND context_id = 'inbox' AND capture_kind = ?
+              AND context_id = ? AND capture_kind = ?
         )",
-            params![hash, threshold, capture_kind],
+            params![hash, threshold, context_id, capture_kind],
             |row| row.get::<_, i64>(0),
         )
         .map_err(err)?
@@ -157,9 +162,10 @@ pub fn save_clipboard_capture_with_window_metadata(
             id, context_id, content_text, content_hash, captured_at,
             source_app_name, source_app_id, source_process_id, source_process_path,
             window_title, window_id, platform, metadata_json, capture_kind, created_at
-        ) VALUES (?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 capture_id,
+                context_id,
                 content_text,
                 hash,
                 captured_at,
@@ -539,6 +545,28 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn reference_captures_are_saved_to_knowledge_base_and_deduplicated_there() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = ClipboardSnapshot::text("selected reference text");
+        let id = save_clipboard_capture(&mut conn, dir.path(), &snapshot, "reference").unwrap();
+
+        let context_id = conn
+            .query_row(
+                "SELECT context_id FROM captures WHERE id = ?",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(context_id, "knowledge-base");
+        assert_eq!(
+            save_clipboard_capture(&mut conn, dir.path(), &snapshot, "reference").unwrap_err(),
+            "DUPLICATE_CAPTURE_IGNORED"
         );
     }
 
