@@ -92,6 +92,9 @@ jobs:
       - name: Check Iced migration build
         run: cargo check --manifest-path apps/scrypuppy-iced/Cargo.toml --locked
 
+      - name: Lint Iced migration
+        run: cargo clippy --manifest-path apps/scrypuppy-iced/Cargo.toml --locked -- -D warnings
+
       - name: Test Iced migration
         run: cargo test --manifest-path apps/scrypuppy-iced/Cargo.toml --locked
 
