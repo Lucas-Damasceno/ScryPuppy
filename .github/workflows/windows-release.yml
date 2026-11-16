@@ -83,7 +83,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: windows-rust-${{ hashFiles('src-tauri/Cargo.lock') }}
+            apps/scrypuppy-iced/target
+          key: windows-rust-${{ hashFiles('src-tauri/Cargo.lock', 'apps/scrypuppy-iced/Cargo.lock') }}
           restore-keys: |
             windows-rust-
 
@@ -140,6 +141,18 @@ jobs:
 
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+
+      - name: Check Iced formatting
+        run: cargo fmt --manifest-path apps/scrypuppy-iced/Cargo.toml --check
+
+      - name: Lint Iced app
+        run: cargo clippy --manifest-path apps/scrypuppy-iced/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test Iced app
+        run: cargo test --manifest-path apps/scrypuppy-iced/Cargo.toml --locked
+
+      - name: Build Iced release executable
+        run: cargo build --manifest-path apps/scrypuppy-iced/Cargo.toml --release --locked
 
       - name: Build and smoke-test Windows installer
         env:
@@ -244,6 +257,8 @@ jobs:
               src-tauri/Cargo.toml `
               src-tauri/Cargo.lock `
               src-tauri/tauri.conf.json `
+              apps/scrypuppy-iced/Cargo.toml `
+              apps/scrypuppy-iced/Cargo.lock `
               README.md
             git commit -m "chore(release): $env:RELEASE_TAG [skip ci]"
             if ($LASTEXITCODE -ne 0) {

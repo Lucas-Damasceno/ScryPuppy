@@ -108,6 +108,18 @@ Update-VersionFile "src-tauri/tauri.conf.json" @(
     Pattern = '(?m)^(?<prefix>  "version":\s*")[^"]+(?<suffix>",)(?=\r?$)'
   }
 )
+Update-VersionFile "apps/scrypuppy-iced/Cargo.toml" @(
+  @{
+    Label = "package version"
+    Pattern = '(?m)^(?<prefix>version\s*=\s*")[^"]+(?<suffix>")(?=\r?$)'
+  }
+)
+Update-VersionFile "apps/scrypuppy-iced/Cargo.lock" @(
+  @{
+    Label = "scrypuppy-iced package version"
+    Pattern = '(?ms)(?<prefix>^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-iced"\r?\nversion\s*=\s*")[^"]+(?<suffix>")'
+  }
+)
 Update-VersionFile "README.md" @(
   @{
     Label = "current package version"

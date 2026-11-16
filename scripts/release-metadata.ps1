@@ -6,16 +6,24 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $tauriRoot = Join-Path $repoRoot "src-tauri"
+$icedRoot = Join-Path $repoRoot "apps\scrypuppy-iced"
 $tauriConfig = Get-Content (Join-Path $tauriRoot "tauri.conf.json") -Raw | ConvertFrom-Json
 $packageJson = Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json
 $packageLock = Get-Content (Join-Path $repoRoot "package-lock.json") -Raw
 $cargoToml = Get-Content (Join-Path $tauriRoot "Cargo.toml") -Raw
 $cargoLock = Get-Content (Join-Path $tauriRoot "Cargo.lock") -Raw
+$icedCargoToml = Get-Content (Join-Path $icedRoot "Cargo.toml") -Raw
+$icedCargoLock = Get-Content (Join-Path $icedRoot "Cargo.lock") -Raw
 
 $cargoTomlMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"(?<version>[^"]+)"')
 $cargoLockMatch = [regex]::Match(
   $cargoLock,
   '(?ms)^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy"\r?\nversion\s*=\s*"(?<version>[^"]+)"'
+)
+$icedCargoTomlMatch = [regex]::Match($icedCargoToml, '(?m)^version\s*=\s*"(?<version>[^"]+)"')
+$icedCargoLockMatch = [regex]::Match(
+  $icedCargoLock,
+  '(?ms)^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-iced"\r?\nversion\s*=\s*"(?<version>[^"]+)"'
 )
 $packageLockVersionMatch = [regex]::Match(
   $packageLock,
@@ -28,6 +36,8 @@ $packageLockRootMatch = [regex]::Match(
 if (
   -not $cargoTomlMatch.Success -or
   -not $cargoLockMatch.Success -or
+  -not $icedCargoTomlMatch.Success -or
+  -not $icedCargoLockMatch.Success -or
   -not $packageLockVersionMatch.Success -or
   -not $packageLockRootMatch.Success
 ) {
@@ -40,6 +50,8 @@ $versions = [ordered]@{
   "package-lock.json root package" = $packageLockRootMatch.Groups["version"].Value
   "src-tauri/Cargo.toml" = $cargoTomlMatch.Groups["version"].Value
   "src-tauri/Cargo.lock" = $cargoLockMatch.Groups["version"].Value
+  "apps/scrypuppy-iced/Cargo.toml" = $icedCargoTomlMatch.Groups["version"].Value
+  "apps/scrypuppy-iced/Cargo.lock" = $icedCargoLockMatch.Groups["version"].Value
   "src-tauri/tauri.conf.json" = [string]$tauriConfig.version
 }
 $uniqueVersions = @($versions.Values | Select-Object -Unique)
