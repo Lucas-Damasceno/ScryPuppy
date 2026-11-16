@@ -697,8 +697,8 @@ impl App {
 
     fn new() -> (Self, Task<Message>) {
         let (main, open) = window::open(window::Settings {
-            size: Size::new(1100.0, 720.0),
-            min_size: Some(Size::new(920.0, 560.0)),
+            size: Size::new(850.0, 720.0),
+            min_size: Some(Size::new(820.0, 560.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
         });
@@ -3299,8 +3299,14 @@ impl App {
             text_input("Buscar capturas", &self.query)
                 .on_input(Message::QueryChanged)
                 .on_submit(Message::Search)
-                .padding(10),
+                .padding(10)
+                .width(Length::Fixed(460.0)),
             button("Buscar").on_press(Message::Search),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        let library_actions = row![
             button(if self.action_busy {
                 "Aguarde…"
             } else {
@@ -3323,8 +3329,10 @@ impl App {
             .on_press(Message::ToggleTheme)
             .style(move |_, status| navigation_style(dark, false, status)),
         ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .wrap();
         let mut content = column![
             text(if self.settings_open {
                 "Configurações"
@@ -3339,17 +3347,19 @@ impl App {
             })
             .size(12),
         ]
-        .spacing(18);
+        .spacing(18)
+        .width(Length::Fill);
         if !self.onboarding_completed && !self.settings_open {
             content = content.push(
                 container(
                     column![
                         text("Bem-vindo ao ScryPuppy").size(20),
-                        text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar uma seleção, Ctrl + Shift + S para criar uma referência, Ctrl + Shift + F para perguntar à biblioteca e Ctrl + Shift + V para abrir o Quick Paste.").size(13),
-                        text("A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações.").size(12),
+                        text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar uma seleção, Ctrl + Shift + S para criar uma referência, Ctrl + Shift + F para perguntar à biblioteca e Ctrl + Shift + V para abrir o Quick Paste.").size(13).width(Length::Fill),
+                        text("A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações.").size(12).width(Length::Fill),
                         button("Continuar para a biblioteca").on_press(Message::CompleteOnboarding),
                     ]
-                    .spacing(10),
+                    .spacing(10)
+                    .width(Length::Fill),
                 )
                 .width(Length::Fill)
                 .padding(18)
@@ -3357,34 +3367,43 @@ impl App {
             );
         }
         if !self.settings_open {
-            content = content.push(search);
+            content = content.push(search).push(library_actions);
+            content = content.push(
+                text_input("Aplicativo", &self.library_app_filter)
+                    .on_input(Message::LibraryAppFilterChanged)
+                    .on_submit(Message::Search)
+                    .padding(8)
+                    .width(Length::Fill),
+            );
             content = content.push(
                 row![
-                    text_input("Aplicativo", &self.library_app_filter)
-                        .on_input(Message::LibraryAppFilterChanged)
-                        .on_submit(Message::Search)
-                        .padding(8)
-                        .width(Length::Fill),
                     text_input("Tag exata", &self.library_tag_filter)
                         .on_input(Message::LibraryTagFilterChanged)
                         .on_submit(Message::Search)
                         .padding(8)
-                        .width(150),
+                        .width(140),
                     text_input("De · AAAA-MM-DD", &self.library_date_from)
                         .on_input(Message::LibraryDateFromChanged)
                         .on_submit(Message::Search)
                         .padding(8)
-                        .width(145),
+                        .width(160),
                     text_input("Até · AAAA-MM-DD", &self.library_date_to)
                         .on_input(Message::LibraryDateToChanged)
                         .on_submit(Message::Search)
                         .padding(8)
-                        .width(145),
+                        .width(160),
+                ]
+                .spacing(8)
+                .width(Length::Fill),
+            );
+            content = content.push(
+                row![
                     button(library_kind_filter_label(&self.library_kind_filter))
                         .on_press(Message::CycleLibraryKindFilter),
                     button("Limpar filtros").on_press(Message::ClearLibraryFilters),
                 ]
-                .spacing(6),
+                .spacing(8)
+                .width(Length::Fill),
             );
             content = content.push(text("Pergunte à biblioteca").size(18)).push(
                 row![
@@ -3392,7 +3411,8 @@ impl App {
                         .on_input(Message::AssistantQueryChanged)
                         .on_submit(Message::AskAssistant)
                         .id(self.assistant_query_id.clone())
-                        .padding(10),
+                        .padding(10)
+                        .width(Length::Fixed(460.0)),
                     button(if self.assistant_busy {
                         "Buscando…"
                     } else {
@@ -3403,7 +3423,8 @@ impl App {
                             .then_some(Message::AskAssistant),
                     ),
                 ]
-                .spacing(8),
+                .spacing(8)
+                .width(Length::Fill),
             );
             content = content.push(
                 row![
@@ -3417,7 +3438,9 @@ impl App {
                         .on_input(Message::AssistantDateToChanged)
                         .padding(8),
                 ]
-                .spacing(8),
+                .spacing(8)
+                .width(Length::Fill)
+                .wrap(),
             );
             if let Some(context_id) = &self.context {
                 let context_name = self
@@ -3805,8 +3828,8 @@ impl App {
             if snapshot.captures.is_empty() {
                 content = content.push(text("Nenhuma captura encontrada."));
             }
-            for group in snapshot.captures.chunks(3) {
-                let mut cards = row![].spacing(12);
+            for group in snapshot.captures.chunks(2) {
+                let mut cards = row![].spacing(12).width(Length::Fill);
                 for capture in group {
                     let excerpt = self
                         .text_previews
@@ -3901,10 +3924,10 @@ impl App {
                             },
                             ..button::Style::default()
                         })
-                        .width(Length::FillPortion(1)),
+                        .width(Length::Fixed(250.0)),
                     );
                 }
-                for _ in group.len()..3 {
+                for _ in group.len()..2 {
                     cards = cards.push(Space::new().width(Length::FillPortion(1)));
                 }
                 content = content.push(cards);
