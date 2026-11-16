@@ -7966,7 +7966,7 @@ fn render_doc_first_page_thumbnail(path: &Path) -> Result<Vec<u8>, String> {
     if lines <= 0 {
         return Err("Não foi possível ler a miniatura Word.".into());
     }
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
         if pixel[3] == 0 {
             pixel[3] = 255;
