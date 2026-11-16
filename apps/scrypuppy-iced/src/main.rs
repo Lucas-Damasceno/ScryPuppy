@@ -192,6 +192,7 @@ struct Snapshot {
     clipboard_monitor_quick_context_enabled: bool,
     quick_context_enabled: bool,
     onboarding_completed: bool,
+    launch_at_startup: bool,
     context_rules: Vec<ContextRuleRow>,
 }
 
@@ -237,6 +238,8 @@ struct App {
     new_rule_name: String,
     new_rule_condition: String,
     new_tag: String,
+    launch_at_startup: bool,
+    autostart_changed: bool,
     context_editor: Option<ContextEditor>,
     pending_delete_context: Option<String>,
     offset: usize,
@@ -331,6 +334,7 @@ enum Message {
     ToggleTheme,
     ToggleClipboardMonitor,
     ToggleLinkPreviewFetch,
+    ToggleAutostart,
     ToggleSettings,
     ToggleCaptureScreenshots,
     ToggleMonitorScreenshots,
@@ -352,6 +356,7 @@ enum Message {
     ThemeSaved(Result<(), String>),
     QuickStyleSaved(Result<(), String>),
     LinkPreviewsSaved(Result<(), String>),
+    AutostartSaved(bool, Result<(), String>),
     SettingSaved(&'static str, Result<(), String>),
 }
 
@@ -388,6 +393,8 @@ impl App {
             new_rule_name: String::new(),
             new_rule_condition: String::new(),
             new_tag: String::new(),
+            launch_at_startup: false,
+            autostart_changed: false,
             context_editor: None,
             pending_delete_context: None,
             offset: 0,
@@ -1012,6 +1019,15 @@ impl App {
                 );
                 Task::batch([reload, save])
             }
+            Message::ToggleAutostart => {
+                self.launch_at_startup = !self.launch_at_startup;
+                self.autostart_changed = true;
+                let enabled = self.launch_at_startup;
+                Task::perform(
+                    async move { set_autostart_preference(enabled) },
+                    move |result| Message::AutostartSaved(enabled, result),
+                )
+            }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
                 Task::none()
@@ -1167,6 +1183,15 @@ impl App {
                 }
                 Task::none()
             }
+            Message::AutostartSaved(enabled, result) => {
+                if let Err(error) = result {
+                    self.launch_at_startup = !enabled;
+                    self.notice = Some(format!(
+                        "Não foi possível alterar a inicialização automática: {error}"
+                    ));
+                }
+                Task::none()
+            }
             Message::SettingSaved(key, result) => {
                 if let Err(error) = result {
                     self.notice = Some(format!(
@@ -1214,6 +1239,9 @@ impl App {
                         }
                         if !self.onboarding_changed {
                             self.onboarding_completed = snapshot.onboarding_completed;
+                        }
+                        if !self.autostart_changed {
+                            self.launch_at_startup = snapshot.launch_at_startup;
                         }
                         let fetch_links = self.link_preview_fetch_enabled;
                         self.link_previews_loading = fetch_links
@@ -1609,7 +1637,10 @@ impl App {
                     })
                     .on_press(Message::ToggleLinkPreviewFetch),
                 )
-                .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12));
+                .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12))
+                .push(button(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" })
+                    .on_press(Message::ToggleAutostart))
+                .push(text("Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows.").size(12));
         } else if self.loading {
             content = content.push(text("Carregando biblioteca…"));
         } else if let Some(error) = &self.error {
@@ -2572,6 +2603,7 @@ fn demo_snapshot() -> Snapshot {
         clipboard_monitor_quick_context_enabled: false,
         quick_context_enabled: true,
         onboarding_completed: true,
+        launch_at_startup: false,
         context_rules: Vec::new(),
     }
 }
@@ -2675,6 +2707,76 @@ fn save_setting_value(key: &str, value: &str) -> Result<(), String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_write(&path, &database_key)?;
     save_setting_value_in(&conn, key, value)
+}
+
+fn set_autostart_preference(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::System::Registry::{
+                RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
+                HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+            },
+        };
+        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name: Vec<u16> = "ScryPuppy".encode_utf16().chain(Some(0)).collect();
+        let mut key = HKEY::default();
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut key,
+                None,
+            )
+        };
+        if status.0 != 0 {
+            return Err(format!("Registro do Windows ({})", status.0));
+        }
+        let result = if enabled {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            let command = format!("\"{}\"", executable.display());
+            let data: Vec<u16> = std::ffi::OsStr::new(&command)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+            let status =
+                unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) };
+            if status.0 == 0 {
+                Ok(())
+            } else {
+                Err(format!("Registro do Windows ({})", status.0))
+            }
+        } else {
+            let status = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
+            if status.0 == 0 || status.0 == 2 {
+                Ok(())
+            } else {
+                Err(format!("Registro do Windows ({})", status.0))
+            }
+        };
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        result?;
+    }
+    #[cfg(not(windows))]
+    if enabled {
+        return Err("A inicialização automática está disponível no Windows.".into());
+    }
+    let save = save_setting_value("launch_at_startup", if enabled { "true" } else { "false" });
+    save
 }
 
 fn persist_boolean_setting(key: &'static str, value: bool, demo: bool) -> Task<Message> {
@@ -3638,6 +3740,7 @@ fn load_library(
         read_boolean_setting(&conn, "clipboard_monitor_quick_context_enabled", false);
     let quick_context_enabled = read_boolean_setting(&conn, "quick_context_enabled", true);
     let onboarding_completed = read_boolean_setting(&conn, "onboarding_completed", false);
+    let launch_at_startup = read_boolean_setting(&conn, "launch_at_startup", false);
     let context_rules = {
         let mut stmt = conn
             .prepare(
@@ -3679,6 +3782,7 @@ fn load_library(
         clipboard_monitor_quick_context_enabled,
         quick_context_enabled,
         onboarding_completed,
+        launch_at_startup,
         context_rules,
     })
 }
