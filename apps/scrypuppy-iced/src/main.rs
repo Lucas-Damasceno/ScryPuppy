@@ -6315,6 +6315,9 @@ fn remove_capture_from_context(capture_id: String, context_id: String) -> Result
 }
 
 fn delete_capture_from_library(capture_id: String) -> Result<(), String> {
+    let _capture_session = CAPTURE_COORDINATOR
+        .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+        .begin()?;
     let (path, database_key) = default_database_credentials()?;
     let app_dir = path
         .parent()
@@ -6580,9 +6583,7 @@ fn capture_current_clipboard() -> Result<String, String> {
         },
     )?;
     if include_images {
-        if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
-            eprintln!("A captura foi salva sem screenshot da janela: {error}");
-        }
+        queue_window_screenshot(id.clone(), active);
     }
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
@@ -6711,9 +6712,7 @@ fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
         },
     )?;
     if include_screenshot {
-        if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
-            eprintln!("A captura foi salva sem screenshot da janela: {error}");
-        }
+        queue_window_screenshot(id.clone(), active);
     }
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
@@ -6750,6 +6749,16 @@ fn save_window_screenshot(
     capture_id: &str,
     active: &ActiveWindowMetadata,
 ) -> Result<(), String> {
+    let capture_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM captures WHERE id = ?1)",
+            [capture_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !capture_exists {
+        return Err("A captura foi removida antes de concluir o screenshot.".into());
+    }
     let directory = app_dir.join("assets").join("screenshots");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let path = directory.join(format!("{capture_id}.png"));
@@ -6777,6 +6786,36 @@ fn save_window_screenshot(
         return Err(error.to_string());
     }
     Ok(())
+}
+
+fn queue_window_screenshot(capture_id: String, active: ActiveWindowMetadata) {
+    let _ = thread::Builder::new()
+        .name("scrypuppy-window-screenshot".into())
+        .spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let _capture_session = CAPTURE_COORDINATOR
+                    .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+                    .begin()?;
+                if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let (path, database_key) = default_database_credentials()?;
+                let app_dir = path
+                    .parent()
+                    .ok_or("Diretório da biblioteca indisponível.")?;
+                let conn = open_existing_read_write(&path, &database_key).map_err(|_| {
+                    "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
+                })?;
+                save_window_screenshot(&conn, app_dir, &capture_id, &active)?;
+                if scrypuppy_core::ocr::enqueue_capture(&conn, &capture_id)? {
+                    start_ocr_worker();
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("A captura foi salva sem screenshot da janela: {error}");
+            }
+        });
 }
 
 #[cfg(windows)]
@@ -6846,7 +6885,7 @@ fn normalize_window_label(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ActiveWindowMetadata {
     app_name: Option<String>,
     app_id: Option<String>,
@@ -6938,9 +6977,7 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
     ) {
         Ok(id) => {
             if capture_window_screenshot {
-                if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
-                    eprintln!("A captura automática ficou sem screenshot da janela: {error}");
-                }
+                queue_window_screenshot(id.clone(), active);
             }
             let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
             sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
