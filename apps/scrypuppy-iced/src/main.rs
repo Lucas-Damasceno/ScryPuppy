@@ -192,6 +192,16 @@ struct Snapshot {
     clipboard_monitor_quick_context_enabled: bool,
     quick_context_enabled: bool,
     onboarding_completed: bool,
+    context_rules: Vec<ContextRuleRow>,
+}
+
+#[derive(Clone, Debug)]
+struct ContextRuleRow {
+    id: String,
+    context_id: String,
+    name: String,
+    enabled: bool,
+    condition: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -224,6 +234,8 @@ struct App {
     query: String,
     context: Option<String>,
     new_context_name: String,
+    new_rule_name: String,
+    new_rule_condition: String,
     context_editor: Option<ContextEditor>,
     pending_delete_context: Option<String>,
     offset: usize,
@@ -277,6 +289,13 @@ enum Message {
     SelectContext(Option<String>),
     NewContextNameChanged(String),
     CreateContext,
+    NewRuleNameChanged(String),
+    NewRuleConditionChanged(String),
+    CreateContextRule,
+    ContextRuleCreated(Result<(), String>),
+    ToggleContextRule(String, bool),
+    DeleteContextRule(String),
+    ContextRuleChanged(Result<(), String>),
     ContextCreated(Result<String, String>),
     BeginRenameContext(String),
     ContextEditorNameChanged(String),
@@ -361,6 +380,8 @@ impl App {
             query: String::new(),
             context: None,
             new_context_name: String::new(),
+            new_rule_name: String::new(),
+            new_rule_condition: String::new(),
             context_editor: None,
             pending_delete_context: None,
             offset: 0,
@@ -645,6 +666,73 @@ impl App {
                     async move { create_context_in_library(name) },
                     Message::ContextCreated,
                 )
+            }
+            Message::NewRuleNameChanged(value) => {
+                self.new_rule_name = value;
+                Task::none()
+            }
+            Message::NewRuleConditionChanged(value) => {
+                self.new_rule_condition = value;
+                Task::none()
+            }
+            Message::CreateContextRule => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Regras desativadas no modo de demonstração.".into());
+                    return Task::none();
+                }
+                let Some(context_id) = self.context.clone() else {
+                    return Task::none();
+                };
+                let name = self.new_rule_name.trim().to_string();
+                let condition = self.new_rule_condition.trim().to_string();
+                if name.is_empty() || condition.is_empty() || self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { create_text_context_rule(&context_id, &name, &condition) },
+                    Message::ContextRuleCreated,
+                )
+            }
+            Message::ContextRuleCreated(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.new_rule_name.clear();
+                        self.new_rule_condition.clear();
+                        self.notice = Some("Regra automática criada.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.reload()
+            }
+            Message::ToggleContextRule(id, enabled) => {
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { set_context_rule_enabled(&id, enabled) },
+                    Message::ContextRuleChanged,
+                )
+            }
+            Message::DeleteContextRule(id) => {
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { delete_context_rule(&id) },
+                    Message::ContextRuleChanged,
+                )
+            }
+            Message::ContextRuleChanged(result) => {
+                self.action_busy = false;
+                if let Err(error) = result {
+                    self.notice = Some(error);
+                }
+                self.reload()
             }
             Message::ContextCreated(result) => {
                 self.action_busy = false;
@@ -1319,6 +1407,48 @@ impl App {
                             .on_press(Message::RequestDeleteContext(context_id.to_string()))
                             .width(Length::Fill),
                     );
+                }
+            }
+            if let Some(context_id) = self.context.as_deref() {
+                if !matches!(context_id, "inbox" | "knowledge-base") {
+                    navigation = navigation
+                        .push(Space::new().height(8))
+                        .push(text("REGRAS AUTOMÁTICAS").size(11))
+                        .push(text_input("Nome da regra", &self.new_rule_name)
+                            .on_input(Message::NewRuleNameChanged).padding(8))
+                        .push(text_input("Texto que deve conter", &self.new_rule_condition)
+                            .on_input(Message::NewRuleConditionChanged).padding(8))
+                        .push(text("A regra compara o texto da captura e é aplicada às próximas capturas.").size(10))
+                        .push(button("Criar regra de texto")
+                            .on_press_maybe((!self.action_busy).then_some(Message::CreateContextRule))
+                            .width(Length::Fill));
+                    if let Some(snapshot) = &self.snapshot {
+                        for rule in snapshot
+                            .context_rules
+                            .iter()
+                            .filter(|rule| rule.context_id == context_id)
+                        {
+                            navigation = navigation
+                                .push(
+                                    row![
+                                        button(text(if rule.enabled {
+                                            format!("✓ {}", rule.name)
+                                        } else {
+                                            rule.name.clone()
+                                        }))
+                                        .on_press(Message::ToggleContextRule(
+                                            rule.id.clone(),
+                                            !rule.enabled
+                                        ))
+                                        .width(Length::Fill),
+                                        button("×")
+                                            .on_press(Message::DeleteContextRule(rule.id.clone())),
+                                    ]
+                                    .spacing(4),
+                                )
+                                .push(text(rule.condition.as_str()).size(10));
+                        }
+                    }
                 }
             }
         }
@@ -2381,6 +2511,7 @@ fn demo_snapshot() -> Snapshot {
         clipboard_monitor_quick_context_enabled: false,
         quick_context_enabled: true,
         onboarding_completed: true,
+        context_rules: Vec::new(),
     }
 }
 
@@ -2507,6 +2638,71 @@ fn save_setting_value_in(
         rusqlite::params![key, value],
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn create_text_context_rule(context_id: &str, name: &str, value: &str) -> Result<(), String> {
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty()
+        || name.chars().count() > 80
+        || value.is_empty()
+        || value.chars().count() > 500
+    {
+        return Err("Informe um nome (até 80 caracteres) e um texto (até 500 caracteres).".into());
+    }
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM contexts WHERE id = ?1 AND is_builtin = 0)",
+            [context_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("As regras só podem ser adicionadas a Contextos personalizados.".into());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = chrono::Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT INTO context_rules (id, context_id, name, enabled, match_mode, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 1, 'all', ?4, ?4)",
+        rusqlite::params![id, context_id, name, at],
+    ).map_err(|e| e.to_string())?;
+    transaction.execute(
+        "INSERT INTO context_rule_conditions (id, rule_id, ordinal, field, operator, value, created_at)
+         VALUES (?1, ?2, 0, 'text', 'contains', ?3, ?4)",
+        rusqlite::params![uuid::Uuid::new_v4().to_string(), id, value, at],
+    ).map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())
+}
+
+fn set_context_rule_enabled(id: &str, enabled: bool) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &database_key)?;
+    let changed = conn
+        .execute(
+            "UPDATE context_rules SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, i64::from(enabled), chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Regra não encontrada.".into());
+    }
+    Ok(())
+}
+
+fn delete_context_rule(id: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &database_key)?;
+    let changed = conn
+        .execute("DELETE FROM context_rules WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Regra não encontrada.".into());
+    }
     Ok(())
 }
 
@@ -3331,6 +3527,29 @@ fn load_library(
         read_boolean_setting(&conn, "clipboard_monitor_quick_context_enabled", false);
     let quick_context_enabled = read_boolean_setting(&conn, "quick_context_enabled", true);
     let onboarding_completed = read_boolean_setting(&conn, "onboarding_completed", false);
+    let context_rules = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.id, r.context_id, r.name, r.enabled, COALESCE(c.value, '')
+             FROM context_rules r LEFT JOIN context_rule_conditions c
+             ON c.rule_id = r.id AND c.ordinal = 0 ORDER BY r.created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ContextRuleRow {
+                    id: row.get(0)?,
+                    context_id: row.get(1)?,
+                    name: row.get(2)?,
+                    enabled: row.get::<_, i64>(3)? != 0,
+                    condition: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
     Ok(Snapshot {
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
@@ -3349,6 +3568,7 @@ fn load_library(
         clipboard_monitor_quick_context_enabled,
         quick_context_enabled,
         onboarding_completed,
+        context_rules,
     })
 }
 
@@ -3715,6 +3935,8 @@ mod tests {
             CREATE TABLE capture_entities(capture_id TEXT, id TEXT, kind TEXT, value TEXT, source TEXT, confidence REAL);\
             CREATE TABLE capture_ocr(capture_id TEXT, status TEXT, text TEXT, error TEXT, updated_at TEXT);\
             CREATE TABLE contexts(id TEXT, name TEXT, normalized_name TEXT, slug TEXT, created_at TEXT, updated_at TEXT);\
+            CREATE TABLE context_rules(id TEXT, context_id TEXT, name TEXT, enabled INTEGER, match_mode TEXT, created_at TEXT, updated_at TEXT);\
+            CREATE TABLE context_rule_conditions(id TEXT, rule_id TEXT, ordinal INTEGER, field TEXT, operator TEXT, value TEXT, created_at TEXT);\
             CREATE TABLE capture_contexts(capture_id TEXT, context_id TEXT, assignment_origin TEXT, confidence REAL, created_at TEXT);\
             CREATE TABLE capture_search_documents(capture_id TEXT PRIMARY KEY, content TEXT, ocr TEXT, metadata TEXT, content_hash TEXT, updated_at TEXT);\
             CREATE TABLE capture_embeddings(capture_id TEXT PRIMARY KEY, content_hash TEXT);\
