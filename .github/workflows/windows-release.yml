@@ -259,6 +259,8 @@ jobs:
               src-tauri/tauri.conf.json `
               apps/scrypuppy-iced/Cargo.toml `
               apps/scrypuppy-iced/Cargo.lock `
+              crates/scrypuppy-core/Cargo.toml `
+              crates/scrypuppy-core/Cargo.lock `
               README.md
             git commit -m "chore(release): $env:RELEASE_TAG [skip ci]"
             if ($LASTEXITCODE -ne 0) {

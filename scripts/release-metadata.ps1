@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $tauriRoot = Join-Path $repoRoot "src-tauri"
 $icedRoot = Join-Path $repoRoot "apps\scrypuppy-iced"
+$coreRoot = Join-Path $repoRoot "crates\scrypuppy-core"
 $tauriConfig = Get-Content (Join-Path $tauriRoot "tauri.conf.json") -Raw | ConvertFrom-Json
 $packageJson = Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json
 $packageLock = Get-Content (Join-Path $repoRoot "package-lock.json") -Raw
@@ -14,6 +15,8 @@ $cargoToml = Get-Content (Join-Path $tauriRoot "Cargo.toml") -Raw
 $cargoLock = Get-Content (Join-Path $tauriRoot "Cargo.lock") -Raw
 $icedCargoToml = Get-Content (Join-Path $icedRoot "Cargo.toml") -Raw
 $icedCargoLock = Get-Content (Join-Path $icedRoot "Cargo.lock") -Raw
+$coreCargoToml = Get-Content (Join-Path $coreRoot "Cargo.toml") -Raw
+$coreCargoLock = Get-Content (Join-Path $coreRoot "Cargo.lock") -Raw
 
 $cargoTomlMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"(?<version>[^"]+)"')
 $cargoLockMatch = [regex]::Match(
@@ -24,6 +27,11 @@ $icedCargoTomlMatch = [regex]::Match($icedCargoToml, '(?m)^version\s*=\s*"(?<ver
 $icedCargoLockMatch = [regex]::Match(
   $icedCargoLock,
   '(?ms)^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-iced"\r?\nversion\s*=\s*"(?<version>[^"]+)"'
+)
+$coreCargoTomlMatch = [regex]::Match($coreCargoToml, '(?m)^version\s*=\s*"(?<version>[^"]+)"')
+$coreCargoLockMatch = [regex]::Match(
+  $coreCargoLock,
+  '(?ms)^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-core"\r?\nversion\s*=\s*"(?<version>[^"]+)"'
 )
 $packageLockVersionMatch = [regex]::Match(
   $packageLock,
@@ -38,6 +46,8 @@ if (
   -not $cargoLockMatch.Success -or
   -not $icedCargoTomlMatch.Success -or
   -not $icedCargoLockMatch.Success -or
+  -not $coreCargoTomlMatch.Success -or
+  -not $coreCargoLockMatch.Success -or
   -not $packageLockVersionMatch.Success -or
   -not $packageLockRootMatch.Success
 ) {
@@ -52,6 +62,8 @@ $versions = [ordered]@{
   "src-tauri/Cargo.lock" = $cargoLockMatch.Groups["version"].Value
   "apps/scrypuppy-iced/Cargo.toml" = $icedCargoTomlMatch.Groups["version"].Value
   "apps/scrypuppy-iced/Cargo.lock" = $icedCargoLockMatch.Groups["version"].Value
+  "crates/scrypuppy-core/Cargo.toml" = $coreCargoTomlMatch.Groups["version"].Value
+  "crates/scrypuppy-core/Cargo.lock" = $coreCargoLockMatch.Groups["version"].Value
   "src-tauri/tauri.conf.json" = [string]$tauriConfig.version
 }
 $uniqueVersions = @($versions.Values | Select-Object -Unique)

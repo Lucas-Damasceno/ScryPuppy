@@ -120,6 +120,18 @@ Update-VersionFile "apps/scrypuppy-iced/Cargo.lock" @(
     Pattern = '(?ms)(?<prefix>^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-iced"\r?\nversion\s*=\s*")[^"]+(?<suffix>")'
   }
 )
+Update-VersionFile "crates/scrypuppy-core/Cargo.toml" @(
+  @{
+    Label = "package version"
+    Pattern = '(?m)^(?<prefix>version\s*=\s*")[^"]+(?<suffix>")(?=\r?$)'
+  }
+)
+Update-VersionFile "crates/scrypuppy-core/Cargo.lock" @(
+  @{
+    Label = "scrypuppy-core package version"
+    Pattern = '(?ms)(?<prefix>^\[\[package\]\]\r?\nname\s*=\s*"scrypuppy-core"\r?\nversion\s*=\s*")[^"]+(?<suffix>")'
+  }
+)
 Update-VersionFile "README.md" @(
   @{
     Label = "current package version"
