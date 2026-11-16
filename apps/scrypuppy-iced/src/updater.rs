@@ -9,6 +9,7 @@ const UPDATE_PUBLIC_KEY: &str = "RWQ8fkWotIeUYjFKA1bD5l+c4GyiXPRnYoRNf0lL0wZYd22
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_INSTALLER_BYTES: usize = 100 * 1024 * 1024;
+const DISMISSED_UPDATE_DURATION_SECS: u64 = 6 * 60 * 60;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct UpdateInfo {
@@ -129,6 +130,53 @@ pub async fn download_verified_update(update: UpdateInfo) -> Result<PathBuf, Str
         ));
     }
     Ok(installer_path)
+}
+
+pub fn is_update_dismissed(version: &str) -> bool {
+    let Some(path) = dismissed_update_path() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some((dismissed_version, timestamp)) = contents.trim().split_once('|') else {
+        return false;
+    };
+    if dismissed_version != version {
+        return false;
+    }
+    let Ok(timestamp) = timestamp.parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(timestamp) < DISMISSED_UPDATE_DURATION_SECS
+}
+
+pub fn dismiss_update(version: &str) -> Result<(), String> {
+    let Some(path) = dismissed_update_path() else {
+        return Err("A pasta de configuração do usuário está indisponível.".into());
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "A pasta de configuração do usuário está indisponível.".to_string())?;
+    std::fs::create_dir_all(parent)
+        .and_then(|()| std::fs::write(path, format!("{version}|{now}")))
+        .map_err(|error| format!("Não foi possível lembrar esta atualização: {error}"))
+}
+
+fn dismissed_update_path() -> Option<PathBuf> {
+    Some(
+        dirs::data_dir()?
+            .join("com.scryppy.desktop")
+            .join("update-dismissed.txt"),
+    )
 }
 
 #[cfg(windows)]
@@ -337,5 +385,39 @@ mod tests {
             powershell_literal(std::path::Path::new("C:\\Users\\O'Neil\\update.exe")),
             "C:\\Users\\O''Neil\\update.exe"
         );
+    }
+
+    #[test]
+    fn dismissed_update_record_expires_and_is_version_specific() {
+        let timestamp = 1_800_000_000_u64;
+        let now = timestamp + DISMISSED_UPDATE_DURATION_SECS - 1;
+        assert!(dismissal_is_current(
+            "1.0.0-beta.13",
+            "1.0.0-beta.13",
+            timestamp,
+            now
+        ));
+        assert!(!dismissal_is_current(
+            "1.0.0-beta.14",
+            "1.0.0-beta.13",
+            timestamp,
+            now
+        ));
+        assert!(!dismissal_is_current(
+            "1.0.0-beta.13",
+            "1.0.0-beta.13",
+            timestamp,
+            timestamp + DISMISSED_UPDATE_DURATION_SECS
+        ));
+    }
+
+    fn dismissal_is_current(
+        version: &str,
+        dismissed_version: &str,
+        timestamp: u64,
+        now: u64,
+    ) -> bool {
+        version == dismissed_version
+            && now.saturating_sub(timestamp) < DISMISSED_UPDATE_DURATION_SECS
     }
 }

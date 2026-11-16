@@ -2874,7 +2874,8 @@ impl App {
                             .as_ref()
                             .is_none_or(|current| current.version != update.version)
                         {
-                            self.update_notice_dismissed = false;
+                            self.update_notice_dismissed =
+                                !manual && updater::is_update_dismissed(&update.version);
                         }
                         self.available_update = Some(update);
                         self.update_status = if self.assistant_language == "en" {
@@ -2898,6 +2899,9 @@ impl App {
                 Task::none()
             }
             Message::DismissUpdateNotice => {
+                if let Some(update) = &self.available_update {
+                    let _ = updater::dismiss_update(&update.version);
+                }
                 self.update_notice_dismissed = true;
                 Task::none()
             }
