@@ -6608,6 +6608,7 @@ fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
     let marker = format!("__SCRY_PUPPY_REFERENCE_MARKER_{}__", uuid::Uuid::new_v4());
     if let Err(error) = clipboard.write(scrypuppy_core::clipboard::ClipboardSnapshot::text(&marker))
     {
+        mark_internal_clipboard_sequence();
         clipboard.shutdown();
         return Err(error);
     }
@@ -6659,6 +6660,7 @@ fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
             if let Some(previous) = previous.as_ref() {
                 let _ = clipboard.write(previous.clone());
             }
+            mark_internal_clipboard_sequence();
             clipboard.shutdown();
             return Err(error);
         }
@@ -6681,10 +6683,7 @@ fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
         });
     }
 
-    #[cfg(windows)]
-    coordinator.mark_internal_sequence(unsafe {
-        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
-    });
+    mark_internal_clipboard_sequence();
     let (path, database_key) = default_database_credentials()?;
     let app_dir = path
         .parent()
@@ -6732,13 +6731,17 @@ fn restore_reference_clipboard(
     let result = service.write(snapshot.clone());
     service.shutdown();
     result?;
+    mark_internal_clipboard_sequence();
+    Ok(())
+}
+
+fn mark_internal_clipboard_sequence() {
     #[cfg(windows)]
     CAPTURE_COORDINATOR
         .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
         .mark_internal_sequence(unsafe {
             windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
         });
-    Ok(())
 }
 
 fn save_window_screenshot(
