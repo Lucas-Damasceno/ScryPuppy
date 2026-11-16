@@ -119,6 +119,7 @@ fn main() -> iced::Result {
             iced::Subscription::batch([
                 window::close_events().map(Message::Closed),
                 window::close_requests().map(Message::CloseRequested),
+                window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
                 iced::event::listen_with(|event, _status, id| match event {
                     iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                         key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
@@ -447,6 +448,7 @@ struct App {
 enum Message {
     CloseRequested(window::Id),
     Closed(window::Id),
+    WindowResized(window::Id, Size),
     FocusTab(window::Id, bool),
     MainOpened(window::Id),
     ShowMain,
@@ -730,6 +732,12 @@ impl App {
         match message {
             Message::CloseRequested(id) if id == self.main => hide_window(id),
             Message::CloseRequested(_) => Task::none(),
+            Message::WindowResized(id, size)
+                if self.quick_window == Some(id) && size.width > 0.0 && size.height > 0.0 =>
+            {
+                set_quick_paste_hit_region(id, self.quick_paste_minimal)
+            }
+            Message::WindowResized(_, _) => Task::none(),
             Message::FocusTab(_id, reverse) => {
                 if reverse {
                     iced::widget::operation::focus_previous()
