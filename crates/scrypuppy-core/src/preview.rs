@@ -4,11 +4,13 @@
 //! bounded and must run on a worker; no function intentionally accesses the network.
 use std::{
     fs,
-    io::{Cursor, Read},
+    fs::OpenOptions,
+    io::{Cursor, Read, Write},
     path::{Component, Path},
 };
 
 use image::{ImageFormat, ImageReader, Limits};
+use sha2::{Digest, Sha256};
 
 pub const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
@@ -29,6 +31,132 @@ pub struct ImagePreview {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+/// Returns a cached preview keyed by the capture ID, preview kind, and exact
+/// source bytes. A changed source automatically gets a new cache entry.
+/// Cache failures are best-effort and never prevent generating the preview.
+pub fn cached_preview<F>(
+    cache_root: &Path,
+    capture_id: &str,
+    kind: &str,
+    source: &[u8],
+    max_output_bytes: usize,
+    generate: F,
+) -> Result<Vec<u8>, PreviewError>
+where
+    F: FnOnce() -> Result<Vec<u8>, PreviewError>,
+{
+    let capture_key = digest(capture_id.as_bytes());
+    let mut content = Vec::with_capacity(kind.len() + source.len() + 1);
+    content.extend_from_slice(kind.as_bytes());
+    content.push(0);
+    content.extend_from_slice(source);
+    let content_key = digest(&content);
+    let cache_dir = cache_root.join(&capture_key);
+    let cache_file = cache_dir.join(format!("{content_key}.bin"));
+
+    if safe_cache_directory(cache_root).is_ok()
+        && safe_cache_directory(&cache_dir).is_ok()
+        && safe_cache_file(&cache_file, max_output_bytes).is_ok()
+    {
+        if let Ok(bytes) = fs::read(&cache_file) {
+            return Ok(bytes);
+        }
+    }
+
+    let generated = generate()?;
+    if generated.len() <= max_output_bytes
+        && safe_cache_directory(cache_root).is_ok()
+        && safe_cache_directory(&cache_dir).is_ok()
+    {
+        let _ = write_cache_atomically(&cache_file, &generated);
+    }
+    Ok(generated)
+}
+
+/// Removes the cached previews associated with one capture, without following
+/// symlinks or reparse points.
+pub fn remove_cached_previews(cache_root: &Path, capture_id: &str) -> Result<(), PreviewError> {
+    let root_metadata = match fs::symlink_metadata(cache_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(PreviewError::UnsupportedImage),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    let capture_dir = cache_root.join(digest(capture_id.as_bytes()));
+    let directory_metadata = match fs::symlink_metadata(&capture_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(PreviewError::UnsupportedImage),
+    };
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(PreviewError::UnsupportedImage);
+    }
+    for entry in fs::read_dir(&capture_dir).map_err(|_| PreviewError::UnsupportedImage)? {
+        let path = entry.map_err(|_| PreviewError::UnsupportedImage)?.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| PreviewError::UnsupportedImage)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            fs::remove_file(path).map_err(|_| PreviewError::UnsupportedImage)?;
+        }
+    }
+    fs::remove_dir(capture_dir).map_err(|_| PreviewError::UnsupportedImage)
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn safe_cache_directory(path: &Path) -> Result<(), PreviewError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(PreviewError::UnsupportedImage)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| PreviewError::UnsupportedImage)
+        }
+        Err(_) => Err(PreviewError::UnsupportedImage),
+    }
+}
+
+fn safe_cache_file(path: &Path, max_bytes: usize) -> Result<(), PreviewError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > max_bytes as u64 =>
+        {
+            Err(PreviewError::UnsupportedImage)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(PreviewError::UnsupportedImage)
+        }
+        Err(_) => Err(PreviewError::UnsupportedImage),
+    }
+}
+
+fn write_cache_atomically(path: &Path, bytes: &[u8]) -> Result<(), PreviewError> {
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    file.write_all(bytes)
+        .map_err(|_| PreviewError::UnsupportedImage)?;
+    file.flush().map_err(|_| PreviewError::UnsupportedImage)?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|_| PreviewError::UnsupportedImage)
 }
 
 /// Read only an application-managed asset from a local, non-reparse path.
@@ -365,6 +493,72 @@ mod tests {
         let preview = image_thumbnail(bytes.get_ref()).unwrap();
         assert_eq!((preview.width, preview.height), (32, 32));
         assert_eq!(image::guess_format(&preview.png).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn preview_cache_reuses_matching_source_and_invalidates_changed_content() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let generated = Cell::new(0);
+        let first = cached_preview(
+            dir.path(),
+            "capture-1",
+            "image/png",
+            b"source-v1",
+            1024,
+            || {
+                generated.set(generated.get() + 1);
+                Ok(b"preview-v1".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(first, b"preview-v1");
+        let cached = cached_preview(
+            dir.path(),
+            "capture-1",
+            "image/png",
+            b"source-v1",
+            1024,
+            || {
+                generated.set(generated.get() + 1);
+                Ok(b"unused".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, b"preview-v1");
+        assert_eq!(generated.get(), 1);
+
+        let updated = cached_preview(
+            dir.path(),
+            "capture-1",
+            "image/png",
+            b"source-v2",
+            1024,
+            || {
+                generated.set(generated.get() + 1);
+                Ok(b"preview-v2".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(updated, b"preview-v2");
+        assert_eq!(generated.get(), 2);
+
+        remove_cached_previews(dir.path(), "capture-1").unwrap();
+        let regenerated = cached_preview(
+            dir.path(),
+            "capture-1",
+            "image/png",
+            b"source-v1",
+            1024,
+            || {
+                generated.set(generated.get() + 1);
+                Ok(b"preview-v1".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(regenerated, b"preview-v1");
+        assert_eq!(generated.get(), 3);
     }
 
     #[test]

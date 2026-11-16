@@ -4880,6 +4880,10 @@ fn delete_capture_from_library(capture_id: String) -> Result<(), String> {
         &assets_root,
         &assets_root.join("clipboard-files").join(&capture_id),
     )?;
+    let _ = scrypuppy_core::preview::remove_cached_previews(
+        &app_dir.join("preview-cache"),
+        &capture_id,
+    );
 
     let contexts =
         scrypuppy_core::context_exports::list_contexts(&conn).map_err(|error| error.to_string())?;
@@ -5495,6 +5499,7 @@ fn read_boolean_setting(conn: &rusqlite::Connection, key: &str, default: bool) -
 fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<TextPreview>) {
     let mut images = Vec::new();
     let mut text = Vec::new();
+    let cache_root = root.parent().unwrap_or(root).join("preview-cache");
     for capture in captures {
         if let Some(path) = capture
             .representations
@@ -5503,8 +5508,15 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
             .and_then(|representation| representation.asset_path.as_deref())
         {
             if let Ok(bytes) = read_managed_asset(root, Path::new(path)) {
-                if let Ok(preview) = image_thumbnail(&bytes) {
-                    images.push((capture.id.clone(), preview.png));
+                if let Ok(preview) = scrypuppy_core::preview::cached_preview(
+                    &cache_root,
+                    &capture.id,
+                    "clipboard-image",
+                    &bytes,
+                    12 * 1024 * 1024,
+                    || image_thumbnail(&bytes).map(|preview| preview.png),
+                ) {
+                    images.push((capture.id.clone(), preview));
                 }
             }
         }
@@ -5521,8 +5533,19 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
             };
             if extension.eq_ignore_ascii_case("pdf") {
                 if let Some(path) = file.local_path.as_deref().map(Path::new) {
-                    if read_managed_asset(root, path).is_ok() {
-                        if let Ok(preview) = render_pdf_first_page(path) {
+                    if let Ok(source) = read_managed_asset(root, path) {
+                        if let Ok(preview) = scrypuppy_core::preview::cached_preview(
+                            &cache_root,
+                            &capture.id,
+                            "pdf-first-page",
+                            &source,
+                            12 * 1024 * 1024,
+                            || {
+                                render_pdf_first_page(path).map_err(|_| {
+                                    scrypuppy_core::preview::PreviewError::InvalidDocument
+                                })
+                            },
+                        ) {
                             images.push((capture.id.clone(), preview));
                         }
                     }
@@ -5533,14 +5556,30 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                 continue;
             }
             if let Ok(bytes) = bytes {
-                let excerpt = match Some(extension) {
-                    Some(extension) if extension.eq_ignore_ascii_case("txt") => {
-                        scrypuppy_core::preview::text_excerpt(&bytes)
-                    }
-                    Some(_) => scrypuppy_core::preview::docx_excerpt(&bytes),
-                    None => continue,
+                let kind = if extension.eq_ignore_ascii_case("txt") {
+                    "plain-text-excerpt"
+                } else {
+                    "docx-text-excerpt"
                 };
-                if let Ok(excerpt) = excerpt {
+                let excerpt = scrypuppy_core::preview::cached_preview(
+                    &cache_root,
+                    &capture.id,
+                    kind,
+                    &bytes,
+                    8 * 1024,
+                    || {
+                        let excerpt = if extension.eq_ignore_ascii_case("txt") {
+                            scrypuppy_core::preview::text_excerpt(&bytes)
+                        } else {
+                            scrypuppy_core::preview::docx_excerpt(&bytes)
+                        }?;
+                        Ok(excerpt.into_bytes())
+                    },
+                );
+                if let Ok(excerpt) = excerpt.and_then(|bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|_| scrypuppy_core::preview::PreviewError::InvalidText)
+                }) {
                     text.push((capture.id.clone(), excerpt));
                 }
             }
