@@ -1041,8 +1041,8 @@ fn secret_pattern() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_chat, generate_document_markdown, generate_document_markdown_with,
-        AssistantSettings, ChatAnswer, ChatRequest, EvidenceItem,
+        answer_chat, answer_chat_with_ranked_ids, generate_document_markdown,
+        generate_document_markdown_with, AssistantSettings, ChatAnswer, ChatRequest, EvidenceItem,
     };
     use crate::{
         capture_store::save_clipboard_capture,
@@ -1179,6 +1179,27 @@ mod tests {
         assert_eq!(original_evidence.context_names, ["Trabalho"]);
         assert!(original_evidence.excerpt.contains("[redigido]"));
         assert!(!original_evidence.excerpt.contains("sk-proj-"));
+
+        let ranked = vec![
+            archived_id.clone(),
+            capture_id.clone(),
+            late_today_id.clone(),
+        ];
+        let hybrid_answer = answer_chat_with_ranked_ids(
+            &conn,
+            &settings,
+            &ChatRequest {
+                query: "planejamento".into(),
+                context_id: Some("work".into()),
+                app: None,
+                date_from: None,
+                date_to: None,
+                limit: None,
+            },
+            Some(&ranked),
+        )
+        .unwrap();
+        assert_eq!(hybrid_answer.evidence[0].capture_id, archived_id);
 
         let filtered = answer_chat(
             &conn,
