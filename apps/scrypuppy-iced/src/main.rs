@@ -328,6 +328,7 @@ struct Snapshot {
     clipboard_monitor_capture_screenshots: bool,
     clipboard_monitor_quick_context_enabled: bool,
     quick_context_enabled: bool,
+    quick_context_after_reference: bool,
     onboarding_completed: bool,
     launch_at_startup: bool,
     retention_policy: String,
@@ -444,6 +445,8 @@ struct App {
     clipboard_monitor_quick_context_changed: bool,
     quick_context_enabled: bool,
     quick_context_enabled_changed: bool,
+    quick_context_after_reference: bool,
+    quick_context_after_reference_changed: bool,
     settings_open: bool,
     onboarding_completed: bool,
     onboarding_changed: bool,
@@ -590,6 +593,7 @@ enum Message {
     ToggleMonitorScreenshots,
     ToggleMonitorQuickContext,
     ToggleQuickContext,
+    ToggleQuickContextAfterReference,
     CompleteOnboarding,
     ReopenOnboarding,
     ClipboardChanged(u32),
@@ -741,6 +745,8 @@ impl App {
             clipboard_monitor_quick_context_changed: false,
             quick_context_enabled: true,
             quick_context_enabled_changed: false,
+            quick_context_after_reference: false,
+            quick_context_after_reference_changed: false,
             settings_open: false,
             onboarding_completed: false,
             onboarding_changed: false,
@@ -2208,6 +2214,8 @@ impl App {
                         self.clipboard_monitor_capture_screenshots_changed = false;
                         self.clipboard_monitor_quick_context_changed = false;
                         self.quick_context_enabled_changed = false;
+                        self.quick_context_after_reference_changed = false;
+                        self.quick_context_after_reference = false;
                         self.onboarding_changed = false;
                         self.autostart_changed = false;
                         self.retention_changed = false;
@@ -2558,6 +2566,15 @@ impl App {
                     self.is_demo_mode(),
                 )
             }
+            Message::ToggleQuickContextAfterReference => {
+                self.quick_context_after_reference = !self.quick_context_after_reference;
+                self.quick_context_after_reference_changed = true;
+                persist_boolean_setting(
+                    "quick_context_after_reference",
+                    self.quick_context_after_reference,
+                    self.is_demo_mode(),
+                )
+            }
             Message::ClipboardChanged(sequence) => {
                 if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
                     return Task::none();
@@ -2751,6 +2768,10 @@ impl App {
                         if !self.quick_context_enabled_changed {
                             self.quick_context_enabled = snapshot.quick_context_enabled;
                         }
+                        if !self.quick_context_after_reference_changed {
+                            self.quick_context_after_reference =
+                                snapshot.quick_context_after_reference;
+                        }
                         if !self.onboarding_changed {
                             self.onboarding_completed = snapshot.onboarding_completed;
                         }
@@ -2915,8 +2936,14 @@ impl App {
                 match result {
                     Ok(id) => {
                         self.notice = Some("Referência salva na Knowledge Base.".into());
-                        self.selected_capture = Some(id);
+                        self.selected_capture = Some(id.clone());
                         let refresh = self.refresh_local_search();
+                        if self.quick_context_enabled && self.quick_context_after_reference {
+                            return Task::batch([
+                                Task::done(Message::OpenQuickContext(id)),
+                                refresh,
+                            ]);
+                        }
                         return Task::batch([self.reload(), refresh]);
                     }
                     Err(error) => self.notice = Some(error),
@@ -3488,6 +3515,14 @@ impl App {
                         "Quick Context após captura manual: desligado"
                     })
                     .on_press(Message::ToggleQuickContext),
+                )
+                .push(
+                    button(if self.quick_context_after_reference {
+                        "Quick Context após referência: ligado"
+                    } else {
+                        "Quick Context após referência: desligado"
+                    })
+                    .on_press(Message::ToggleQuickContextAfterReference),
                 )
                 .push(
                     button(if self.clipboard_monitor_quick_context_enabled {
@@ -4723,6 +4758,7 @@ fn demo_snapshot() -> Snapshot {
         clipboard_monitor_capture_screenshots: false,
         clipboard_monitor_quick_context_enabled: false,
         quick_context_enabled: true,
+        quick_context_after_reference: false,
         onboarding_completed: true,
         launch_at_startup: false,
         retention_policy: "3_months".into(),
@@ -6899,6 +6935,8 @@ fn load_library(path: &Path, key: &str, filter: CaptureFilter) -> Result<Snapsho
     let clipboard_monitor_quick_context_enabled =
         read_boolean_setting(&conn, "clipboard_monitor_quick_context_enabled", false);
     let quick_context_enabled = read_boolean_setting(&conn, "quick_context_enabled", true);
+    let quick_context_after_reference =
+        read_boolean_setting(&conn, "quick_context_after_reference", false);
     let onboarding_completed = read_boolean_setting(&conn, "onboarding_completed", false);
     let launch_at_startup = read_boolean_setting(&conn, "launch_at_startup", false);
     let retention_policy = conn
@@ -6972,6 +7010,7 @@ fn load_library(path: &Path, key: &str, filter: CaptureFilter) -> Result<Snapsho
         clipboard_monitor_capture_screenshots,
         clipboard_monitor_quick_context_enabled,
         quick_context_enabled,
+        quick_context_after_reference,
         onboarding_completed,
         launch_at_startup,
         retention_policy,
