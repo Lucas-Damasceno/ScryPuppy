@@ -33,6 +33,7 @@ static CLIPBOARD_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
 static CLIPBOARD_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static DATA_RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static OCR_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static RETENTION_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static AI_API_KEY_STATUS: AtomicU8 = AtomicU8::new(0);
@@ -426,6 +427,7 @@ struct App {
     offset: usize,
     selected_capture: Option<String>,
     pending_delete_capture: Option<String>,
+    clear_all_data_confirmation: bool,
     theme_changed: bool,
     clipboard_monitor_enabled: bool,
     clipboard_monitor_changed: bool,
@@ -555,6 +557,10 @@ enum Message {
     CancelDeleteCapture,
     DeleteCapture(String),
     CaptureDeleted(Result<(), String>),
+    RequestClearAllData,
+    CancelClearAllData,
+    ConfirmClearAllData,
+    DataCleared(bool, Result<(), String>),
     AssignContext(String, String),
     RemoveContext(String, String),
     CaptureClipboard,
@@ -715,6 +721,7 @@ impl App {
             offset: 0,
             selected_capture: None,
             pending_delete_capture: None,
+            clear_all_data_confirmation: false,
             theme_changed: false,
             clipboard_monitor_enabled: false,
             clipboard_monitor_changed: false,
@@ -2149,6 +2156,86 @@ impl App {
                 }
                 self.reload()
             }
+            Message::RequestClearAllData => {
+                self.clear_all_data_confirmation = true;
+                Task::none()
+            }
+            Message::CancelClearAllData => {
+                self.clear_all_data_confirmation = false;
+                Task::none()
+            }
+            Message::ConfirmClearAllData => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.clear_all_data_confirmation = false;
+                    self.notice = Some("Limpeza desativada no modo de demonstração.".into());
+                    return Task::none();
+                }
+                if self.action_busy || self.assistant_busy || self.loading {
+                    self.notice =
+                        Some("Aguarde as operações atuais antes de limpar os dados.".into());
+                    return Task::none();
+                }
+                let monitor_was_enabled = self.clipboard_monitor_enabled;
+                DATA_RESET_IN_PROGRESS.store(true, Ordering::Release);
+                CLIPBOARD_MONITOR_ENABLED.store(false, Ordering::Release);
+                self.clear_all_data_confirmation = false;
+                self.action_busy = true;
+                let manager = self.local_search.clone();
+                Task::perform(
+                    async move { delete_all_library_data(manager) },
+                    move |result| Message::DataCleared(monitor_was_enabled, result),
+                )
+            }
+            Message::DataCleared(monitor_was_enabled, result) => {
+                DATA_RESET_IN_PROGRESS.store(false, Ordering::Release);
+                self.action_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.clipboard_monitor_enabled = false;
+                        self.clipboard_monitor_changed = false;
+                        CLIPBOARD_MONITOR_ENABLED.store(false, Ordering::Release);
+                        self.theme_changed = false;
+                        self.quick_paste_style_changed = false;
+                        self.quick_context_style_changed = false;
+                        self.link_preview_fetch_changed = false;
+                        self.capture_screenshots_changed = false;
+                        self.clipboard_monitor_capture_screenshots_changed = false;
+                        self.clipboard_monitor_quick_context_changed = false;
+                        self.quick_context_enabled_changed = false;
+                        self.onboarding_changed = false;
+                        self.autostart_changed = false;
+                        self.retention_changed = false;
+                        self.ai_provider_changed = false;
+                        self.ai_model_changed = false;
+                        self.assistant_language_changed = false;
+                        self.local_search_refresh_pending = false;
+                        self.launch_at_startup = false;
+                        self.local_search_status = self.local_search.status();
+                        AI_API_KEY_STATUS.store(1, Ordering::Release);
+                        self.ai_api_key_configured = false;
+                        self.ai_api_key_input.clear();
+                        self.context = None;
+                        self.offset = 0;
+                        self.selected_capture = None;
+                        self.assistant_capture = None;
+                        self.assistant_answer = None;
+                        self.snapshot = None;
+                        self.notice = Some(
+                            "Dados locais apagados. A biblioteca criptografada foi recriada."
+                                .into(),
+                        );
+                        self.reload()
+                    }
+                    Err(error) => {
+                        self.clipboard_monitor_enabled = monitor_was_enabled;
+                        CLIPBOARD_MONITOR_ENABLED.store(monitor_was_enabled, Ordering::Release);
+                        self.notice =
+                            Some(format!("Não foi possível limpar os dados locais: {error}"));
+                        Task::none()
+                    }
+                }
+            }
             Message::AssignContext(capture_id, context_id) => {
                 #[cfg(debug_assertions)]
                 if self.demo {
@@ -2184,6 +2271,9 @@ impl App {
                 )
             }
             Message::CaptureClipboard => {
+                if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                    return Task::none();
+                }
                 #[cfg(debug_assertions)]
                 if self.demo {
                     self.notice = Some("Captura desativada no modo de demonstração.".into());
@@ -2431,6 +2521,9 @@ impl App {
                 )
             }
             Message::ClipboardChanged(sequence) => {
+                if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                    return Task::none();
+                }
                 let coordinator = CAPTURE_COORDINATOR
                     .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
                 if coordinator.consume_internal_sequence(sequence)
@@ -3462,6 +3555,21 @@ impl App {
                 }
             } else {
                 content = content.push(text("Calculando prévia de retenção…").size(12));
+            }
+            if self.clear_all_data_confirmation {
+                content = content
+                    .push(text("Apagar capturas, anexos, documentos e credencial de IA? Esta ação não pode ser desfeita. A chave criptográfica da biblioteca será mantida.").size(12))
+                    .push(row![
+                        button("Apagar todos os dados")
+                            .on_press_maybe((!self.action_busy).then_some(Message::ConfirmClearAllData)),
+                        button("Cancelar")
+                            .on_press_maybe((!self.action_busy).then_some(Message::CancelClearAllData)),
+                    ].spacing(8));
+            } else {
+                content =
+                    content.push(button("Limpar todos os dados").on_press_maybe(
+                        (!self.action_busy).then_some(Message::RequestClearAllData),
+                    ));
             }
         } else if self.loading {
             content = content.push(text("Carregando biblioteca…"));
@@ -4633,6 +4741,107 @@ fn remove_local_search(manager: Arc<LocalSearchManager>) -> Result<LocalSearchSt
         return Err(error);
     }
     Ok(manager.status())
+}
+
+fn delete_all_library_data(manager: Arc<LocalSearchManager>) -> Result<(), String> {
+    manager.request_cancel();
+    for _ in 0..500 {
+        if !manager.operation_running() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if manager.operation_running() {
+        return Err(
+            "A busca local ainda está ocupada. Tente novamente quando a indexação terminar.".into(),
+        );
+    }
+
+    let coordinator =
+        CAPTURE_COORDINATOR.get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
+    let _capture_session = coordinator.begin()?;
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    set_autostart_preference(false)?;
+    secure_remove_dir(&app_dir.join("assets"))?;
+    secure_remove_dir(&app_dir.join("markdown"))?;
+    secure_remove_dir(&app_dir.join("preview-cache"))?;
+    for suffix in [
+        "",
+        "-wal",
+        "-shm",
+        ".plaintext-migration-backup",
+        ".encrypted-tmp",
+    ] {
+        secure_remove_file_safely(&PathBuf::from(format!("{}{}", path.display(), suffix)))?;
+    }
+    clear_ai_api_key()?;
+    AI_API_KEY_STATUS.store(1, Ordering::Release);
+
+    let conn = scrypuppy_core::storage::open_or_create(app_dir, &database_key)?;
+    scrypuppy_core::schema::migrate(&conn).map_err(|error| error.to_string())?;
+    save_setting_value_in(&conn, "magic_search_engine", "local")?;
+    manager.set_index_progress(0, 0);
+    manager.set_phase(
+        if manager.installed() {
+            LocalSearchPhase::Ready
+        } else {
+            LocalSearchPhase::NotDownloaded
+        },
+        None,
+    );
+    Ok(())
+}
+
+fn secure_remove_dir(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Recusando limpar um link simbólico: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "O caminho de limpeza não é uma pasta: {}",
+            path.display()
+        ));
+    }
+    for entry in std::fs::read_dir(path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "Recusando limpar um link simbólico: {}",
+                entry_path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            secure_remove_dir(&entry_path)?;
+        } else {
+            secure_remove_file_safely(&entry_path)?;
+        }
+    }
+    std::fs::remove_dir(path).map_err(|error| error.to_string())
+}
+
+fn secure_remove_file_safely(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Recusando apagar um link simbólico: {}",
+            path.display()
+        )),
+        Ok(_) => scrypuppy_core::context_exports::secure_remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn refresh_local_search_data(
@@ -6101,6 +6310,9 @@ fn capture_current_clipboard() -> Result<String, String> {
     let _capture_session = CAPTURE_COORDINATOR
         .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
         .begin()?;
+    if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+        return Err("A limpeza da biblioteca está em andamento.".into());
+    }
     let (path, database_key) = default_database_credentials()?;
     let app_dir = path
         .parent()
@@ -6991,6 +7203,19 @@ mod tests {
             std::fs::read_to_string(directory.path().join("anotacoes.md")).unwrap(),
             document.markdown
         );
+    }
+
+    #[test]
+    fn secure_remove_dir_clears_nested_managed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let nested = managed.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("capture.bin"), b"sensitive clipboard data").unwrap();
+
+        secure_remove_dir(&managed).unwrap();
+
+        assert!(!managed.exists());
     }
 
     #[test]
