@@ -8316,7 +8316,7 @@ mod tests {
             "Image thumbnail unavailable."
         );
 
-        let (images, text) = previews(&asset_root, &[capture, image_capture]);
+        let (images, text) = previews(&asset_root, &[capture, image_capture.clone()]);
 
         let image_preview = images
             .iter()
@@ -8330,6 +8330,23 @@ mod tests {
         assert_eq!(text[0].0, "legacy-doc-capture");
         assert!(text[0].1.contains("Concert du soir"));
         assert!(directory.path().join("preview-cache").exists());
+
+        let mut missing_image = image_capture;
+        missing_image.id = "missing-image-file".into();
+        missing_image.files[0].local_path = Some(
+            asset_root
+                .join("missing.webp")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let (missing_previews, _) = previews(&asset_root, &[missing_image.clone()]);
+        assert!(!missing_previews
+            .iter()
+            .any(|(capture_id, _)| capture_id == "missing-image-file"));
+        assert_eq!(
+            preview_fallback_text(&missing_image),
+            "Miniatura da imagem indisponível."
+        );
     }
 
     fn load_library_for_test(
