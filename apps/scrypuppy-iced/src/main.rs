@@ -44,6 +44,9 @@ const PAGE_SIZE: usize = 60;
 const AI_KEY_CREDENTIAL: &str = "ai-api-key-v1";
 const CREDENTIAL_SERVICE: &str = "Scryppy";
 
+type ImagePreview = (String, Vec<u8>);
+type TextPreview = (String, String);
+
 fn main() -> iced::Result {
     #[cfg(windows)]
     let debug_demo = cfg!(debug_assertions) && std::env::args_os().any(|arg| arg == "--demo");
@@ -267,6 +270,11 @@ struct App {
     paste_target: Option<isize>,
     dark: bool,
     query: String,
+    assistant_query: String,
+    assistant_busy: bool,
+    assistant_revision: u64,
+    assistant_answer: Option<scrypuppy_core::assistant::ChatAnswer>,
+    assistant_capture: Option<CaptureDto>,
     context: Option<String>,
     new_context_name: String,
     new_rule_name: String,
@@ -336,6 +344,11 @@ enum Message {
     ShowMain,
     QuitFromTray,
     QueryChanged(String),
+    AssistantQueryChanged(String),
+    AskAssistant,
+    AssistantAnswered(u64, Result<scrypuppy_core::assistant::ChatAnswer, String>),
+    OpenAssistantEvidence(String),
+    AssistantEvidenceLoaded(u64, String, Result<Box<CaptureDto>, String>),
     Search,
     PreviousPage,
     NextPage,
@@ -416,7 +429,7 @@ enum Message {
     ToggleQuickPasteStyle,
     ToggleQuickContextStyle,
     Loaded(u64, Result<Snapshot, String>),
-    Previews(u64, Vec<(String, Vec<u8>)>, Vec<(String, String)>),
+    Previews(u64, Vec<ImagePreview>, Vec<TextPreview>),
     LinkPreviews(u64, Vec<(String, LinkPreviewData)>),
     ContextAssigned(u64, Result<(), String>),
     ContextRemoved(u64, Result<(), String>),
@@ -463,6 +476,11 @@ impl App {
             paste_target: None,
             dark: true,
             query: String::new(),
+            assistant_query: String::new(),
+            assistant_busy: false,
+            assistant_revision: 0,
+            assistant_answer: None,
+            assistant_capture: None,
             context: None,
             new_context_name: String::new(),
             new_rule_name: String::new(),
@@ -742,6 +760,81 @@ impl App {
                 self.offset = 0;
                 self.reload()
             }
+            Message::AssistantQueryChanged(value) => {
+                self.assistant_query = value.chars().take(500).collect();
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                self.assistant_busy = false;
+                self.assistant_answer = None;
+                Task::none()
+            }
+            Message::AskAssistant => {
+                let query = self.assistant_query.trim().to_string();
+                if query.is_empty() {
+                    self.notice = Some("Digite uma pergunta para buscar nas capturas.".into());
+                    return Task::none();
+                }
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.assistant_answer = Some(demo_assistant_answer(&query));
+                    self.assistant_busy = false;
+                    return Task::none();
+                }
+                if self.assistant_busy {
+                    return Task::none();
+                }
+                let context_id = self.context.clone();
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                let revision = self.assistant_revision;
+                self.assistant_busy = true;
+                self.assistant_answer = None;
+                Task::perform(
+                    async move {
+                        let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                        thread::spawn(move || {
+                            let _ = sender.send(answer_library_question(&query, context_id));
+                        });
+                        receiver
+                            .await
+                            .unwrap_or_else(|_| Err("A busca foi interrompida.".into()))
+                    },
+                    move |result| Message::AssistantAnswered(revision, result),
+                )
+            }
+            Message::AssistantAnswered(revision, result) => {
+                if revision != self.assistant_revision {
+                    return Task::none();
+                }
+                self.assistant_busy = false;
+                match result {
+                    Ok(answer) => self.assistant_answer = Some(answer),
+                    Err(error) => self.notice = Some(error),
+                }
+                Task::none()
+            }
+            Message::OpenAssistantEvidence(capture_id) => {
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                let revision = self.assistant_revision;
+                self.selected_capture = Some(capture_id.clone());
+                self.assistant_capture = None;
+                let result_capture_id = capture_id.clone();
+                Task::perform(
+                    async move { load_capture_by_id(&capture_id).map(Box::new) },
+                    move |result| {
+                        Message::AssistantEvidenceLoaded(revision, result_capture_id, result)
+                    },
+                )
+            }
+            Message::AssistantEvidenceLoaded(revision, capture_id, result) => {
+                if revision == self.assistant_revision
+                    && self.selected_capture.as_deref() == Some(capture_id.as_str())
+                {
+                    match result {
+                        Ok(capture) => self.assistant_capture = Some(*capture),
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
+                Task::none()
+            }
             Message::PreviousPage => {
                 self.offset = self.offset.saturating_sub(PAGE_SIZE);
                 self.selected_capture = None;
@@ -763,6 +856,11 @@ impl App {
             Message::SelectContext(id) => {
                 if id != self.context {
                     self.invalidate_rule_preview();
+                    self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                    self.assistant_busy = false;
+                    self.assistant_answer = None;
+                    self.assistant_capture = None;
+                    self.assistant_capture = None;
                 }
                 self.context = id;
                 self.offset = 0;
@@ -800,6 +898,8 @@ impl App {
             }
             Message::TagSaved(result) => {
                 self.action_busy = false;
+                self.assistant_capture = None;
+                self.assistant_answer = None;
                 if let Err(error) = result {
                     self.notice = Some(error);
                 } else {
@@ -1256,6 +1356,7 @@ impl App {
             }
             Message::SelectCapture(id) => {
                 self.selected_capture = Some(id);
+                self.assistant_capture = None;
                 Task::none()
             }
             Message::RequestDeleteCapture(id) => {
@@ -1288,6 +1389,8 @@ impl App {
                 match result {
                     Ok(()) => {
                         self.selected_capture = None;
+                        self.assistant_capture = None;
+                        self.assistant_answer = None;
                         self.notice = Some("Captura excluída.".into());
                     }
                     Err(error) => self.notice = Some(error),
@@ -1830,6 +1933,8 @@ impl App {
                 }
                 let close_quick_context = match result {
                     Ok(()) => {
+                        self.assistant_capture = None;
+                        self.assistant_answer = None;
                         self.notice = Some("Captura adicionada ao Contexto.".into());
                         self.quick_context_window.take()
                     }
@@ -1854,7 +1959,11 @@ impl App {
                     return Task::none();
                 }
                 match result {
-                    Ok(()) => self.notice = Some("Captura removida do Contexto.".into()),
+                    Ok(()) => {
+                        self.assistant_capture = None;
+                        self.assistant_answer = None;
+                        self.notice = Some("Captura removida do Contexto.".into());
+                    }
                     Err(error) => self.notice = Some(error),
                 }
                 self.reload()
@@ -2166,6 +2275,67 @@ impl App {
         }
         if !self.settings_open {
             content = content.push(search);
+            content = content.push(text("Pergunte à biblioteca").size(18)).push(
+                row![
+                    text_input("Pergunte sobre suas capturas", &self.assistant_query)
+                        .on_input(Message::AssistantQueryChanged)
+                        .on_submit(Message::AskAssistant)
+                        .padding(10),
+                    button(if self.assistant_busy {
+                        "Buscando…"
+                    } else {
+                        "Perguntar"
+                    })
+                    .on_press_maybe(
+                        (!self.assistant_busy && !self.action_busy)
+                            .then_some(Message::AskAssistant),
+                    ),
+                ]
+                .spacing(8),
+            );
+            if self.assistant_busy {
+                content = content.push(text("Consultando capturas locais…").size(12));
+            }
+            if let Some(answer) = &self.assistant_answer {
+                let mut answer_content = column![
+                    text(answer.answer.as_str()).size(14),
+                    text(format!(
+                        "Confiança: {} · {} evidência(s)",
+                        answer.confidence,
+                        answer.evidence.len()
+                    ))
+                    .size(10),
+                ]
+                .spacing(8);
+                for evidence in &answer.evidence {
+                    let context = if evidence.context_names.is_empty() {
+                        "Inbox".to_string()
+                    } else {
+                        evidence.context_names.join(", ")
+                    };
+                    answer_content = answer_content.push(
+                        button(text(format!(
+                            "{} · {} · {} · {}",
+                            evidence
+                                .app_name
+                                .as_deref()
+                                .unwrap_or("Aplicativo desconhecido"),
+                            context,
+                            evidence.captured_at,
+                            evidence.excerpt,
+                        )))
+                        .on_press(Message::OpenAssistantEvidence(evidence.capture_id.clone()))
+                        .width(Length::Fill),
+                    );
+                }
+                content = content.push(
+                    container(scrollable(answer_content))
+                        .height(180)
+                        .width(Length::Fill)
+                        .padding(14)
+                        .style(move |_| panel_style(dark, false)),
+                );
+            }
         }
         if self.clipboard_monitor_enabled && !self.settings_open {
             content = content.push(
@@ -2454,11 +2624,16 @@ impl App {
                     .align_y(Alignment::Center),
                 );
             }
-            if let Some(capture) = snapshot
+            let selected_capture = snapshot
                 .captures
                 .iter()
                 .find(|capture| self.selected_capture.as_deref() == Some(capture.id.as_str()))
-            {
+                .or_else(|| {
+                    self.assistant_capture.as_ref().filter(|capture| {
+                        self.selected_capture.as_deref() == Some(capture.id.as_str())
+                    })
+                });
+            if let Some(capture) = selected_capture {
                 let mut details = column![
                     text("Detalhes da captura").size(18),
                     text(format!(
@@ -3290,6 +3465,32 @@ fn demo_snapshot() -> Snapshot {
     }
 }
 
+#[cfg(debug_assertions)]
+fn demo_assistant_answer(query: &str) -> scrypuppy_core::assistant::ChatAnswer {
+    let evidence = demo_snapshot()
+        .captures
+        .into_iter()
+        .take(2)
+        .map(|capture| scrypuppy_core::assistant::EvidenceItem {
+            capture_id: capture.id,
+            captured_at: capture.captured_at,
+            context_names: vec!["Trabalho".into()],
+            app_name: capture.source_app_name,
+            application_id: None,
+            window_title: None,
+            excerpt: capture.content_text,
+            matched_fields: vec!["demonstração".into()],
+        })
+        .collect();
+    scrypuppy_core::assistant::ChatAnswer {
+        answer: format!(
+            "Resposta simulada para ‘{query}’; nenhum dado real ou provedor externo foi acessado."
+        ),
+        confidence: "demo".into(),
+        evidence,
+    }
+}
+
 fn load_default_library(
     query: String,
     context: Option<String>,
@@ -3367,6 +3568,50 @@ fn default_database_credentials() -> Result<(PathBuf, String), String> {
         .map_err(|error| error.to_string())?;
     }
     Ok((path, database_key))
+}
+
+fn answer_library_question(
+    query: &str,
+    context_id: Option<String>,
+) -> Result<scrypuppy_core::assistant::ChatAnswer, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &database_key)?;
+    let setting = |key: &str, fallback: &str| {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_or_else(|_| fallback.into())
+    };
+    let provider = setting("ai_provider", "deepseek");
+    let model = setting("ai_model", &scrypuppy_core::ai::default_model(&provider));
+    let api_key = CredentialEntry::new(CREDENTIAL_SERVICE, AI_KEY_CREDENTIAL)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .unwrap_or_default();
+    let settings = scrypuppy_core::assistant::AssistantSettings {
+        language: setting("language", "en"),
+        provider,
+        model,
+        api_key,
+    };
+    scrypuppy_core::assistant::answer_chat(
+        &conn,
+        &settings,
+        &scrypuppy_core::assistant::ChatRequest {
+            query: query.into(),
+            context_id,
+            app: None,
+            date_from: None,
+            date_to: None,
+            limit: Some(6),
+        },
+    )
+}
+
+fn load_capture_by_id(capture_id: &str) -> Result<CaptureDto, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &database_key)?;
+    scrypuppy_core::library::get_capture_by_id(&conn, capture_id)
 }
 
 fn save_theme_preference(dark: bool) -> Result<(), String> {
@@ -3525,8 +3770,7 @@ fn set_autostart_preference(enabled: bool) -> Result<(), String> {
     if enabled {
         return Err("A inicialização automática está disponível no Windows.".into());
     }
-    let save = save_setting_value("launch_at_startup", if enabled { "true" } else { "false" });
-    save
+    save_setting_value("launch_at_startup", if enabled { "true" } else { "false" })
 }
 
 fn load_retention_preview(policy: String) -> Result<RetentionPreview, String> {
@@ -4004,15 +4248,10 @@ fn create_context_in(
 
     let export_dir = app_dir.join("markdown").join("contexts");
     std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
-    scrypuppy_core::context_exports::write_context_export(
-        &conn,
-        &export_dir,
-        &context,
-        context_key,
-    )
-    .map_err(|error| {
-        format!("Contexto criado, mas o export criptografado não foi escrito: {error}")
-    })?;
+    scrypuppy_core::context_exports::write_context_export(conn, &export_dir, &context, context_key)
+        .map_err(|error| {
+            format!("Contexto criado, mas o export criptografado não foi escrito: {error}")
+        })?;
     Ok(id)
 }
 
@@ -4780,8 +5019,8 @@ fn assign_captures_to_context_in(
     context_id: &str,
 ) -> Result<(), String> {
     let path = app_dir.join(DATABASE_FILE);
-    let mut conn = scrypuppy_core::storage::open_existing_read_write(&path, &database_key)
-        .map_err(|_| {
+    let mut conn =
+        scrypuppy_core::storage::open_existing_read_write(&path, database_key).map_err(|_| {
             "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
         })?;
     let at = chrono::Utc::now().to_rfc3339();
@@ -4932,10 +5171,7 @@ fn read_boolean_setting(conn: &rusqlite::Connection, key: &str, default: bool) -
     .unwrap_or(default)
 }
 
-fn previews(
-    root: &Path,
-    captures: &[CaptureDto],
-) -> (Vec<(String, Vec<u8>)>, Vec<(String, String)>) {
+fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<TextPreview>) {
     let mut images = Vec::new();
     let mut text = Vec::new();
     for capture in captures {
@@ -5246,6 +5482,19 @@ mod tests {
             .unwrap(),
             "openai"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn assistant_demo_returns_synthetic_evidence_without_opening_the_library() {
+        let answer = demo_assistant_answer("planejamento");
+        assert!(answer.answer.contains("nenhum dado real"));
+        assert_eq!(answer.confidence, "demo");
+        assert!(!answer.evidence.is_empty());
+        assert!(answer.evidence[0]
+            .capture_id
+            .chars()
+            .all(|character| character.is_ascii_digit()));
     }
 
     #[test]

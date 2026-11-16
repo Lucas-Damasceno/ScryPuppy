@@ -1,6 +1,7 @@
 //! Domain services independent of the desktop UI runtime.
 pub mod ai;
 pub mod app_error;
+pub mod assistant;
 pub mod capture_store;
 pub mod clipboard;
 pub mod context_exports;
