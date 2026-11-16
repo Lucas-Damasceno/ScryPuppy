@@ -258,8 +258,12 @@ fn localized_ui_text(value: &str, english: bool) -> String {
             "The multilingual model is downloaded on demand. Captures and their vectors stay in the encrypted local library; indexing does not send captures to external services.".into()
         }
         "Inteligência artificial" => "Artificial intelligence".into(),
-        "Idioma das respostas: Português" => "Language: Portuguese".into(),
-        "Idioma das respostas: English" => "Language: English".into(),
+        "Idioma da interface e das respostas: Português" => {
+            "Interface and assistant language: Portuguese".into()
+        }
+        "Idioma da interface e das respostas: English" => {
+            "Interface and assistant language: English".into()
+        }
         "Modelo local não baixado" => "Local model not downloaded".into(),
         "Remover modelo de busca baixado" => "Remove downloaded search model".into(),
         "Busca local encontrou um erro" => "Local search encountered an error".into(),
@@ -4007,9 +4011,9 @@ impl App {
                 .push(text("Inteligência artificial").size(20))
                 .push(
                     button(text(if self.assistant_language == "pt-BR" {
-                        "Idioma das respostas: Português"
+                        "Idioma da interface e das respostas: Português"
                     } else {
-                        "Idioma das respostas: English"
+                        "Idioma da interface e das respostas: English"
                     }))
                     .on_press(Message::CycleAssistantLanguage),
                 )
