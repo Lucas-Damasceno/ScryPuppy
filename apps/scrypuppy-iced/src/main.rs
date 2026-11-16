@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
@@ -33,6 +33,7 @@ static CLIPBOARD_EVENT_SENDER: OnceLock<
 static CLIPBOARD_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static OCR_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static RETENTION_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static AI_API_KEY_STATUS: AtomicU8 = AtomicU8::new(0);
 static CAPTURE_COORDINATOR: OnceLock<scrypuppy_core::coordination::CaptureCoordinator> =
     OnceLock::new();
 #[cfg(windows)]
@@ -40,6 +41,8 @@ thread_local! {
     static TRAY_ICON: std::cell::RefCell<Option<tray_icon::TrayIcon>> = const { std::cell::RefCell::new(None) };
 }
 const PAGE_SIZE: usize = 60;
+const AI_KEY_CREDENTIAL: &str = "ai-api-key-v1";
+const CREDENTIAL_SERVICE: &str = "Scryppy";
 
 fn main() -> iced::Result {
     #[cfg(windows)]
@@ -215,6 +218,9 @@ struct Snapshot {
     onboarding_completed: bool,
     launch_at_startup: bool,
     retention_policy: String,
+    ai_provider: String,
+    ai_model: String,
+    ai_api_key_configured: bool,
     context_rules: Vec<ContextRuleRow>,
 }
 
@@ -272,6 +278,12 @@ struct App {
     rule_preview: Option<(u64, String, usize)>,
     rule_preview_loading: bool,
     new_tag: String,
+    ai_provider: String,
+    ai_model: String,
+    ai_api_key_input: String,
+    ai_provider_changed: bool,
+    ai_model_changed: bool,
+    ai_api_key_configured: bool,
     launch_at_startup: bool,
     autostart_changed: bool,
     retention_policy: String,
@@ -331,6 +343,13 @@ enum Message {
     NewContextNameChanged(String),
     CreateContext,
     NewTagChanged(String),
+    CycleAiProvider,
+    CycleAiModel,
+    AiApiKeyChanged(String),
+    SaveAiApiKey,
+    ClearAiApiKey,
+    AiApiKeySaved(Result<(), String>),
+    AiApiKeyCleared(Result<(), String>),
     AddTag(String),
     RemoveTag(String, String),
     TagSaved(Result<(), String>),
@@ -455,6 +474,12 @@ impl App {
             rule_preview: None,
             rule_preview_loading: false,
             new_tag: String::new(),
+            ai_provider: "deepseek".into(),
+            ai_model: "deepseek-v4-flash".into(),
+            ai_api_key_input: String::new(),
+            ai_provider_changed: false,
+            ai_model_changed: false,
+            ai_api_key_configured: false,
             launch_at_startup: false,
             autostart_changed: false,
             retention_policy: "3_months".into(),
@@ -781,6 +806,119 @@ impl App {
                     self.new_tag.clear();
                 }
                 self.reload()
+            }
+            Message::CycleAiProvider => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                let providers = scrypuppy_core::ai::provider_options();
+                if providers.is_empty() {
+                    return Task::none();
+                }
+                let index = providers
+                    .iter()
+                    .position(|provider| provider.id == self.ai_provider)
+                    .unwrap_or(0);
+                let provider = providers[(index + 1) % providers.len()].id.clone();
+                let model = scrypuppy_core::ai::default_model(&provider);
+                self.ai_provider = provider.clone();
+                self.ai_model = model.clone();
+                self.ai_provider_changed = true;
+                self.ai_model_changed = true;
+                Task::perform(
+                    async move { save_ai_provider_model(&provider, &model) },
+                    |result| Message::SettingSaved("ai_provider / ai_model", result),
+                )
+            }
+            Message::CycleAiModel => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                let Some(provider) = scrypuppy_core::ai::provider_options()
+                    .into_iter()
+                    .find(|provider| provider.id == self.ai_provider)
+                else {
+                    return Task::none();
+                };
+                if provider.models.is_empty() {
+                    return Task::none();
+                }
+                let index = provider
+                    .models
+                    .iter()
+                    .position(|model| model.id == self.ai_model)
+                    .unwrap_or(0);
+                let model = provider.models[(index + 1) % provider.models.len()]
+                    .id
+                    .clone();
+                let provider_id = provider.id;
+                self.ai_model = model.clone();
+                self.ai_model_changed = true;
+                Task::perform(
+                    async move { save_ai_provider_model(&provider_id, &model) },
+                    |result| Message::SettingSaved("ai_model", result),
+                )
+            }
+            Message::AiApiKeyChanged(value) => {
+                self.ai_api_key_input = value.chars().take(4096).collect();
+                Task::none()
+            }
+            Message::SaveAiApiKey => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Credenciais desativadas no modo de demonstração.".into());
+                    return Task::none();
+                }
+                let api_key = self.ai_api_key_input.trim().to_string();
+                if api_key.is_empty() {
+                    self.notice = Some("Digite uma chave de API antes de salvar.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { save_ai_api_key(&api_key) },
+                    Message::AiApiKeySaved,
+                )
+            }
+            Message::ClearAiApiKey => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Credenciais desativadas no modo de demonstração.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(async { clear_ai_api_key() }, Message::AiApiKeyCleared)
+            }
+            Message::AiApiKeySaved(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.ai_api_key_input.clear();
+                        self.ai_api_key_configured = true;
+                        AI_API_KEY_STATUS.store(2, Ordering::Release);
+                        self.notice = Some(
+                            "Chave de API salva no Gerenciador de Credenciais do Windows.".into(),
+                        );
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                Task::none()
+            }
+            Message::AiApiKeyCleared(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.ai_api_key_input.clear();
+                        self.ai_api_key_configured = false;
+                        AI_API_KEY_STATUS.store(1, Ordering::Release);
+                        self.notice =
+                            Some("Chave de API removida do Gerenciador de Credenciais.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                Task::none()
             }
             Message::CreateContext => {
                 #[cfg(debug_assertions)]
@@ -1561,10 +1699,18 @@ impl App {
                 Task::none()
             }
             Message::SettingSaved(key, result) => {
-                if let Err(error) = result {
-                    self.notice = Some(format!(
-                        "A configuração '{key}' mudou nesta sessão, mas não foi salva: {error}"
-                    ));
+                match result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.notice = Some(format!(
+                            "A configuração '{key}' mudou nesta sessão, mas não foi salva: {error}"
+                        ));
+                        if key.starts_with("ai_provider") || key.starts_with("ai_model") {
+                            self.ai_provider_changed = false;
+                            self.ai_model_changed = false;
+                            return self.reload();
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -1614,6 +1760,13 @@ impl App {
                         if !self.retention_changed {
                             self.retention_policy = snapshot.retention_policy.clone();
                         }
+                        if !self.ai_provider_changed {
+                            self.ai_provider = snapshot.ai_provider.clone();
+                        }
+                        if !self.ai_model_changed {
+                            self.ai_model = snapshot.ai_model.clone();
+                        }
+                        self.ai_api_key_configured = snapshot.ai_api_key_configured;
                         let fetch_links = self.link_preview_fetch_enabled;
                         self.link_previews_loading = fetch_links
                             && captures.iter().any(|capture| capture.content_kind == "url");
@@ -2020,6 +2173,22 @@ impl App {
             );
         }
         if self.settings_open {
+            let ai_provider_label = scrypuppy_core::ai::provider_options()
+                .into_iter()
+                .find(|provider| provider.id == self.ai_provider)
+                .map(|provider| provider.name)
+                .unwrap_or_else(|| self.ai_provider.clone());
+            let ai_model_label = scrypuppy_core::ai::provider_options()
+                .into_iter()
+                .find(|provider| provider.id == self.ai_provider)
+                .and_then(|provider| {
+                    provider
+                        .models
+                        .into_iter()
+                        .find(|model| model.id == self.ai_model)
+                        .map(|model| model.name)
+                })
+                .unwrap_or_else(|| self.ai_model.clone());
             content = content
                 .push(text("Captura e privacidade").size(20))
                 .push(
@@ -2065,6 +2234,35 @@ impl App {
                     .on_press(Message::ToggleLinkPreviewFetch),
                 )
                 .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12))
+                .push(text("Inteligência artificial").size(20))
+                .push(
+                    button(text(format!("Provedor: {ai_provider_label}")))
+                        .on_press(Message::CycleAiProvider),
+                )
+                .push(
+                    button(text(format!("Modelo: {ai_model_label}")))
+                        .on_press(Message::CycleAiModel),
+                )
+                .push(
+                    text_input("Chave de API", &self.ai_api_key_input)
+                        .on_input(Message::AiApiKeyChanged)
+                        .secure(true)
+                        .padding(8),
+                )
+                .push(row![
+                    button("Salvar chave")
+                        .on_press_maybe((!self.action_busy).then_some(Message::SaveAiApiKey))
+                        .width(Length::Fill),
+                    button("Remover chave")
+                        .on_press_maybe((self.ai_api_key_configured && !self.action_busy).then_some(Message::ClearAiApiKey))
+                        .width(Length::Fill),
+                ].spacing(6))
+                .push(text(if self.ai_api_key_configured {
+                    "A chave está configurada no Gerenciador de Credenciais do Windows."
+                } else {
+                    "Nenhuma chave de API está configurada."
+                }).size(12))
+                .push(text("A chave fica fora do banco local. A geração de respostas e documentos ainda não está disponível na interface Iced.").size(12))
                 .push(button(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" })
                     .on_press(Message::ToggleAutostart))
                 .push(text("Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows.").size(12));
@@ -3085,6 +3283,9 @@ fn demo_snapshot() -> Snapshot {
         onboarding_completed: true,
         launch_at_startup: false,
         retention_policy: "3_months".into(),
+        ai_provider: "deepseek".into(),
+        ai_model: "deepseek-v4-flash".into(),
+        ai_api_key_configured: false,
         context_rules: Vec::new(),
     }
 }
@@ -3188,6 +3389,74 @@ fn save_setting_value(key: &str, value: &str) -> Result<(), String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_write(&path, &database_key)?;
     save_setting_value_in(&conn, key, value)
+}
+
+fn save_ai_provider_model(provider: &str, model: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    save_ai_provider_model_in(&mut conn, provider, model)
+}
+
+fn save_ai_provider_model_in(
+    conn: &mut rusqlite::Connection,
+    provider: &str,
+    model: &str,
+) -> Result<(), String> {
+    let provider_option = scrypuppy_core::ai::provider_options()
+        .into_iter()
+        .find(|option| option.id == provider)
+        .ok_or("Provedor de IA inválido.")?;
+    if !provider_option
+        .models
+        .iter()
+        .any(|option| option.id == model)
+    {
+        return Err("Modelo de IA inválido para o provedor selecionado.".into());
+    }
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    save_setting_value_in(&transaction, "ai_provider", provider)?;
+    save_setting_value_in(&transaction, "ai_model", model)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn save_ai_api_key(api_key: &str) -> Result<(), String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() || api_key.chars().count() > 4096 {
+        return Err("A chave de API está vazia ou excede 4096 caracteres.".into());
+    }
+    let entry = CredentialEntry::new(CREDENTIAL_SERVICE, AI_KEY_CREDENTIAL)
+        .map_err(|_| "Credencial de IA indisponível.")?;
+    entry.set_password(api_key).map_err(|_| {
+        "Não foi possível salvar a chave de IA no Gerenciador de Credenciais do Windows.".into()
+    })
+}
+
+fn ai_api_key_is_configured() -> bool {
+    match AI_API_KEY_STATUS.load(Ordering::Acquire) {
+        1 => false,
+        2 => true,
+        _ => {
+            let configured = CredentialEntry::new(CREDENTIAL_SERVICE, AI_KEY_CREDENTIAL)
+                .and_then(|entry| entry.get_password())
+                .is_ok();
+            let status = if configured { 2 } else { 1 };
+            let _ =
+                AI_API_KEY_STATUS.compare_exchange(0, status, Ordering::AcqRel, Ordering::Acquire);
+            AI_API_KEY_STATUS.load(Ordering::Acquire) == 2
+        }
+    }
+}
+
+fn clear_ai_api_key() -> Result<(), String> {
+    let entry = CredentialEntry::new(CREDENTIAL_SERVICE, AI_KEY_CREDENTIAL)
+        .map_err(|_| "Credencial de IA indisponível.")?;
+    match entry.delete_credential() {
+        Ok(()) | Err(CredentialError::NoEntry) => Ok(()),
+        Err(_) => Err(
+            "Não foi possível remover a chave de IA do Gerenciador de Credenciais do Windows."
+                .into(),
+        ),
+    }
 }
 
 fn set_autostart_preference(enabled: bool) -> Result<(), String> {
@@ -4581,6 +4850,21 @@ fn load_library(
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_else(|_| "3_months".into());
+    let ai_provider = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'ai_provider'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "deepseek".into());
+    let ai_model = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'ai_model'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| scrypuppy_core::ai::default_model(&ai_provider));
+    let ai_api_key_configured = ai_api_key_is_configured();
     let context_rules = {
         let mut stmt = conn
             .prepare(
@@ -4625,6 +4909,9 @@ fn load_library(
         onboarding_completed,
         launch_at_startup,
         retention_policy,
+        ai_provider,
+        ai_model,
+        ai_api_key_configured,
         context_rules,
     })
 }
@@ -4928,6 +5215,40 @@ mod tests {
     }
 
     #[test]
+    fn ai_provider_and_model_preferences_share_the_library_schema() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        scrypuppy_core::schema::migrate(&conn).unwrap();
+        save_ai_provider_model_in(&mut conn, "openai", "gpt-5-mini").unwrap();
+
+        let provider: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ai_provider'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let model: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ai_model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-5-mini");
+        assert!(save_ai_provider_model_in(&mut conn, "unknown", "model").is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'ai_provider'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "openai"
+        );
+    }
+
+    #[test]
     fn link_preview_uses_local_cache_without_fetch_when_disabled() {
         let dir = tempfile::tempdir().unwrap();
         let url = "http://127.0.0.1/private";
@@ -5101,6 +5422,8 @@ mod tests {
         assert_eq!(snapshot.contexts[0].name, "Trabalho");
         assert_eq!(snapshot.captures[0].content_kind, "plain_text");
         assert_eq!(snapshot.captures[0].contexts[0].id, "work");
+        assert_eq!(snapshot.ai_provider, "deepseek");
+        assert_eq!(snapshot.ai_model, "deepseek-v4-flash");
         let write_conn = open_existing_read_write(&path, &key).unwrap();
         write_conn
             .execute(
