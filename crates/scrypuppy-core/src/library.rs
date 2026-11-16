@@ -125,6 +125,12 @@ pub struct CaptureFilter {
     pub context_id: Option<String>,
     pub search: Option<String>,
     pub tag: Option<String>,
+    #[serde(default)]
+    pub app: Option<String>,
+    #[serde(default)]
+    pub date_from: Option<String>,
+    #[serde(default)]
+    pub date_to: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     #[serde(default)]
@@ -153,6 +159,9 @@ pub fn default_capture_filter() -> CaptureFilter {
         context_id: None,
         search: None,
         tag: None,
+        app: None,
+        date_from: None,
+        date_to: None,
         limit: None,
         offset: None,
         exclude_references: false,
@@ -221,6 +230,29 @@ fn capture_query_parts(filter: &CaptureFilter) -> CaptureQueryParts {
                 .to_string(),
         );
         args.push(tag.clone());
+    }
+
+    if let Some(app) = filter.app.as_ref().filter(|value| !value.trim().is_empty()) {
+        where_parts.push("lower(coalesce(c.source_app_name, '')) LIKE lower(?)".to_string());
+        args.push(format!("%{}%", app.trim()));
+    }
+
+    if let Some(date_from) = filter
+        .date_from
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        where_parts.push("c.captured_at >= ?".to_string());
+        args.push(date_from.clone());
+    }
+
+    if let Some(date_to) = filter
+        .date_to
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        where_parts.push("c.captured_at < ?".to_string());
+        args.push(date_to.clone());
     }
 
     CaptureQueryParts {
@@ -688,4 +720,62 @@ pub fn get_capture_by_id(conn: &Connection, id: &str) -> Result<CaptureDto, Stri
     captures
         .pop()
         .ok_or_else(|| "Captura nao encontrada.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_query_parts, CaptureFilter};
+
+    #[test]
+    fn capture_filters_add_app_and_exclusive_date_bounds() {
+        let filter = CaptureFilter {
+            context_id: None,
+            search: None,
+            tag: Some("release".into()),
+            app: Some("Visual Studio".into()),
+            date_from: Some("2026-11-01T00:00:00".into()),
+            date_to: Some("2026-12-01T00:00:00".into()),
+            limit: None,
+            offset: None,
+            exclude_references: false,
+        };
+
+        let parts = capture_query_parts(&filter);
+
+        assert!(parts.where_clause.contains("ct.tag = ?"));
+        assert!(parts
+            .where_clause
+            .contains("lower(coalesce(c.source_app_name, '')) LIKE lower(?)"));
+        assert!(parts.where_clause.contains("c.captured_at >= ?"));
+        assert!(parts.where_clause.contains("c.captured_at < ?"));
+        assert_eq!(
+            parts.args,
+            [
+                "release",
+                "%Visual Studio%",
+                "2026-11-01T00:00:00",
+                "2026-12-01T00:00:00"
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_app_and_date_filters_are_ignored() {
+        let filter = CaptureFilter {
+            context_id: None,
+            search: None,
+            tag: None,
+            app: Some("  ".into()),
+            date_from: Some(String::new()),
+            date_to: None,
+            limit: None,
+            offset: None,
+            exclude_references: false,
+        };
+
+        let parts = capture_query_parts(&filter);
+
+        assert!(parts.where_clause.is_empty());
+        assert!(parts.args.is_empty());
+    }
 }

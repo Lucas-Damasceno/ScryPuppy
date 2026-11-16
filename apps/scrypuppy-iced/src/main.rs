@@ -372,6 +372,10 @@ struct App {
     paste_target: Option<isize>,
     dark: bool,
     query: String,
+    library_app_filter: String,
+    library_date_from: String,
+    library_date_to: String,
+    library_tag_filter: String,
     assistant_query: String,
     assistant_app_filter: String,
     assistant_date_from: String,
@@ -454,6 +458,11 @@ enum Message {
     ShowMain,
     QuitFromTray,
     QueryChanged(String),
+    LibraryAppFilterChanged(String),
+    LibraryDateFromChanged(String),
+    LibraryDateToChanged(String),
+    LibraryTagFilterChanged(String),
+    ClearLibraryFilters,
     AssistantQueryChanged(String),
     AssistantAppFilterChanged(String),
     AssistantDateFromChanged(String),
@@ -608,6 +617,10 @@ impl App {
             paste_target: None,
             dark: true,
             query: String::new(),
+            library_app_filter: String::new(),
+            library_date_from: String::new(),
+            library_date_to: String::new(),
+            library_tag_filter: String::new(),
             assistant_query: String::new(),
             assistant_app_filter: String::new(),
             assistant_date_from: String::new(),
@@ -699,6 +712,36 @@ impl App {
             snapshot
                 .captures
                 .retain(|capture| capture.content_text.to_lowercase().contains(&query));
+            let app_filter = self.library_app_filter.trim().to_lowercase();
+            if !app_filter.is_empty() {
+                snapshot.captures.retain(|capture| {
+                    capture
+                        .source_app_name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&app_filter)
+                });
+            }
+            let tag_filter = self.library_tag_filter.trim();
+            if !tag_filter.is_empty() {
+                snapshot
+                    .captures
+                    .retain(|capture| capture.tags.iter().any(|tag| tag == tag_filter));
+            }
+            if let Ok(Some(date_from)) =
+                normalize_assistant_date_filter(&self.library_date_from, false)
+            {
+                snapshot
+                    .captures
+                    .retain(|capture| capture.captured_at.as_str() >= date_from.as_str());
+            }
+            if let Ok(Some(date_to)) = normalize_assistant_date_filter(&self.library_date_to, true)
+            {
+                snapshot
+                    .captures
+                    .retain(|capture| capture.captured_at.as_str() < date_to.as_str());
+            }
             if self.context.as_deref().is_some_and(|id| id != "work") {
                 snapshot.captures.clear();
             }
@@ -722,8 +765,16 @@ impl App {
         let query = self.query.clone();
         let context = self.context.clone();
         let offset = self.offset;
+        let app_filter = self.library_app_filter.clone();
+        let date_from = self.library_date_from.clone();
+        let date_to = self.library_date_to.clone();
+        let tag_filter = self.library_tag_filter.clone();
         Task::perform(
-            async move { load_default_library(query, context, offset) },
+            async move {
+                load_default_library(
+                    query, context, offset, app_filter, date_from, date_to, tag_filter,
+                )
+            },
             move |result| Message::Loaded(revision, result),
         )
     }
@@ -797,6 +848,10 @@ impl App {
                 self.quick_window = Some(id);
                 self.context = None;
                 self.query.clear();
+                self.library_app_filter.clear();
+                self.library_date_from.clear();
+                self.library_date_to.clear();
+                self.library_tag_filter.clear();
                 self.offset = 0;
                 Task::batch([open.map(Message::QuickPasteOpened), self.reload()])
             }
@@ -909,7 +964,56 @@ impl App {
                 Task::none()
             }
             Message::Search => {
+                let date_from =
+                    match normalize_assistant_date_filter(&self.library_date_from, false) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.notice = Some(error);
+                            return Task::none();
+                        }
+                    };
+                let date_to = match normalize_assistant_date_filter(&self.library_date_to, true) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                if date_from
+                    .as_ref()
+                    .zip(date_to.as_ref())
+                    .is_some_and(|(from, to)| from >= to)
+                {
+                    self.notice = Some("A data inicial deve ser anterior à data final.".into());
+                    return Task::none();
+                }
+                self.notice = None;
                 self.offset = 0;
+                self.reload()
+            }
+            Message::LibraryAppFilterChanged(value) => {
+                self.library_app_filter = value.chars().take(120).collect();
+                Task::none()
+            }
+            Message::LibraryDateFromChanged(value) => {
+                self.library_date_from = value.chars().take(10).collect();
+                Task::none()
+            }
+            Message::LibraryDateToChanged(value) => {
+                self.library_date_to = value.chars().take(10).collect();
+                Task::none()
+            }
+            Message::LibraryTagFilterChanged(value) => {
+                self.library_tag_filter = value.chars().take(120).collect();
+                Task::none()
+            }
+            Message::ClearLibraryFilters => {
+                self.library_app_filter.clear();
+                self.library_date_from.clear();
+                self.library_date_to.clear();
+                self.library_tag_filter.clear();
+                self.offset = 0;
+                self.notice = None;
                 self.reload()
             }
             Message::AssistantQueryChanged(value) => {
@@ -2729,6 +2833,32 @@ impl App {
         }
         if !self.settings_open {
             content = content.push(search);
+            content = content.push(
+                row![
+                    text_input("Aplicativo", &self.library_app_filter)
+                        .on_input(Message::LibraryAppFilterChanged)
+                        .on_submit(Message::Search)
+                        .padding(8)
+                        .width(Length::Fill),
+                    text_input("Tag exata", &self.library_tag_filter)
+                        .on_input(Message::LibraryTagFilterChanged)
+                        .on_submit(Message::Search)
+                        .padding(8)
+                        .width(150),
+                    text_input("De · AAAA-MM-DD", &self.library_date_from)
+                        .on_input(Message::LibraryDateFromChanged)
+                        .on_submit(Message::Search)
+                        .padding(8)
+                        .width(145),
+                    text_input("Até · AAAA-MM-DD", &self.library_date_to)
+                        .on_input(Message::LibraryDateToChanged)
+                        .on_submit(Message::Search)
+                        .padding(8)
+                        .width(145),
+                    button("Limpar filtros").on_press(Message::ClearLibraryFilters),
+                ]
+                .spacing(6),
+            );
             content = content.push(text("Pergunte à biblioteca").size(18)).push(
                 row![
                     text_input("Pergunte sobre suas capturas", &self.assistant_query)
@@ -4167,9 +4297,26 @@ fn load_default_library(
     query: String,
     context: Option<String>,
     offset: usize,
+    app_filter: String,
+    date_from: String,
+    date_to: String,
+    tag_filter: String,
 ) -> Result<Snapshot, String> {
     let (path, key) = default_database_credentials()?;
-    load_library(&path, &key, query, context, offset)
+    let date_from = normalize_assistant_date_filter(&date_from, false)?;
+    let date_to = normalize_assistant_date_filter(&date_to, true)?;
+    let filter = CaptureFilter {
+        context_id: context,
+        search: (!query.trim().is_empty()).then_some(query),
+        tag: (!tag_filter.trim().is_empty()).then_some(tag_filter),
+        app: (!app_filter.trim().is_empty()).then_some(app_filter),
+        date_from,
+        date_to,
+        limit: Some(PAGE_SIZE),
+        offset: Some(offset),
+        exclude_references: false,
+    };
+    load_library(&path, &key, filter)
         .map_err(|_| "Não foi possível abrir a biblioteca existente com segurança.".into())
 }
 
@@ -5931,22 +6078,8 @@ fn assign_captures_to_context_in(
         })
 }
 
-fn load_library(
-    path: &Path,
-    key: &str,
-    query: String,
-    context: Option<String>,
-    offset: usize,
-) -> Result<Snapshot, String> {
+fn load_library(path: &Path, key: &str, filter: CaptureFilter) -> Result<Snapshot, String> {
     let conn = open_existing_read_only(path, key)?;
-    let filter = CaptureFilter {
-        context_id: context,
-        search: (!query.trim().is_empty()).then_some(query),
-        tag: None,
-        limit: Some(PAGE_SIZE),
-        offset: Some(offset),
-        exclude_references: false,
-    };
     let dark = conn
         .query_row(
             "SELECT value FROM settings WHERE key = 'iced_theme_dark'",
@@ -6372,6 +6505,30 @@ mod tests {
     use super::*;
     use scrypuppy_core::storage::open_or_create;
 
+    fn load_library_for_test(
+        path: &Path,
+        key: &str,
+        query: String,
+        context: Option<String>,
+        offset: usize,
+    ) -> Result<Snapshot, String> {
+        load_library(
+            path,
+            key,
+            CaptureFilter {
+                context_id: context,
+                search: (!query.trim().is_empty()).then_some(query),
+                tag: None,
+                app: None,
+                date_from: None,
+                date_to: None,
+                limit: Some(PAGE_SIZE),
+                offset: Some(offset),
+                exclude_references: false,
+            },
+        )
+    }
+
     #[test]
     fn quick_paste_hit_region_scales_with_dpi_and_rejects_tiny_windows() {
         assert_eq!(
@@ -6665,7 +6822,8 @@ mod tests {
         }
         drop(conn);
         let path = dir.path().join(DATABASE_FILE);
-        let snapshot = load_library(&path, &key, "hello".into(), Some("work".into()), 0).unwrap();
+        let snapshot =
+            load_library_for_test(&path, &key, "hello".into(), Some("work".into()), 0).unwrap();
         assert_eq!(snapshot.total, 1);
         assert!(!snapshot.dark);
         assert_eq!(snapshot.contexts[0].name, "Trabalho");
@@ -6716,11 +6874,12 @@ mod tests {
             "iced_quick_context_style"
         ));
         drop(write_conn);
-        let filtered = load_library(&path, &key, "hello".into(), Some("work".into()), 0).unwrap();
+        let filtered =
+            load_library_for_test(&path, &key, "hello".into(), Some("work".into()), 0).unwrap();
         assert!(filtered.dark);
         assert!(!filtered.quick_paste_minimal);
         assert!(filtered.quick_context_minimal);
-        let images = load_library(&path, &key, "image sample".into(), None, 0).unwrap();
+        let images = load_library_for_test(&path, &key, "image sample".into(), None, 0).unwrap();
         let (rendered, _) = previews(&images.asset_root, &images.captures);
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].0, "2");
@@ -6728,18 +6887,19 @@ mod tests {
             ::image::guess_format(&rendered[0].1).unwrap(),
             ::image::ImageFormat::Png
         );
-        let first_page = load_library(&path, &key, String::new(), None, 0).unwrap();
-        let second_page = load_library(&path, &key, String::new(), None, PAGE_SIZE).unwrap();
+        let first_page = load_library_for_test(&path, &key, String::new(), None, 0).unwrap();
+        let second_page =
+            load_library_for_test(&path, &key, String::new(), None, PAGE_SIZE).unwrap();
         assert_eq!(first_page.total, 62);
         assert_eq!(first_page.captures.len(), PAGE_SIZE);
         assert_eq!(second_page.captures.len(), 2);
         assert_eq!(
-            load_library(&path, &key, "missing".into(), None, 0)
+            load_library_for_test(&path, &key, "missing".into(), None, 0)
                 .unwrap()
                 .total,
             0
         );
-        assert!(load_library(&path, &"34".repeat(32), String::new(), None, 0).is_err());
+        assert!(load_library_for_test(&path, &"34".repeat(32), String::new(), None, 0).is_err());
     }
 
     #[test]
