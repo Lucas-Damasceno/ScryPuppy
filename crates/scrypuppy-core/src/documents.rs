@@ -87,7 +87,15 @@ pub fn save_answer(
                 .join("\n")
         }
     );
-    let filters = serde_json::json!({ "response_mode": "direct", "source": "iced_assistant" });
+    // Keep the filter payload compatible with the existing Tauri Magic Search
+    // reader, which still consumes these rows during the migration period.
+    let filters = serde_json::json!({
+        "query": query,
+        "context_ids": [],
+        "include_knowledge_base": false,
+        "include_inbox": false,
+        "response_mode": "direct"
+    });
     conn.execute(
         "INSERT INTO magic_search_documents
          (id, root_id, previous_document_id, version, title, query, markdown, provider, model,
@@ -253,6 +261,16 @@ mod tests {
             }],
         };
         let document = save_answer(&conn, "Qual é o prazo?", &answer, None).unwrap();
+        let stored_filters: serde_json::Value = conn
+            .query_row(
+                "SELECT filters_json FROM magic_search_documents WHERE id = ?1",
+                [&document.id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|value| serde_json::from_str(&value).unwrap())
+            .unwrap();
+        assert_eq!(stored_filters["query"], "Qual é o prazo?");
+        assert_eq!(stored_filters["response_mode"], "direct");
         assert_eq!(document.evidence.len(), 1);
         assert_eq!(document.evidence[0].capture_id, "source-1");
         assert!(document.markdown.contains("## Fontes"));
