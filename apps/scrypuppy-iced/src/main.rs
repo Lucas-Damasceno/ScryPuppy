@@ -378,7 +378,7 @@ enum Message {
     SaveEditedDocument,
     EditedDocumentSaved(Result<(), String>),
     ExportDocument,
-    DocumentExported(Result<String, String>),
+    DocumentExported(Result<Option<String>, String>),
     OpenAssistantEvidence(String),
     AssistantEvidenceLoaded(u64, String, Result<Box<CaptureDto>, String>),
     Search,
@@ -1055,14 +1055,24 @@ impl App {
                 };
                 self.action_busy = true;
                 Task::perform(
-                    async move { export_document_markdown(&document) },
+                    async move {
+                        let suggested_name = document_export_filename(&document);
+                        let dialog = rfd::AsyncFileDialog::new()
+                            .add_filter("Markdown", &["md"])
+                            .set_file_name(&suggested_name);
+                        let Some(handle) = dialog.save_file().await else {
+                            return Ok(None);
+                        };
+                        export_document_markdown(&document, handle.path()).map(Some)
+                    },
                     Message::DocumentExported,
                 )
             }
             Message::DocumentExported(result) => {
                 self.action_busy = false;
                 match result {
-                    Ok(path) => self.notice = Some(format!("Markdown exportado em {path}")),
+                    Ok(Some(path)) => self.notice = Some(format!("Markdown exportado em {path}")),
+                    Ok(None) => {}
                     Err(error) => self.error = Some(error),
                 }
                 Task::none()
@@ -4079,15 +4089,7 @@ fn save_document_markdown(id: &str, markdown: &str) -> Result<(), String> {
     scrypuppy_core::documents::update_markdown(&conn, id, markdown)
 }
 
-fn export_document_markdown(
-    document: &scrypuppy_core::documents::Document,
-) -> Result<String, String> {
-    let (database_path, _) = default_database_credentials()?;
-    let root = database_path
-        .parent()
-        .ok_or("Diretório da biblioteca indisponível")?;
-    let export_dir = root.join("exports").join("magic-search");
-    std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+fn document_export_filename(document: &scrypuppy_core::documents::Document) -> String {
     let slug = document
         .title
         .chars()
@@ -4106,12 +4108,21 @@ fn export_document_markdown(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let filename = format!(
+    format!(
         "{}-{}.md",
         if slug.is_empty() { "documento" } else { &slug },
         &document.id[..8.min(document.id.len())]
-    );
-    let path = export_dir.join(filename);
+    )
+}
+
+fn export_document_markdown(
+    document: &scrypuppy_core::documents::Document,
+    selected_path: &Path,
+) -> Result<String, String> {
+    let mut path = selected_path.to_path_buf();
+    if path.extension().is_none() {
+        path.set_extension("md");
+    }
     std::fs::write(&path, &document.markdown).map_err(|error| error.to_string())?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -5992,6 +6003,33 @@ mod tests {
         );
         assert!(normalize_assistant_date_filter("15/11/2026", false).is_err());
         assert_eq!(normalize_assistant_date_filter("", false).unwrap(), None);
+    }
+
+    #[test]
+    fn document_export_uses_the_selected_path_and_adds_markdown_extension() {
+        let document = scrypuppy_core::documents::Document {
+            id: "12345678-90ab-cdef-1234-567890abcdef".into(),
+            root_id: "12345678-90ab-cdef-1234-567890abcdef".into(),
+            version: 1,
+            title: "Notas da reunião".into(),
+            query: "reunião".into(),
+            markdown: "# Notas da reunião".into(),
+            created_at: "2026-11-15T12:00:00Z".into(),
+            evidence: Vec::new(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let selected_path = directory.path().join("anotacoes");
+
+        assert_eq!(
+            document_export_filename(&document),
+            "notas-da-reunio-12345678.md"
+        );
+        let written_path = export_document_markdown(&document, &selected_path).unwrap();
+        assert!(written_path.ends_with("anotacoes.md"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("anotacoes.md")).unwrap(),
+            document.markdown
+        );
     }
 
     #[test]

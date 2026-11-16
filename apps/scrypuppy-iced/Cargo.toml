@@ -11,6 +11,7 @@ enigo = "0.2.1"
 global-hotkey = "=0.8.0"
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs"] }
 keyring = "4.1.4"
+rfd = "=0.16.0"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5.8"
 regex = "1.13.0"
