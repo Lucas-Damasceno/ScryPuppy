@@ -236,7 +236,8 @@ struct App {
     context: Option<String>,
     new_context_name: String,
     new_rule_name: String,
-    new_rule_condition: String,
+    new_rule_conditions: Vec<String>,
+    new_rule_match_mode: String,
     new_tag: String,
     launch_at_startup: bool,
     autostart_changed: bool,
@@ -298,7 +299,10 @@ enum Message {
     RemoveTag(String, String),
     TagSaved(Result<(), String>),
     NewRuleNameChanged(String),
-    NewRuleConditionChanged(String),
+    NewRuleConditionChanged(usize, String),
+    AddRuleCondition,
+    RemoveRuleCondition,
+    ToggleRuleMatchMode,
     CreateContextRule,
     ContextRuleCreated(Result<(), String>),
     ToggleContextRule(String, bool),
@@ -391,7 +395,8 @@ impl App {
             context: None,
             new_context_name: String::new(),
             new_rule_name: String::new(),
-            new_rule_condition: String::new(),
+            new_rule_conditions: vec![String::new()],
+            new_rule_match_mode: "all".into(),
             new_tag: String::new(),
             launch_at_startup: false,
             autostart_changed: false,
@@ -718,8 +723,31 @@ impl App {
                 self.new_rule_name = value;
                 Task::none()
             }
-            Message::NewRuleConditionChanged(value) => {
-                self.new_rule_condition = value;
+            Message::NewRuleConditionChanged(index, value) => {
+                if let Some(condition) = self.new_rule_conditions.get_mut(index) {
+                    *condition = value;
+                }
+                Task::none()
+            }
+            Message::AddRuleCondition => {
+                if self.new_rule_conditions.len() < 12 {
+                    self.new_rule_conditions.push(String::new());
+                }
+                Task::none()
+            }
+            Message::RemoveRuleCondition => {
+                if self.new_rule_conditions.len() > 1 {
+                    self.new_rule_conditions.pop();
+                }
+                Task::none()
+            }
+            Message::ToggleRuleMatchMode => {
+                self.new_rule_match_mode = if self.new_rule_match_mode == "all" {
+                    "any"
+                } else {
+                    "all"
+                }
+                .into();
                 Task::none()
             }
             Message::CreateContextRule => {
@@ -732,13 +760,20 @@ impl App {
                     return Task::none();
                 };
                 let name = self.new_rule_name.trim().to_string();
-                let condition = self.new_rule_condition.trim().to_string();
-                if name.is_empty() || condition.is_empty() || self.action_busy {
+                let conditions = self
+                    .new_rule_conditions
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .collect::<Vec<_>>();
+                let match_mode = self.new_rule_match_mode.clone();
+                if name.is_empty() || conditions.iter().any(String::is_empty) || self.action_busy {
                     return Task::none();
                 }
                 self.action_busy = true;
                 Task::perform(
-                    async move { create_text_context_rule(&context_id, &name, &condition) },
+                    async move {
+                        create_text_context_rule(&context_id, &name, &conditions, &match_mode)
+                    },
                     Message::ContextRuleCreated,
                 )
             }
@@ -747,7 +782,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         self.new_rule_name.clear();
-                        self.new_rule_condition.clear();
+                        self.new_rule_conditions = vec![String::new()];
                         self.notice = Some("Regra automática criada.".into());
                     }
                     Err(error) => self.notice = Some(error),
@@ -1482,11 +1517,28 @@ impl App {
                     navigation = navigation
                         .push(Space::new().height(8))
                         .push(text("REGRAS AUTOMÁTICAS").size(11))
-                        .push(text_input("Nome da regra", &self.new_rule_name)
-                            .on_input(Message::NewRuleNameChanged).padding(8))
-                        .push(text_input("Texto que deve conter", &self.new_rule_condition)
-                            .on_input(Message::NewRuleConditionChanged).padding(8))
-                        .push(text("A regra compara o texto da captura e é aplicada às próximas capturas.").size(10))
+                        .push(
+                            text_input("Nome da regra", &self.new_rule_name)
+                                .on_input(Message::NewRuleNameChanged)
+                                .padding(8),
+                        );
+                    for (index, condition) in self.new_rule_conditions.iter().enumerate() {
+                        navigation = navigation.push(
+                            text_input(&format!("Texto {} contém", index + 1), condition)
+                                .on_input(move |value| {
+                                    Message::NewRuleConditionChanged(index, value)
+                                })
+                                .padding(8),
+                        );
+                    }
+                    navigation = navigation
+                        .push(row![
+                            button("+ condição").on_press(Message::AddRuleCondition).width(Length::Fill),
+                            button("− condição").on_press(Message::RemoveRuleCondition).width(Length::Fill),
+                        ].spacing(5))
+                        .push(button(if self.new_rule_match_mode == "all" { "Combinar: todas (E)" } else { "Combinar: qualquer (OU)" })
+                            .on_press(Message::ToggleRuleMatchMode))
+                        .push(text("As condições comparam o texto da captura e valem para as próximas capturas.").size(10))
                         .push(button("Criar regra de texto")
                             .on_press_maybe((!self.action_busy).then_some(Message::CreateContextRule))
                             .width(Length::Fill));
@@ -2854,15 +2906,23 @@ fn update_capture_tag(capture_id: &str, raw_tag: &str, remove: bool) -> Result<(
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)
 }
 
-fn create_text_context_rule(context_id: &str, name: &str, value: &str) -> Result<(), String> {
+fn create_text_context_rule(
+    context_id: &str,
+    name: &str,
+    values: &[String],
+    match_mode: &str,
+) -> Result<(), String> {
     let name = name.trim();
-    let value = value.trim();
     if name.is_empty()
         || name.chars().count() > 80
-        || value.is_empty()
-        || value.chars().count() > 500
+        || values.is_empty()
+        || values.len() > 12
+        || !matches!(match_mode, "all" | "any")
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.trim().chars().count() > 500)
     {
-        return Err("Informe um nome (até 80 caracteres) e um texto (até 500 caracteres).".into());
+        return Err("Informe um nome (até 80 caracteres) e até 12 condições de texto (até 500 caracteres cada).".into());
     }
     let (path, database_key) = default_database_credentials()?;
     let mut conn = open_existing_read_write(&path, &database_key)?;
@@ -2881,14 +2941,16 @@ fn create_text_context_rule(context_id: &str, name: &str, value: &str) -> Result
     let at = chrono::Utc::now().to_rfc3339();
     transaction.execute(
         "INSERT INTO context_rules (id, context_id, name, enabled, match_mode, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 1, 'all', ?4, ?4)",
-        rusqlite::params![id, context_id, name, at],
+         VALUES (?1, ?2, ?3, 1, ?5, ?4, ?4)",
+        rusqlite::params![id, context_id, name, at, match_mode],
     ).map_err(|e| e.to_string())?;
-    transaction.execute(
-        "INSERT INTO context_rule_conditions (id, rule_id, ordinal, field, operator, value, created_at)
-         VALUES (?1, ?2, 0, 'text', 'contains', ?3, ?4)",
-        rusqlite::params![uuid::Uuid::new_v4().to_string(), id, value, at],
-    ).map_err(|e| e.to_string())?;
+    for (ordinal, value) in values.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO context_rule_conditions (id, rule_id, ordinal, field, operator, value, created_at)
+             VALUES (?1, ?2, ?3, 'text', 'contains', ?4, ?5)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), id, ordinal as i64, value.trim(), at],
+        ).map_err(|e| e.to_string())?;
+    }
     transaction.commit().map_err(|e| e.to_string())
 }
 
