@@ -6450,6 +6450,11 @@ fn capture_current_clipboard() -> Result<String, String> {
             window_id: active.window_id.as_deref(),
         },
     )?;
+    if include_images {
+        if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
+            eprintln!("A captura foi salva sem screenshot da janela: {error}");
+        }
+    }
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
     if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
@@ -6551,6 +6556,9 @@ fn capture_selected_reference() -> Result<String, String> {
     let app_dir = path
         .parent()
         .ok_or("Diretório da biblioteca indisponível.")?;
+    let settings_conn = open_existing_read_only(&path, &database_key)?;
+    let include_screenshot = read_boolean_setting(&settings_conn, "capture_screenshots", true);
+    drop(settings_conn);
     let active = active_window_metadata();
     let mut conn = open_existing_read_write(&path, &database_key).map_err(|_| {
         "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
@@ -6570,6 +6578,11 @@ fn capture_selected_reference() -> Result<String, String> {
             window_id: active.window_id.as_deref(),
         },
     )?;
+    if include_screenshot {
+        if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
+            eprintln!("A captura foi salva sem screenshot da janela: {error}");
+        }
+    }
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
     if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
@@ -6593,6 +6606,108 @@ fn restore_reference_clipboard(
             windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
         });
     Ok(())
+}
+
+fn save_window_screenshot(
+    conn: &rusqlite::Connection,
+    app_dir: &Path,
+    capture_id: &str,
+    active: &ActiveWindowMetadata,
+) -> Result<(), String> {
+    let directory = app_dir.join("assets").join("screenshots");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{capture_id}.png"));
+    let (saved_path, status, error) = match capture_active_window_image(active, &path) {
+        Ok(()) => (Some(path.clone()), "saved", None),
+        Err(error) => (None, "unavailable", Some(error)),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let insert = conn.execute(
+        "INSERT INTO capture_assets (id, capture_id, kind, path, status, error, created_at)
+         VALUES (?1, ?2, 'screenshot', ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            capture_id,
+            saved_path.as_ref().map(|path| path.display().to_string()),
+            status,
+            error,
+            now
+        ],
+    );
+    if let Err(error) = insert {
+        if let Some(path) = saved_path {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn capture_active_window_image(active: &ActiveWindowMetadata, path: &Path) -> Result<(), String> {
+    let windows = xcap::Window::all().map_err(|error| error.to_string())?;
+    let active_pid = active.process_id.map(|pid| pid as u32);
+    let active_title = active.window_title.as_deref().unwrap_or_default();
+    let active_app = active.app_name.as_deref().unwrap_or_default();
+    let window = windows
+        .into_iter()
+        .filter_map(|window| {
+            let pid_matches = active_pid
+                .and_then(|pid| window.pid().ok().map(|window_pid| window_pid == pid))
+                .unwrap_or(false);
+            let title_matches = window
+                .title()
+                .ok()
+                .map(|title| {
+                    !active_title.trim().is_empty()
+                        && normalize_window_label(&title) == normalize_window_label(active_title)
+                })
+                .unwrap_or(false);
+            let app_matches = window
+                .app_name()
+                .ok()
+                .map(|app| {
+                    !active_app.trim().is_empty()
+                        && normalize_window_label(&app) == normalize_window_label(active_app)
+                })
+                .unwrap_or(false);
+            let area = u64::from(window.width().unwrap_or_default())
+                .saturating_mul(u64::from(window.height().unwrap_or_default()));
+            let score = if pid_matches && title_matches {
+                400
+            } else if title_matches && app_matches {
+                300
+            } else if pid_matches && app_matches && area > 20_000 {
+                100
+            } else if pid_matches && area > 20_000 {
+                50
+            } else {
+                0
+            };
+            (score > 0).then_some((score, area, window))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+        .map(|(_, _, window)| window)
+        .ok_or_else(|| {
+            "Não foi possível identificar a janela ativa para o screenshot.".to_string()
+        })?;
+    if window.is_minimized().unwrap_or(false) {
+        return Err("A janela ativa está minimizada.".into());
+    }
+    window
+        .capture_image()
+        .map_err(|error| error.to_string())?
+        .save(path)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn capture_active_window_image(_active: &ActiveWindowMetadata, _path: &Path) -> Result<(), String> {
+    Err("A captura da janela está disponível somente no Windows.".into())
+}
+
+fn normalize_window_label(value: &str) -> String {
+    value.trim().to_lowercase()
 }
 
 #[derive(Default)]
@@ -6639,6 +6754,7 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         "clipboard_monitor_capture_screenshots",
         false,
     );
+    let capture_window_screenshot = include_images;
     let prompt_quick_context = read_boolean_setting(&settings_conn, "quick_context_enabled", true)
         && read_boolean_setting(
             &settings_conn,
@@ -6685,6 +6801,11 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         },
     ) {
         Ok(id) => {
+            if capture_window_screenshot {
+                if let Err(error) = save_window_screenshot(&conn, app_dir, &id, &active) {
+                    eprintln!("A captura automática ficou sem screenshot da janela: {error}");
+                }
+            }
             let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
             sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
             if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
