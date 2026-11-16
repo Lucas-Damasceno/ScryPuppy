@@ -7854,7 +7854,6 @@ fn render_doc_first_page_thumbnail(path: &Path) -> Result<Vec<u8>, String> {
                 CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP,
                 BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
             },
-            System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
             UI::Shell::{
                 IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY,
             },
@@ -7867,7 +7866,7 @@ fn render_doc_first_page_thumbnail(path: &Path) -> Result<Vec<u8>, String> {
     }
 
     // Shell thumbnail providers may access disk, so this function is only called by the preview worker.
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let _com_apartment = ComApartment::initialize();
     let item: IShellItemImageFactory =
         unsafe { SHCreateItemFromParsingName(&HSTRING::from(path.display().to_string()), None) }
             .map_err(|error| error.to_string())?;
@@ -7961,20 +7960,43 @@ fn render_doc_first_page_thumbnail(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(windows)]
+struct ComApartment {
+    initialized: bool,
+}
+
+#[cfg(windows)]
+impl ComApartment {
+    fn initialize() -> Self {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        Self {
+            initialized: unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+#[cfg(windows)]
 fn render_pdf_first_page(path: &Path) -> Result<Vec<u8>, String> {
     use windows::{
         core::HSTRING,
         Data::Pdf::PdfDocument,
         Storage::StorageFile,
         Storage::Streams::{DataReader, InMemoryRandomAccessStream},
-        Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
     };
     let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 20 * 1024 * 1024 {
         return Err("PDF acima do limite seguro de prévia.".into());
     }
     // The preview worker owns this COM apartment and never blocks capture or window creation.
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let _com_apartment = ComApartment::initialize();
     let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.display().to_string()))
         .map_err(|error| error.to_string())?
         .get()
