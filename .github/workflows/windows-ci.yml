@@ -95,6 +95,15 @@ jobs:
       - name: Test Iced migration
         run: cargo test --manifest-path apps/scrypuppy-iced/Cargo.toml --locked
 
+      - name: Check shared Rust core formatting
+        run: cargo fmt --manifest-path crates/scrypuppy-core/Cargo.toml --check
+
+      - name: Test shared Rust core
+        run: cargo test --manifest-path crates/scrypuppy-core/Cargo.toml --locked
+
+      - name: Check optimized Iced migration build
+        run: cargo check --release --manifest-path apps/scrypuppy-iced/Cargo.toml --locked
+
       - name: Build and smoke-test unsigned Windows installer
         env:
           REQUIRE_UPDATER_SIGNATURE: false
