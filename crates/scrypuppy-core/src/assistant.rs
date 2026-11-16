@@ -22,6 +22,7 @@ pub struct ChatRequest {
     pub context_id: Option<String>,
     pub app: Option<String>,
     pub date_from: Option<String>,
+    /// Exclusive upper bound for capture timestamps.
     pub date_to: Option<String>,
     pub limit: Option<usize>,
 }
@@ -146,7 +147,7 @@ fn load_chat_captures(conn: &Connection, request: &ChatRequest) -> Result<Vec<Ca
                 OR EXISTS (SELECT 1 FROM capture_contexts cc WHERE cc.capture_id = c.id AND cc.context_id = ?1))
                AND (?2 IS NULL OR lower(coalesce(c.source_app_name, '')) LIKE '%' || lower(?2) || '%')
                AND (?3 IS NULL OR c.captured_at >= ?3)
-               AND (?4 IS NULL OR c.captured_at <= ?4)
+               AND (?4 IS NULL OR c.captured_at < ?4)
              ORDER BY c.captured_at DESC, c.id
              LIMIT 500",
         )
@@ -1030,6 +1031,18 @@ mod tests {
             "capture",
         )
         .unwrap();
+        let late_today_id = save_clipboard_capture(
+            &mut conn,
+            dir.path(),
+            &ClipboardSnapshot {
+                representations: vec![ClipboardRepresentation::PlainText(
+                    "Planejamento registrado no fim do dia".into(),
+                )],
+                formats: Vec::new(),
+            },
+            "capture",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO capture_contexts (capture_id, context_id, assignment_origin, confidence, created_at)
              VALUES (?1, 'work', 'manual', 1, 'now')",
@@ -1040,6 +1053,12 @@ mod tests {
             "INSERT INTO capture_contexts (capture_id, context_id, assignment_origin, confidence, created_at)
              VALUES (?1, 'work', 'manual', 1, 'now')",
             [&archived_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_contexts (capture_id, context_id, assignment_origin, confidence, created_at)
+             VALUES (?1, 'work', 'manual', 1, 'now')",
+            [&late_today_id],
         )
         .unwrap();
         conn.execute(
@@ -1052,6 +1071,12 @@ mod tests {
             "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-14T10:00:00Z'
              WHERE id = ?1",
             [&archived_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-15T23:59:59Z'
+             WHERE id = ?1",
+            [&late_today_id],
         )
         .unwrap();
 
@@ -1073,12 +1098,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(answer.evidence.len(), 2);
-        assert_eq!(answer.evidence[0].capture_id, capture_id);
+        assert_eq!(answer.evidence.len(), 3);
+        let original_evidence = answer
+            .evidence
+            .iter()
+            .find(|evidence| evidence.capture_id == capture_id)
+            .unwrap();
         assert!(answer.answer.contains("Encontrei"));
-        assert_eq!(answer.evidence[0].context_names, ["Trabalho"]);
-        assert!(answer.evidence[0].excerpt.contains("[redigido]"));
-        assert!(!answer.evidence[0].excerpt.contains("sk-proj-"));
+        assert_eq!(original_evidence.context_names, ["Trabalho"]);
+        assert!(original_evidence.excerpt.contains("[redigido]"));
+        assert!(!original_evidence.excerpt.contains("sk-proj-"));
 
         let filtered = answer_chat(
             &conn,
@@ -1088,13 +1117,16 @@ mod tests {
                 context_id: Some("work".into()),
                 app: Some("Visual Studio".into()),
                 date_from: Some("2026-11-15T00:00:00".into()),
-                date_to: Some("2026-11-15T23:59:59.999999999".into()),
+                date_to: Some("2026-11-16T00:00:00".into()),
                 limit: None,
             },
         )
         .unwrap();
-        assert_eq!(filtered.evidence.len(), 1);
-        assert_eq!(filtered.evidence[0].capture_id, capture_id);
+        assert_eq!(filtered.evidence.len(), 2);
+        assert!(filtered
+            .evidence
+            .iter()
+            .any(|evidence| evidence.capture_id == late_today_id));
 
         let summary = answer_chat(
             &conn,
@@ -1110,7 +1142,7 @@ mod tests {
         )
         .unwrap();
         assert!(summary.answer.starts_with("Resumo local"));
-        assert_eq!(summary.evidence.len(), 2);
+        assert_eq!(summary.evidence.len(), 3);
 
         let daily = answer_chat(
             &conn,
@@ -1125,7 +1157,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(daily.answer.starts_with("Hoje encontrei 1 captura"));
+        assert!(daily.answer.starts_with("Hoje encontrei 2 captura"));
 
         let no_match = answer_chat(
             &conn,

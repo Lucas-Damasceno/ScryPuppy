@@ -4063,12 +4063,16 @@ fn normalize_assistant_date_filter(
     }
     let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map_err(|_| "Use datas no formato AAAA-MM-DD.".to_string())?;
-    let time = if end_of_day {
-        chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)
+    let (date, time) = if end_of_day {
+        (
+            date.succ_opt()
+                .ok_or_else(|| "A data final não pode passar do último dia válido.".to_string())?,
+            chrono::NaiveTime::from_hms_opt(0, 0, 0),
+        )
     } else {
-        chrono::NaiveTime::from_hms_opt(0, 0, 0)
-    }
-    .ok_or_else(|| "Data inválida.".to_string())?;
+        (date, chrono::NaiveTime::from_hms_opt(0, 0, 0))
+    };
+    let time = time.ok_or_else(|| "Data inválida.".to_string())?;
     Ok(Some(
         date.and_time(time)
             .format("%Y-%m-%dT%H:%M:%S%.f")
@@ -6080,7 +6084,7 @@ mod tests {
         );
         assert_eq!(
             normalize_assistant_date_filter("2026-11-15", true).unwrap(),
-            Some("2026-11-15T23:59:59.999999999".into())
+            Some("2026-11-16T00:00:00".into())
         );
         assert!(normalize_assistant_date_filter("15/11/2026", false).is_err());
         assert_eq!(normalize_assistant_date_filter("", false).unwrap(), None);
