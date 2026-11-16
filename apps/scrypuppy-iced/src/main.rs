@@ -1,8 +1,8 @@
 //! Native Iced UI for the ScryPuppy migration.
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use iced::widget::{
-    button, column, container, image as iced_image, row, scrollable, text, text_editor, text_input,
-    Space,
+    button, column, container, image as iced_image, row, scrollable, text as iced_text,
+    text_editor, text_input as iced_text_input, Space,
 };
 use iced::{window, Alignment, Color, Element, Length, Point, Size, Task, Theme};
 use keyring::{Entry as CredentialEntry, Error as CredentialError};
@@ -39,6 +39,7 @@ static DATA_RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static OCR_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static RETENTION_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static AI_API_KEY_STATUS: AtomicU8 = AtomicU8::new(0);
+static UI_LANGUAGE_ENGLISH: AtomicBool = AtomicBool::new(false);
 static CAPTURE_COORDINATOR: OnceLock<scrypuppy_core::coordination::CaptureCoordinator> =
     OnceLock::new();
 #[cfg(windows)]
@@ -48,6 +49,301 @@ thread_local! {
 const PAGE_SIZE: usize = 60;
 const AI_KEY_CREDENTIAL: &str = "ai-api-key-v1";
 const CREDENTIAL_SERVICE: &str = "Scryppy";
+
+fn localized_ui_text(value: &str, english: bool) -> String {
+    if !english {
+        return value.to_owned();
+    }
+
+    for (source, target) in [
+        ("Provedor: ", "Provider: "),
+        ("Modelo: ", "Model: "),
+        ("Apagar capturas após: ", "Delete captures after: "),
+        (
+            "Escopo limitado ao Contexto: ",
+            "Scope limited to context: ",
+        ),
+        ("Origem: ", "Source: "),
+        ("Janela: ", "Window: "),
+        ("Tags: ", "Tags: "),
+        ("Contextos: ", "Contexts: "),
+        ("Texto OCR: ", "OCR text: "),
+        ("Prévia · ", "Preview · "),
+    ] {
+        if let Some(detail) = value.strip_prefix(source) {
+            return format!("{target}{detail}");
+        }
+    }
+    if let Some(rest) = value.strip_prefix("Indexando capturas: ") {
+        return format!("Indexing captures: {}", rest.replace(" de ", " of "));
+    }
+    if let Some(rest) = value.strip_prefix("Busca local pronta · ") {
+        return format!(
+            "Local search ready · {}",
+            rest.replace(" capturas indexadas", " captures indexed")
+        );
+    }
+    if let Some(rest) = value.strip_prefix("Página ") {
+        return format!("Page {}", rest.replace(" de ", " of "));
+    }
+    if let Some(rest) = value.strip_prefix("Confiança: ") {
+        return format!("Confidence: {}", rest.replace(" evidência(s)", " evidence"));
+    }
+    if let Some(count) = value.strip_suffix(" fonte(s) vinculada(s)") {
+        if count.chars().all(|character| character.is_ascii_digit()) {
+            return format!("{count} linked sources");
+        }
+    }
+    if let Some(rest) = value.strip_prefix("Suas capturas · ") {
+        return format!("Your captures · {}", rest.replace(" itens · ", " items · "));
+    }
+    if let Some(rest) =
+        value.strip_prefix("Selecione uma ou mais capturas para adicionar a um Contexto · ")
+    {
+        return format!(
+            "Select one or more captures to add to a context · {}",
+            rest.replace(" selecionada(s)", " selected")
+        );
+    }
+    if let Some(rest) = value.strip_prefix("Adicionar ") {
+        if let Some((count, context)) = rest.split_once(" captura(s) a ") {
+            if count.chars().all(|character| character.is_ascii_digit()) {
+                return format!("Add {count} capture(s) to {context}");
+            }
+        }
+    }
+    if let Some(rest) = value.strip_prefix("Salvar e excluir ") {
+        return format!(
+            "Save and delete {}",
+            rest.replace(" capturas antigas agora", " old captures now")
+        );
+    }
+    if let Some(rest) = value.strip_suffix(" capturas seriam elegíveis agora.") {
+        return format!("{rest} captures would be eligible now.");
+    }
+    if let Some(rest) = value.strip_prefix("A regra corresponderá a ") {
+        return format!(
+            "This rule will match {}",
+            rest.replace(
+                " capturas ainda não vinculadas a este Contexto.",
+                " captures not yet assigned to this context."
+            )
+        );
+    }
+    match value {
+        "Seu espaço de ideias" => "Your space for ideas".into(),
+        "ScryPuppy" => "ScryPuppy".into(),
+        "Voltar à biblioteca" => "Back to library".into(),
+        "Configurações" => "Settings".into(),
+        "Biblioteca" => "Library".into(),
+        "Biblioteca local · selecione uma captura para ver os detalhes" => {
+            "Local library · select a capture to see its details".into()
+        }
+        "Preferências da biblioteca e das capturas" => "Library and capture preferences".into(),
+        "Todas as capturas" => "All captures".into(),
+        "CONTEXTOS" => "CONTEXTS".into(),
+        "Novo contexto" => "New context".into(),
+        "Criar Contexto" => "Create context".into(),
+        "Nome do Contexto" => "Context name".into(),
+        "Salvar" => "Save".into(),
+        "Cancelar" => "Cancel".into(),
+        "Renomear Contexto" => "Rename context".into(),
+        "As capturas permanecem na biblioteca sem este vínculo." => {
+            "Captures stay in the library when this link is removed.".into()
+        }
+        "Confirmar exclusão" => "Confirm deletion".into(),
+        "Excluir Contexto" => "Delete context".into(),
+        "REGRAS AUTOMÁTICAS" => "AUTOMATIC RULES".into(),
+        "Nome da regra" => "Rule name".into(),
+        "Tipo de conteúdo" => "Content type".into(),
+        "Título da janela" => "Window title".into(),
+        "Extensão do arquivo" => "File extension".into(),
+        "Caminho do arquivo" => "File path".into(),
+        "Texto" => "Text".into(),
+        "contém" => "contains".into(),
+        "é igual a" => "equals".into(),
+        "corresponde à expressão regular" => "matches regular expression".into(),
+        "+ condição" => "+ condition".into(),
+        "− condição" => "− condition".into(),
+        "Combinar: todas (E)" => "Match: all (AND)".into(),
+        "Combinar: qualquer (OU)" => "Match: any (OR)".into(),
+        "Calculando prévia…" => "Calculating preview…".into(),
+        "Prévia das capturas" => "Preview captures".into(),
+        "Salvando regra…" => "Saving rule…".into(),
+        "Salvar regra" => "Save rule".into(),
+        "Prévia indisponível" => "Preview unavailable".into(),
+        "Tipo: Todos" => "Type: All".into(),
+        "Tipo: Texto" => "Type: Text".into(),
+        "Tipo: Imagem" => "Type: Image".into(),
+        "Tipo: Link" => "Type: Link".into(),
+        "Tipo: Arquivos" => "Type: Files".into(),
+        "Cada condição tem seu próprio campo e operador; novas capturas também seguem a regra." => {
+            "Each condition has its own field and operator; new captures also follow the rule."
+                .into()
+        }
+        "Buscar capturas" => "Search captures".into(),
+        "Buscar" => "Search".into(),
+        "Aguarde…" => "Please wait…".into(),
+        "Capturar clipboard" => "Capture clipboard".into(),
+        "Capturas manuais: salvar imagens" => "Manual captures: save images".into(),
+        "Capturas manuais: ignorar imagens" => "Manual captures: skip images".into(),
+        "Captura automática: salvar imagens" => "Automatic capture: save images".into(),
+        "Captura automática: ignorar imagens" => "Automatic capture: skip images".into(),
+        "Quick Context após captura manual: ligado" => "Quick Context after manual capture: on".into(),
+        "Quick Context após captura manual: desligado" => "Quick Context after manual capture: off".into(),
+        "Quick Context após referência: ligado" => "Quick Context after reference: on".into(),
+        "Quick Context após referência: desligado" => "Quick Context after reference: off".into(),
+        "Quick Context após captura automática: ligado" => "Quick Context after automatic capture: on".into(),
+        "Quick Context após captura automática: desligado" => "Quick Context after automatic capture: off".into(),
+        "Prévia web: ligada" => "Web previews: on".into(),
+        "Prévia web: desligada" => "Web previews: off".into(),
+        "Tentar novamente / reindexar" => "Retry / reindex".into(),
+        "Baixar modelo e preparar busca local" => "Download model and prepare local search".into(),
+        "Iniciar com o Windows: ligado" => "Start with Windows: on".into(),
+        "Iniciar com o Windows: desligado" => "Start with Windows: off".into(),
+        "Buscando…" => "Searching…".into(),
+        "Perguntar" => "Ask".into(),
+        "Salvando documento…" => "Saving document…".into(),
+        "Importar arquivos" => "Import files".into(),
+        "Auto: ligada" => "Auto: on".into(),
+        "Auto: desligada" => "Auto: off".into(),
+        "Tema claro" => "Light theme".into(),
+        "Tema escuro" => "Dark theme".into(),
+        "Bem-vindo ao ScryPuppy" => "Welcome to ScryPuppy".into(),
+        "Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar uma seleção, Ctrl + Shift + S para criar uma referência, Ctrl + Shift + F para perguntar à biblioteca e Ctrl + Shift + V para abrir o Quick Paste." => {
+            "Your captures stay in the encrypted local library. Use Ctrl + Shift + C to save a selection, Ctrl + Shift + S to create a reference, Ctrl + Shift + F to ask your library, and Ctrl + Shift + V to open Quick Paste.".into()
+        }
+        "A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações." => {
+            "Automatic capture starts off. You can control images, Quick Context, and link previews in Settings.".into()
+        }
+        "Continuar para a biblioteca" => "Continue to library".into(),
+        "Aplicativo" => "Application".into(),
+        "Tag exata" => "Exact tag".into(),
+        "De · AAAA-MM-DD" => "From · YYYY-MM-DD".into(),
+        "Até · AAAA-MM-DD" => "To · YYYY-MM-DD".into(),
+        "Limpar filtros" => "Clear filters".into(),
+        "Pergunte à biblioteca" => "Ask your library".into(),
+        "Pergunte sobre suas capturas" => "Ask about your captures".into(),
+        "App (opcional)" => "App (optional)".into(),
+        "Consultando capturas locais…" => "Searching local captures…".into(),
+        "Documentos salvos" => "Saved documents".into(),
+        "Salvar resposta como documento" => "Save answer as document".into(),
+        "Gerar documento com IA" => "Generate document with AI".into(),
+        "Salvar resposta atual como nova versão" => "Save current answer as a new version".into(),
+        "Exportar Markdown" => "Export Markdown".into(),
+        "Excluir documento e versões" => "Delete document and versions".into(),
+        "Prévia da primeira página do PDF indisponível." => "PDF first-page preview unavailable.".into(),
+        "Prévia visual do documento Word indisponível." => "Word document visual preview unavailable.".into(),
+        "Prévia de texto do documento Word indisponível." => "Word document text preview unavailable.".into(),
+        "Prévia do arquivo de texto indisponível." => "Text file preview unavailable.".into(),
+        "Prévia do site indisponível; o link continua identificado." => "Website preview unavailable; the link is still identified.".into(),
+        "Prévia indisponível para este tipo de captura." => "Preview unavailable for this capture type.".into(),
+        "Confirmar exclusão das versões" => "Confirm deletion of versions".into(),
+        "Reabrir tutorial de introdução" => "Reopen introduction".into(),
+        "Captura e privacidade" => "Capture and privacy".into(),
+        "Controla se imagens copiadas são mantidas como capturas locais." => {
+            "Controls whether copied images are kept as local captures.".into()
+        }
+        "Capturas novas são salvas localmente; imagens seguem a preferência de captura de telas." => {
+            "New captures are saved locally; images follow the screenshot capture preference.".into()
+        }
+        "A captura automática continua desativada até ser ligada na barra da biblioteca." => {
+            "Automatic capture stays off until enabled from the library toolbar.".into()
+        }
+        "Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local." => {
+            "When enabled, ScryPuppy visits public websites to fetch titles, favicons, and link images. Local and private addresses are blocked. You can turn off fetching while keeping previews already saved in the local cache.".into()
+        }
+        "Busca inteligente local" => "Local smart search".into(),
+        "O modelo multilíngue é baixado sob demanda. As capturas e seus vetores permanecem na biblioteca local criptografada; a indexação não envia capturas a serviços externos." => {
+            "The multilingual model is downloaded on demand. Captures and their vectors stay in the encrypted local library; indexing does not send captures to external services.".into()
+        }
+        "Inteligência artificial" => "Artificial intelligence".into(),
+        "Idioma das respostas: Português" => "Language: Portuguese".into(),
+        "Idioma das respostas: English" => "Language: English".into(),
+        "Modelo local não baixado" => "Local model not downloaded".into(),
+        "Remover modelo de busca baixado" => "Remove downloaded search model".into(),
+        "Busca local encontrou um erro" => "Local search encountered an error".into(),
+        "Removendo o modelo local…" => "Removing local model…".into(),
+        "Contexto selecionado" => "Selected context".into(),
+        "Aplicativo desconhecido" => "Unknown application".into(),
+        "Inbox" => "Inbox".into(),
+        "Quick Context · demo" => "Quick Context · demo".into(),
+        "Arquivo" => "File".into(),
+        "Controla o idioma da interface, das respostas e dos documentos gerados." => {
+            "Sets the language used by the interface, answers, and generated documents.".into()
+        }
+        "Chave de API" => "API key".into(),
+        "Salvar chave" => "Save key".into(),
+        "Remover chave" => "Remove key".into(),
+        "A chave fica fora do banco local. Perguntas e fontes podem ser salvas como documentos Markdown na biblioteca criptografada." => {
+            "The key is stored outside the local database. Questions and sources can be saved as Markdown documents in the encrypted library.".into()
+        }
+        "Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows." => {
+            "Add or remove ScryPuppy from your Windows account startup.".into()
+        }
+        "Retenção da biblioteca" => "Library retention".into(),
+        "A prévia exclui referências e arquivos importados. A limpeza automática é executada no máximo uma vez por dia." => {
+            "The preview excludes references and imported files. Automatic cleanup runs at most once a day.".into()
+        }
+        "Salvar e manter as capturas existentes" => "Save and keep existing captures".into(),
+        "Calculando prévia de retenção…" => "Calculating retention preview…".into(),
+        "Apagar capturas, anexos, documentos e credencial de IA? Esta ação não pode ser desfeita. A chave criptográfica da biblioteca será mantida." => {
+            "Delete captures, attachments, documents, and the AI credential? This cannot be undone. The library encryption key will be kept.".into()
+        }
+        "Apagar todos os dados" => "Delete all data".into(),
+        "Limpar todos os dados" => "Clear all data".into(),
+        "Carregando biblioteca…" => "Loading library…".into(),
+        "Baixando o modelo local…" => "Downloading local model…".into(),
+        "Indexando capturas: {} de {}" => "Indexing captures: {} of {}".into(),
+        "Nenhuma captura encontrada." => "No captures found.".into(),
+        "Anterior" => "Previous".into(),
+        "Próxima" => "Next".into(),
+        "Detalhes da captura" => "Capture details".into(),
+        "Adicionar tag" => "Add tag".into(),
+        "Adicionar" => "Add".into(),
+        "Abrir arquivo" => "Open file".into(),
+        "Salvando Contexto…" => "Saving context…".into(),
+        "Excluir esta captura e seus arquivos locais? Essa ação não pode ser desfeita." => {
+            "Delete this capture and its local files? This cannot be undone.".into()
+        }
+        "Excluir captura" => "Delete capture".into(),
+        "Buscar no histórico" => "Search history".into(),
+        "Quick Paste" => "Quick Paste".into(),
+        "Minimalista" => "Minimal".into(),
+        "Fechar" => "Close".into(),
+        "Ctrl + Shift + V para abrir · escolha uma captura para colar" => {
+            "Press Ctrl + Shift + V · choose a capture to paste".into()
+        }
+        "Carregando histórico…" => "Loading history…".into(),
+        "Organizar capturas" => "Organize captures".into(),
+        "Marque ao menos uma captura para continuar." => "Select at least one capture to continue.".into(),
+        "As capturas selecionadas já estão nos Contextos disponíveis." => {
+            "The selected captures are already in the available contexts.".into()
+        }
+        "Carregando a captura salva…" => "Loading saved capture…".into(),
+        "Salvando…" => "Saving…".into(),
+        "Concluir depois" => "Finish later".into(),
+        "‹" | "›" | "×" => value.to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+fn text<'a>(value: impl ToString) -> iced::widget::Text<'a> {
+    iced_text(localized_ui_text(
+        &value.to_string(),
+        UI_LANGUAGE_ENGLISH.load(Ordering::Relaxed),
+    ))
+}
+
+fn text_input<'a, InputMessage: Clone>(
+    placeholder: &str,
+    value: &'a str,
+) -> iced::widget::TextInput<'a, InputMessage> {
+    iced_text_input(
+        &localized_ui_text(placeholder, UI_LANGUAGE_ENGLISH.load(Ordering::Relaxed)),
+        value,
+    )
+}
 
 type ImagePreview = (String, Vec<u8>);
 type TextPreview = (String, String);
@@ -749,7 +1045,7 @@ impl App {
             new_tag: String::new(),
             ai_provider: "deepseek".into(),
             ai_model: "deepseek-v4-flash".into(),
-            assistant_language: "en".into(),
+            assistant_language: "pt-BR".into(),
             assistant_language_changed: false,
             ai_api_key_input: String::new(),
             ai_provider_changed: false,
@@ -3074,6 +3370,7 @@ impl App {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        UI_LANGUAGE_ENGLISH.store(self.assistant_language == "en", Ordering::Relaxed);
         if self.quick_window == Some(id) {
             return self.quick_view();
         }
@@ -3086,15 +3383,15 @@ impl App {
             text("ScryPuppy").size(21),
             text("Seu espaço de ideias").size(12),
             Space::new().height(16),
-            button("Todas as capturas")
+            button(text("Todas as capturas"))
                 .on_press(Message::SelectContext(None))
                 .style(move |_, status| navigation_style(dark, all_selected, status))
                 .width(Length::Fill),
-            button(if self.settings_open {
+            button(text(if self.settings_open {
                 "Voltar à biblioteca"
             } else {
                 "Configurações"
-            })
+            }))
             .on_press(Message::ToggleSettings)
             .width(Length::Fill),
             Space::new().height(12),
@@ -3103,7 +3400,7 @@ impl App {
                 .on_input(Message::NewContextNameChanged)
                 .on_submit(Message::CreateContext)
                 .padding(8),
-            button("Criar Contexto")
+            button(text("Criar Contexto"))
                 .on_press_maybe((!self.action_busy).then_some(Message::CreateContext))
                 .width(Length::Fill),
         ]
@@ -3122,7 +3419,7 @@ impl App {
             if self.demo {
                 if let Some(capture) = snapshot.captures.first() {
                     navigation = navigation.push(
-                        button("Quick Context · demo")
+                        button(text("Quick Context · demo"))
                             .on_press(Message::OpenQuickContext(capture.id.clone()))
                             .width(Length::Fill),
                     );
@@ -3152,10 +3449,10 @@ impl App {
                     );
                     navigation = navigation.push(
                         row![
-                            button("Salvar")
+                            button(text("Salvar"))
                                 .on_press(Message::SaveRenameContext)
                                 .width(Length::Fill),
-                            button("Cancelar")
+                            button(text("Cancelar"))
                                 .on_press(Message::CancelRenameContext)
                                 .width(Length::Fill),
                         ]
@@ -3163,7 +3460,7 @@ impl App {
                     );
                 } else {
                     navigation = navigation.push(
-                        button("Renomear Contexto")
+                        button(text("Renomear Contexto"))
                             .on_press(Message::BeginRenameContext(context_id.to_string()))
                             .width(Length::Fill),
                     );
@@ -3174,10 +3471,10 @@ impl App {
                     );
                     navigation = navigation.push(
                         row![
-                            button("Confirmar exclusão")
+                            button(text("Confirmar exclusão"))
                                 .on_press(Message::DeleteContext(context_id.to_string()))
                                 .width(Length::Fill),
-                            button("Cancelar")
+                            button(text("Cancelar"))
                                 .on_press(Message::CancelDeleteContext)
                                 .width(Length::Fill),
                         ]
@@ -3185,7 +3482,7 @@ impl App {
                     );
                 } else {
                     navigation = navigation.push(
-                        button("Excluir Contexto")
+                        button(text("Excluir Contexto"))
                             .on_press(Message::RequestDeleteContext(context_id.to_string()))
                             .width(Length::Fill),
                     );
@@ -3226,13 +3523,13 @@ impl App {
                     }
                     navigation = navigation
                         .push(row![
-                            button("+ condição").on_press(Message::AddRuleCondition).width(Length::Fill),
-                            button("− condição").on_press(Message::RemoveRuleCondition).width(Length::Fill),
+                            button(text("+ condição")).on_press(Message::AddRuleCondition).width(Length::Fill),
+                            button(text("− condição")).on_press(Message::RemoveRuleCondition).width(Length::Fill),
                         ].spacing(5))
-                        .push(button(if self.new_rule_match_mode == "all" { "Combinar: todas (E)" } else { "Combinar: qualquer (OU)" })
+                        .push(button(text(if self.new_rule_match_mode == "all" { "Combinar: todas (E)" } else { "Combinar: qualquer (OU)" }))
                             .on_press(Message::ToggleRuleMatchMode))
                         .push(text("Cada condição tem seu próprio campo e operador; novas capturas também seguem a regra.").size(10))
-                        .push(button(if self.rule_preview_loading { "Calculando prévia…" } else { "Prévia das capturas" })
+                        .push(button(text(if self.rule_preview_loading { "Calculando prévia…" } else { "Prévia das capturas" }))
                             .on_press_maybe((!self.rule_preview_loading && !self.action_busy).then_some(Message::PreviewContextRule))
                             .width(Length::Fill));
                     let preview_ready = if let Some((revision, preview_context, count)) =
@@ -3249,11 +3546,11 @@ impl App {
                         false
                     };
                     navigation = navigation.push(
-                        button(if self.action_busy {
+                        button(text(if self.action_busy {
                             "Salvando regra…"
                         } else {
                             "Salvar regra"
-                        })
+                        }))
                         .on_press_maybe(
                             (preview_ready && !self.action_busy)
                                 .then_some(Message::CreateContextRule),
@@ -3279,7 +3576,7 @@ impl App {
                                             !rule.enabled
                                         ))
                                         .width(Length::Fill),
-                                        button("×")
+                                        button(text("×"))
                                             .on_press(Message::DeleteContextRule(rule.id.clone())),
                                     ]
                                     .spacing(4),
@@ -3301,31 +3598,31 @@ impl App {
                 .on_submit(Message::Search)
                 .padding(10)
                 .width(Length::Fixed(460.0)),
-            button("Buscar").on_press(Message::Search),
+            button(text("Buscar")).on_press(Message::Search),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
         .width(Length::Fill);
         let library_actions = row![
-            button(if self.action_busy {
+            button(text(if self.action_busy {
                 "Aguarde…"
             } else {
                 "Capturar clipboard"
-            })
+            }))
             .on_press(Message::CaptureClipboard),
-            button("Importar arquivos")
+            button(text("Importar arquivos"))
                 .on_press_maybe((!self.action_busy).then_some(Message::ImportFiles)),
-            button(if self.clipboard_monitor_enabled {
+            button(text(if self.clipboard_monitor_enabled {
                 "Auto: ligada"
             } else {
                 "Auto: desligada"
-            })
+            }))
             .on_press(Message::ToggleClipboardMonitor),
-            button(if self.dark {
+            button(text(if self.dark {
                 "Tema claro"
             } else {
                 "Tema escuro"
-            })
+            }))
             .on_press(Message::ToggleTheme)
             .style(move |_, status| navigation_style(dark, false, status)),
         ]
@@ -3356,7 +3653,7 @@ impl App {
                         text("Bem-vindo ao ScryPuppy").size(20),
                         text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar uma seleção, Ctrl + Shift + S para criar uma referência, Ctrl + Shift + F para perguntar à biblioteca e Ctrl + Shift + V para abrir o Quick Paste.").size(13).width(Length::Fill),
                         text("A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações.").size(12).width(Length::Fill),
-                        button("Continuar para a biblioteca").on_press(Message::CompleteOnboarding),
+                        button(text("Continuar para a biblioteca")).on_press(Message::CompleteOnboarding),
                     ]
                     .spacing(10)
                     .width(Length::Fill),
@@ -3400,7 +3697,7 @@ impl App {
                 row![
                     button(library_kind_filter_label(&self.library_kind_filter))
                         .on_press(Message::CycleLibraryKindFilter),
-                    button("Limpar filtros").on_press(Message::ClearLibraryFilters),
+                    button(text("Limpar filtros")).on_press(Message::ClearLibraryFilters),
                 ]
                 .spacing(8)
                 .width(Length::Fill),
@@ -3413,11 +3710,11 @@ impl App {
                         .id(self.assistant_query_id.clone())
                         .padding(10)
                         .width(Length::Fixed(460.0)),
-                    button(if self.assistant_busy {
+                    button(text(if self.assistant_busy {
                         "Buscando…"
                     } else {
                         "Perguntar"
-                    })
+                    }))
                     .on_press_maybe(
                         (!self.assistant_busy && !self.action_busy)
                             .then_some(Message::AskAssistant),
@@ -3473,10 +3770,10 @@ impl App {
                 .spacing(8);
                 answer_content = answer_content.push(
                     row![
-                        button("Salvar resposta como documento").on_press_maybe(
+                        button(text("Salvar resposta como documento")).on_press_maybe(
                             (!self.action_busy).then_some(Message::SaveAnswerAsDocument),
                         ),
-                        button("Gerar documento com IA").on_press_maybe(
+                        button(text("Gerar documento com IA")).on_press_maybe(
                             (!self.action_busy).then_some(Message::GenerateAiDocument),
                         ),
                     ]
@@ -3533,19 +3830,19 @@ impl App {
                     text_editor(&self.document_editor)
                         .on_action(Message::EditDocument)
                         .height(Length::Fixed(220.0)),
-                    button("Salvar resposta atual como nova versão").on_press_maybe(
+                    button(text("Salvar resposta atual como nova versão")).on_press_maybe(
                         (self.assistant_answer.is_some() && !self.action_busy)
                             .then_some(Message::SaveAnswerAsNewVersion),
                     ),
-                    button(if self.action_busy {
+                    button(text(if self.action_busy {
                         "Salvando documento…"
                     } else {
                         "Salvar edição"
-                    })
+                    }))
                     .on_press_maybe((!self.action_busy).then_some(Message::SaveEditedDocument),),
-                    button("Exportar Markdown")
+                    button(text("Exportar Markdown"))
                         .on_press_maybe((!self.action_busy).then_some(Message::ExportDocument)),
-                    button("Excluir documento e versões").on_press_maybe(
+                    button(text("Excluir documento e versões")).on_press_maybe(
                         (!self.action_busy).then_some(Message::RequestDeleteDocument)
                     ),
                     text(format!("{} fonte(s) vinculada(s)", document.evidence.len())).size(11),
@@ -3561,11 +3858,11 @@ impl App {
                     );
                     document_content = document_content.push(
                         row![
-                            button("Confirmar exclusão das versões").on_press_maybe(
+                            button(text("Confirmar exclusão das versões")).on_press_maybe(
                                 (!self.action_busy)
                                     .then_some(Message::DeleteDocument(document.root_id.clone()))
                             ),
-                            button("Cancelar").on_press(Message::CancelDeleteDocument),
+                            button(text("Cancelar")).on_press(Message::CancelDeleteDocument),
                         ]
                         .spacing(8),
                     );
@@ -3634,56 +3931,56 @@ impl App {
                 })
                 .unwrap_or_else(|| self.ai_model.clone());
             content = content
-                .push(button("Reabrir tutorial de introdução").on_press(Message::ReopenOnboarding))
+                .push(button(text("Reabrir tutorial de introdução")).on_press(Message::ReopenOnboarding))
                 .push(text("Captura e privacidade").size(20))
                 .push(
-                    button(if self.capture_screenshots {
+                    button(text(if self.capture_screenshots {
                         "Capturas manuais: salvar imagens"
                     } else {
                         "Capturas manuais: ignorar imagens"
-                    })
+                    }))
                     .on_press(Message::ToggleCaptureScreenshots),
                 )
                 .push(text("Controla se imagens copiadas são mantidas como capturas locais.").size(12))
                 .push(
-                    button(if self.clipboard_monitor_capture_screenshots {
+                    button(text(if self.clipboard_monitor_capture_screenshots {
                         "Captura automática: salvar imagens"
                     } else {
                         "Captura automática: ignorar imagens"
-                    })
+                    }))
                     .on_press(Message::ToggleMonitorScreenshots),
                 )
                 .push(text("A captura automática continua desativada até ser ligada na barra da biblioteca.").size(12))
                 .push(
-                    button(if self.quick_context_enabled {
+                    button(text(if self.quick_context_enabled {
                         "Quick Context após captura manual: ligado"
                     } else {
                         "Quick Context após captura manual: desligado"
-                    })
+                    }))
                     .on_press(Message::ToggleQuickContext),
                 )
                 .push(
-                    button(if self.quick_context_after_reference {
+                    button(text(if self.quick_context_after_reference {
                         "Quick Context após referência: ligado"
                     } else {
                         "Quick Context após referência: desligado"
-                    })
+                    }))
                     .on_press(Message::ToggleQuickContextAfterReference),
                 )
                 .push(
-                    button(if self.clipboard_monitor_quick_context_enabled {
+                    button(text(if self.clipboard_monitor_quick_context_enabled {
                         "Quick Context após captura automática: ligado"
                     } else {
                         "Quick Context após captura automática: desligado"
-                    })
+                    }))
                     .on_press(Message::ToggleMonitorQuickContext),
                 )
                 .push(
-                    button(if self.link_preview_fetch_enabled {
+                    button(text(if self.link_preview_fetch_enabled {
                         "Prévia web: ligada"
                     } else {
                         "Prévia web: desligada"
-                    })
+                    }))
                     .on_press(Message::ToggleLinkPreviewFetch),
                 )
                 .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12))
@@ -3692,31 +3989,31 @@ impl App {
                 .push(text("O modelo multilíngue é baixado sob demanda. As capturas e seus vetores permanecem na biblioteca local criptografada; a indexação não envia capturas a serviços externos.").size(12));
             if self.local_search_status.can_download || self.local_search_status.can_retry {
                 content = content.push(
-                    button(if self.local_search_status.can_retry {
+                    button(text(if self.local_search_status.can_retry {
                         "Tentar novamente / reindexar"
                     } else {
                         "Baixar modelo e preparar busca local"
-                    })
+                    }))
                     .on_press_maybe((!local_search_busy).then_some(Message::PrepareLocalSearch)),
                 );
             }
             if self.local_search_status.can_remove {
-                content = content
-                    .push(button("Remover modelo de busca baixado").on_press_maybe(
-                        (!local_search_busy).then_some(Message::RemoveLocalSearch),
-                    ));
+                content = content.push(
+                    button(text("Remover modelo de busca baixado"))
+                        .on_press_maybe((!local_search_busy).then_some(Message::RemoveLocalSearch)),
+                );
             }
             content = content
                 .push(text("Inteligência artificial").size(20))
                 .push(
-                    button(if self.assistant_language == "pt-BR" {
+                    button(text(if self.assistant_language == "pt-BR" {
                         "Idioma das respostas: Português"
                     } else {
                         "Idioma das respostas: English"
-                    })
+                    }))
                     .on_press(Message::CycleAssistantLanguage),
                 )
-                .push(text("Controla o idioma das respostas e dos documentos gerados. A interface deste shell ainda está em português.").size(12))
+                .push(text("Controla o idioma da interface, das respostas e dos documentos gerados.").size(12))
                 .push(
                     button(text(format!("Provedor: {ai_provider_label}")))
                         .on_press(Message::CycleAiProvider),
@@ -3732,10 +4029,10 @@ impl App {
                         .padding(8),
                 )
                 .push(row![
-                    button("Salvar chave")
+                    button(text("Salvar chave"))
                         .on_press_maybe((!self.action_busy).then_some(Message::SaveAiApiKey))
                         .width(Length::Fill),
-                    button("Remover chave")
+                    button(text("Remover chave"))
                         .on_press_maybe((self.ai_api_key_configured && !self.action_busy).then_some(Message::ClearAiApiKey))
                         .width(Length::Fill),
                 ].spacing(6))
@@ -3745,7 +4042,7 @@ impl App {
                     "Nenhuma chave de API está configurada."
                 }).size(12))
                 .push(text("A chave fica fora do banco local. Perguntas e fontes podem ser salvas como documentos Markdown na biblioteca criptografada.").size(12))
-                .push(button(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" })
+                .push(button(text(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" }))
                     .on_press(Message::ToggleAutostart))
                 .push(text("Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows.").size(12));
             let retention_label = match self.retention_policy.as_str() {
@@ -3774,7 +4071,7 @@ impl App {
                         .size(12),
                     )
                     .push(
-                        button("Salvar e manter as capturas existentes").on_press_maybe(
+                        button(text("Salvar e manter as capturas existentes")).on_press_maybe(
                             (!self.action_busy).then_some(Message::ApplyRetention(false)),
                         ),
                     );
@@ -3796,14 +4093,14 @@ impl App {
                 content = content
                     .push(text("Apagar capturas, anexos, documentos e credencial de IA? Esta ação não pode ser desfeita. A chave criptográfica da biblioteca será mantida.").size(12))
                     .push(row![
-                        button("Apagar todos os dados")
+                        button(text("Apagar todos os dados"))
                             .on_press_maybe((!self.action_busy).then_some(Message::ConfirmClearAllData)),
-                        button("Cancelar")
+                        button(text("Cancelar"))
                             .on_press_maybe((!self.action_busy).then_some(Message::CancelClearAllData)),
                     ].spacing(8));
             } else {
                 content =
-                    content.push(button("Limpar todos os dados").on_press_maybe(
+                    content.push(button(text("Limpar todos os dados")).on_press_maybe(
                         (!self.action_busy).then_some(Message::RequestClearAllData),
                     ));
             }
@@ -3935,7 +4232,7 @@ impl App {
             if snapshot.total > PAGE_SIZE {
                 content = content.push(
                     row![
-                        button("Anterior")
+                        button(text("Anterior"))
                             .on_press_maybe((self.offset > 0).then_some(Message::PreviousPage)),
                         text(format!(
                             "Página {} de {}",
@@ -3943,7 +4240,7 @@ impl App {
                             snapshot.total.div_ceil(PAGE_SIZE)
                         ))
                         .size(12),
-                        button("Próxima").on_press_maybe(
+                        button(text("Próxima")).on_press_maybe(
                             (self.offset + PAGE_SIZE < snapshot.total).then_some(Message::NextPage)
                         ),
                     ]
@@ -3993,7 +4290,7 @@ impl App {
                             .on_input(Message::NewTagChanged)
                             .on_submit(Message::AddTag(capture.id.clone()))
                             .padding(7),
-                        button("Adicionar").on_press_maybe(
+                        button(text("Adicionar")).on_press_maybe(
                             (!self.action_busy).then_some(Message::AddTag(capture.id.clone()))
                         ),
                     ]
@@ -4046,7 +4343,7 @@ impl App {
                         if let Some(path) = file.local_path.as_ref().or(file.original_path.as_ref())
                         {
                             file_details = file_details.push(
-                                button("Abrir arquivo")
+                                button(text("Abrir arquivo"))
                                     .on_press(Message::OpenCaptureFile(PathBuf::from(path))),
                             );
                         }
@@ -4092,15 +4389,15 @@ impl App {
                     );
                     details = details.push(
                         row![
-                            button("Confirmar exclusão")
+                            button(text("Confirmar exclusão"))
                                 .on_press(Message::DeleteCapture(capture.id.clone())),
-                            button("Cancelar").on_press(Message::CancelDeleteCapture),
+                            button(text("Cancelar")).on_press(Message::CancelDeleteCapture),
                         ]
                         .spacing(8),
                     );
                 } else {
                     details = details.push(
-                        button("Excluir captura")
+                        button(text("Excluir captura"))
                             .on_press(Message::RequestDeleteCapture(capture.id.clone())),
                     );
                 }
@@ -4142,8 +4439,8 @@ impl App {
                 row![
                     text("Quick Paste").size(20),
                     Space::new().width(Length::Fill),
-                    button("Minimalista").on_press(Message::ToggleQuickPasteStyle),
-                    button("Fechar").on_press(Message::FinishQuickPaste)
+                    button(text("Minimalista")).on_press(Message::ToggleQuickPasteStyle),
+                    button(text("Fechar")).on_press(Message::FinishQuickPaste)
                 ]
                 .align_y(Alignment::Center),
                 text("Ctrl + Shift + V para abrir · escolha uma captura para colar").size(11),
@@ -4263,7 +4560,7 @@ impl App {
             if !minimal && snapshot.total > PAGE_SIZE {
                 items = items.push(
                     row![
-                        button("‹")
+                        button(text("‹"))
                             .on_press_maybe((self.offset > 0).then_some(Message::PreviousPage)),
                         text(format!(
                             "{} / {}",
@@ -4271,7 +4568,7 @@ impl App {
                             snapshot.total.div_ceil(PAGE_SIZE)
                         ))
                         .size(11),
-                        button("›").on_press_maybe(
+                        button(text("›")).on_press_maybe(
                             (self.offset + PAGE_SIZE < snapshot.total).then_some(Message::NextPage)
                         ),
                     ]
@@ -4311,9 +4608,9 @@ impl App {
             row![
                 text("Organizar capturas").size(20),
                 Space::new().width(Length::Fill),
-                button(if minimal { "Minimalista" } else { "Normal" })
+                button(text(if minimal { "Minimalista" } else { "Normal" }))
                     .on_press(Message::ToggleQuickContextStyle),
-                button("Fechar").on_press(Message::FinishQuickContext),
+                button(text("Fechar")).on_press(Message::FinishQuickContext),
             ]
             .align_y(Alignment::Center),
             text(format!(
@@ -4487,7 +4784,8 @@ impl App {
         if let Some(notice) = &self.notice {
             content = content.push(text(notice.as_str()).size(11));
         }
-        content = content.push(button("Concluir depois").on_press(Message::FinishQuickContext));
+        content =
+            content.push(button(text("Concluir depois")).on_press(Message::FinishQuickContext));
         container(scrollable(content).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -7726,6 +8024,31 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
 mod tests {
     use super::*;
     use scrypuppy_core::storage::open_or_create;
+
+    #[test]
+    fn ui_localization_translates_labels_and_dynamic_statuses_without_translating_user_text() {
+        assert_eq!(localized_ui_text("Configurações", true), "Settings");
+        assert_eq!(
+            localized_ui_text(
+                "Controla o idioma da interface, das respostas e dos documentos gerados.",
+                true
+            ),
+            "Sets the language used by the interface, answers, and generated documents."
+        );
+        assert_eq!(
+            localized_ui_text("3 fonte(s) vinculada(s)", true),
+            "3 linked sources"
+        );
+        assert_eq!(
+            localized_ui_text("Busca local pronta · 12 capturas indexadas", true),
+            "Local search ready · 12 captures indexed"
+        );
+        assert_eq!(
+            localized_ui_text("Notas pessoais do usuário", true),
+            "Notas pessoais do usuário"
+        );
+        assert_eq!(localized_ui_text("Configurações", false), "Configurações");
+    }
 
     fn load_library_for_test(
         path: &Path,
