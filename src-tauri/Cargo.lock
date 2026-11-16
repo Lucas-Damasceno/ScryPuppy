@@ -5191,6 +5191,7 @@ dependencies = [
  "html5ever",
  "image",
  "quick-xml 0.41.0",
+ "regex",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",

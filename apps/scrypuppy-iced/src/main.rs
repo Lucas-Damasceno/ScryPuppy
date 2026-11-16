@@ -187,6 +187,11 @@ struct Snapshot {
     quick_context_minimal: bool,
     clipboard_monitor_enabled: bool,
     link_preview_fetch_enabled: bool,
+    capture_screenshots: bool,
+    clipboard_monitor_capture_screenshots: bool,
+    clipboard_monitor_quick_context_enabled: bool,
+    quick_context_enabled: bool,
+    onboarding_completed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -230,6 +235,17 @@ struct App {
     link_preview_fetch_enabled: bool,
     link_preview_fetch_changed: bool,
     link_previews_loading: bool,
+    capture_screenshots: bool,
+    capture_screenshots_changed: bool,
+    clipboard_monitor_capture_screenshots: bool,
+    clipboard_monitor_capture_screenshots_changed: bool,
+    clipboard_monitor_quick_context_enabled: bool,
+    clipboard_monitor_quick_context_changed: bool,
+    quick_context_enabled: bool,
+    quick_context_enabled_changed: bool,
+    settings_open: bool,
+    onboarding_completed: bool,
+    onboarding_changed: bool,
     quick_paste_minimal: bool,
     quick_context_minimal: bool,
     quick_paste_style_changed: bool,
@@ -291,6 +307,12 @@ enum Message {
     ToggleTheme,
     ToggleClipboardMonitor,
     ToggleLinkPreviewFetch,
+    ToggleSettings,
+    ToggleCaptureScreenshots,
+    ToggleMonitorScreenshots,
+    ToggleMonitorQuickContext,
+    ToggleQuickContext,
+    CompleteOnboarding,
     ClipboardChanged(u32),
     ClipboardCaptured(Result<Option<(String, bool)>, String>),
     ClipboardMonitorSaved(Result<(), String>),
@@ -306,9 +328,21 @@ enum Message {
     ThemeSaved(Result<(), String>),
     QuickStyleSaved(Result<(), String>),
     LinkPreviewsSaved(Result<(), String>),
+    SettingSaved(&'static str, Result<(), String>),
 }
 
 impl App {
+    fn is_demo_mode(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.demo
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
     fn new() -> (Self, Task<Message>) {
         let (main, open) = window::open(window::Settings {
             size: Size::new(1100.0, 720.0),
@@ -338,6 +372,17 @@ impl App {
             link_preview_fetch_enabled: true,
             link_preview_fetch_changed: false,
             link_previews_loading: false,
+            capture_screenshots: true,
+            capture_screenshots_changed: false,
+            clipboard_monitor_capture_screenshots: false,
+            clipboard_monitor_capture_screenshots_changed: false,
+            clipboard_monitor_quick_context_enabled: false,
+            clipboard_monitor_quick_context_changed: false,
+            quick_context_enabled: true,
+            quick_context_enabled_changed: false,
+            settings_open: false,
+            onboarding_completed: false,
+            onboarding_changed: false,
             quick_paste_minimal: true,
             quick_context_minimal: true,
             quick_paste_style_changed: false,
@@ -839,6 +884,53 @@ impl App {
                 );
                 Task::batch([reload, save])
             }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                Task::none()
+            }
+            Message::CompleteOnboarding => {
+                self.onboarding_completed = true;
+                self.onboarding_changed = true;
+                persist_boolean_setting("onboarding_completed", true, self.is_demo_mode())
+            }
+            Message::ToggleCaptureScreenshots => {
+                self.capture_screenshots = !self.capture_screenshots;
+                self.capture_screenshots_changed = true;
+                persist_boolean_setting(
+                    "capture_screenshots",
+                    self.capture_screenshots,
+                    self.is_demo_mode(),
+                )
+            }
+            Message::ToggleMonitorScreenshots => {
+                self.clipboard_monitor_capture_screenshots =
+                    !self.clipboard_monitor_capture_screenshots;
+                self.clipboard_monitor_capture_screenshots_changed = true;
+                persist_boolean_setting(
+                    "clipboard_monitor_capture_screenshots",
+                    self.clipboard_monitor_capture_screenshots,
+                    self.is_demo_mode(),
+                )
+            }
+            Message::ToggleMonitorQuickContext => {
+                self.clipboard_monitor_quick_context_enabled =
+                    !self.clipboard_monitor_quick_context_enabled;
+                self.clipboard_monitor_quick_context_changed = true;
+                persist_boolean_setting(
+                    "clipboard_monitor_quick_context_enabled",
+                    self.clipboard_monitor_quick_context_enabled,
+                    self.is_demo_mode(),
+                )
+            }
+            Message::ToggleQuickContext => {
+                self.quick_context_enabled = !self.quick_context_enabled;
+                self.quick_context_enabled_changed = true;
+                persist_boolean_setting(
+                    "quick_context_enabled",
+                    self.quick_context_enabled,
+                    self.is_demo_mode(),
+                )
+            }
             Message::ClipboardChanged(sequence) => {
                 let coordinator = CAPTURE_COORDINATOR
                     .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
@@ -947,6 +1039,14 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SettingSaved(key, result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!(
+                        "A configuração '{key}' mudou nesta sessão, mas não foi salva: {error}"
+                    ));
+                }
+                Task::none()
+            }
             Message::Loaded(revision, result) if revision == self.revision => {
                 self.loading = false;
                 match result {
@@ -969,6 +1069,23 @@ impl App {
                         }
                         if !self.link_preview_fetch_changed {
                             self.link_preview_fetch_enabled = snapshot.link_preview_fetch_enabled;
+                        }
+                        if !self.capture_screenshots_changed {
+                            self.capture_screenshots = snapshot.capture_screenshots;
+                        }
+                        if !self.clipboard_monitor_capture_screenshots_changed {
+                            self.clipboard_monitor_capture_screenshots =
+                                snapshot.clipboard_monitor_capture_screenshots;
+                        }
+                        if !self.clipboard_monitor_quick_context_changed {
+                            self.clipboard_monitor_quick_context_enabled =
+                                snapshot.clipboard_monitor_quick_context_enabled;
+                        }
+                        if !self.quick_context_enabled_changed {
+                            self.quick_context_enabled = snapshot.quick_context_enabled;
+                        }
+                        if !self.onboarding_changed {
+                            self.onboarding_completed = snapshot.onboarding_completed;
                         }
                         let fetch_links = self.link_preview_fetch_enabled;
                         self.link_previews_loading = fetch_links
@@ -1074,7 +1191,10 @@ impl App {
                         self.context = None;
                         self.offset = 0;
                         self.selected_capture = Some(id.clone());
-                        return Task::done(Message::OpenQuickContext(id));
+                        if self.quick_context_enabled {
+                            return Task::done(Message::OpenQuickContext(id));
+                        }
+                        return self.reload();
                     }
                     Err(error) => self.notice = Some(error),
                 }
@@ -1100,6 +1220,13 @@ impl App {
                 .on_press(Message::SelectContext(None))
                 .style(move |_, status| navigation_style(dark, all_selected, status))
                 .width(Length::Fill),
+            button(if self.settings_open {
+                "Voltar à biblioteca"
+            } else {
+                "Configurações"
+            })
+            .on_press(Message::ToggleSettings)
+            .width(Length::Fill),
             Space::new().height(12),
             text("CONTEXTOS").size(11),
             text_input("Novo contexto", &self.new_context_name)
@@ -1218,12 +1345,6 @@ impl App {
                 "Auto: desligada"
             })
             .on_press(Message::ToggleClipboardMonitor),
-            button(if self.link_preview_fetch_enabled {
-                "Prévia web: ligada"
-            } else {
-                "Prévia web: desligada"
-            })
-            .on_press(Message::ToggleLinkPreviewFetch),
             button(if self.dark {
                 "Tema claro"
             } else {
@@ -1235,20 +1356,91 @@ impl App {
         .spacing(10)
         .align_y(Alignment::Center);
         let mut content = column![
-            text("Biblioteca").size(28),
-            text("Biblioteca local · selecione uma captura para ver os detalhes").size(12),
-            search
+            text(if self.settings_open {
+                "Configurações"
+            } else {
+                "Biblioteca"
+            })
+            .size(28),
+            text(if self.settings_open {
+                "Preferências da biblioteca e das capturas"
+            } else {
+                "Biblioteca local · selecione uma captura para ver os detalhes"
+            })
+            .size(12),
         ]
         .spacing(18);
-        if self.clipboard_monitor_enabled {
+        if !self.onboarding_completed && !self.settings_open {
+            content = content.push(
+                container(
+                    column![
+                        text("Bem-vindo ao ScryPuppy").size(20),
+                        text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar o clipboard e Ctrl + Shift + V para abrir o Quick Paste.").size(13),
+                        text("A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações.").size(12),
+                        button("Continuar para a biblioteca").on_press(Message::CompleteOnboarding),
+                    ]
+                    .spacing(10),
+                )
+                .width(Length::Fill)
+                .padding(18)
+                .style(move |_| panel_style(dark, false)),
+            );
+        }
+        if !self.settings_open {
+            content = content.push(search);
+        }
+        if self.clipboard_monitor_enabled && !self.settings_open {
             content = content.push(
                 text("Capturas novas são salvas localmente; imagens seguem a preferência de captura de telas.").size(11),
             );
         }
-        content = content.push(
-            text("Prévia web acessa sites públicos para buscar título, favicon e imagem do link; a busca pode ser desativada aqui.").size(11),
-        );
-        if self.loading {
+        if self.settings_open {
+            content = content
+                .push(text("Captura e privacidade").size(20))
+                .push(
+                    button(if self.capture_screenshots {
+                        "Capturas manuais: salvar imagens"
+                    } else {
+                        "Capturas manuais: ignorar imagens"
+                    })
+                    .on_press(Message::ToggleCaptureScreenshots),
+                )
+                .push(text("Controla se imagens copiadas são mantidas como capturas locais.").size(12))
+                .push(
+                    button(if self.clipboard_monitor_capture_screenshots {
+                        "Captura automática: salvar imagens"
+                    } else {
+                        "Captura automática: ignorar imagens"
+                    })
+                    .on_press(Message::ToggleMonitorScreenshots),
+                )
+                .push(text("A captura automática continua desativada até ser ligada na barra da biblioteca.").size(12))
+                .push(
+                    button(if self.quick_context_enabled {
+                        "Quick Context após captura manual: ligado"
+                    } else {
+                        "Quick Context após captura manual: desligado"
+                    })
+                    .on_press(Message::ToggleQuickContext),
+                )
+                .push(
+                    button(if self.clipboard_monitor_quick_context_enabled {
+                        "Quick Context após captura automática: ligado"
+                    } else {
+                        "Quick Context após captura automática: desligado"
+                    })
+                    .on_press(Message::ToggleMonitorQuickContext),
+                )
+                .push(
+                    button(if self.link_preview_fetch_enabled {
+                        "Prévia web: ligada"
+                    } else {
+                        "Prévia web: desligada"
+                    })
+                    .on_press(Message::ToggleLinkPreviewFetch),
+                )
+                .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12));
+        } else if self.loading {
             content = content.push(text("Carregando biblioteca…"));
         } else if let Some(error) = &self.error {
             content = content.push(text(error.as_str()).size(14));
@@ -2184,6 +2376,11 @@ fn demo_snapshot() -> Snapshot {
         quick_context_minimal: true,
         clipboard_monitor_enabled: false,
         link_preview_fetch_enabled: true,
+        capture_screenshots: true,
+        clipboard_monitor_capture_screenshots: false,
+        clipboard_monitor_quick_context_enabled: false,
+        quick_context_enabled: true,
+        onboarding_completed: true,
     }
 }
 
@@ -2286,6 +2483,17 @@ fn save_setting_value(key: &str, value: &str) -> Result<(), String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_write(&path, &database_key)?;
     save_setting_value_in(&conn, key, value)
+}
+
+fn persist_boolean_setting(key: &'static str, value: bool, demo: bool) -> Task<Message> {
+    if demo {
+        return Task::none();
+    }
+    let value = if value { "true" } else { "false" };
+    Task::perform(
+        async move { save_setting_value(key, value) },
+        move |result| Message::SettingSaved(key, result),
+    )
 }
 
 fn save_setting_value_in(
@@ -2589,6 +2797,38 @@ fn assign_capture_to_context(capture_id: String, context_id: String) -> Result<(
     assign_captures_to_context(vec![capture_id], context_id)
 }
 
+fn sync_context_exports_for_capture(
+    conn: &rusqlite::Connection,
+    app_dir: &Path,
+    context_ids: &[String],
+) -> Result<(), String> {
+    if context_ids.is_empty() {
+        return Ok(());
+    }
+    let context_key = CredentialEntry::new("Scryppy", "context-key-v1")
+        .map_err(|_| "Credencial local indisponível.")?
+        .get_password()
+        .map_err(|_| "Não foi possível acessar a chave dos Contextos.")?;
+    let contexts =
+        scrypuppy_core::context_exports::list_contexts(conn).map_err(|error| error.to_string())?;
+    let export_dir = app_dir.join("markdown").join("contexts");
+    std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+    for context_id in context_ids {
+        if let Some(context) = contexts.iter().find(|context| context.id == *context_id) {
+            scrypuppy_core::context_exports::write_context_export(
+                conn,
+                &export_dir,
+                context,
+                &context_key,
+            )
+            .map_err(|error| {
+                format!("Captura salva, mas o export criptografado do Contexto falhou: {error}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn assign_captures_to_context(capture_ids: Vec<String>, context_id: String) -> Result<(), String> {
     let appdata = dirs::data_dir().ok_or("Diretório de dados do Windows indisponível.")?;
     let app_dir = appdata.join("com.scryppy.desktop");
@@ -2822,7 +3062,7 @@ fn capture_current_clipboard() -> Result<String, String> {
         .map_err(|_| {
             "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
         })?;
-    scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
+    let id = scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
         &mut conn,
         app_dir,
         &snapshot,
@@ -2834,7 +3074,10 @@ fn capture_current_clipboard() -> Result<String, String> {
         active.process_path.as_deref(),
         active.window_title.as_deref(),
         active.window_id.as_deref(),
-    )
+    )?;
+    let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
+    sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+    Ok(id)
 }
 
 #[derive(Default)]
@@ -2924,7 +3167,11 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         active.window_title.as_deref(),
         active.window_id.as_deref(),
     ) {
-        Ok(id) => Ok(Some((id, prompt_quick_context))),
+        Ok(id) => {
+            let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
+            sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+            Ok(Some((id, prompt_quick_context)))
+        }
         Err(error)
             if error == "DUPLICATE_CAPTURE_IGNORED"
                 || error == "O clipboard nao retornou conteudo para salvar." =>
@@ -3077,6 +3324,13 @@ fn load_library(
     let clipboard_monitor_enabled = read_boolean_setting(&conn, "clipboard_monitor_enabled", false);
     let link_preview_fetch_enabled =
         read_boolean_setting(&conn, "link_preview_fetch_enabled", true);
+    let capture_screenshots = read_boolean_setting(&conn, "capture_screenshots", true);
+    let clipboard_monitor_capture_screenshots =
+        read_boolean_setting(&conn, "clipboard_monitor_capture_screenshots", false);
+    let clipboard_monitor_quick_context_enabled =
+        read_boolean_setting(&conn, "clipboard_monitor_quick_context_enabled", false);
+    let quick_context_enabled = read_boolean_setting(&conn, "quick_context_enabled", true);
+    let onboarding_completed = read_boolean_setting(&conn, "onboarding_completed", false);
     Ok(Snapshot {
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
@@ -3090,6 +3344,11 @@ fn load_library(
         quick_context_minimal,
         clipboard_monitor_enabled,
         link_preview_fetch_enabled,
+        capture_screenshots,
+        clipboard_monitor_capture_screenshots,
+        clipboard_monitor_quick_context_enabled,
+        quick_context_enabled,
+        onboarding_completed,
     })
 }
 

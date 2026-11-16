@@ -4,6 +4,7 @@ pub mod app_error;
 pub mod capture_store;
 pub mod clipboard;
 pub mod context_exports;
+pub mod context_rules;
 pub mod contexts;
 pub mod coordination;
 pub mod crypto;

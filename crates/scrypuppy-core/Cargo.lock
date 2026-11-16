@@ -2424,6 +2424,7 @@ dependencies = [
  "html5ever",
  "image",
  "quick-xml",
+ "regex",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",

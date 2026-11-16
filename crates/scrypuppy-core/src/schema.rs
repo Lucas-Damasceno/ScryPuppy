@@ -409,6 +409,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('onboarding_completed', 'false')",
+        [],
+    )?;
+    conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_provider', 'deepseek')",
         [],
     )?;
@@ -490,6 +494,15 @@ mod tests {
             )
             .unwrap(),
             "true"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'onboarding_completed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "false"
         );
     }
 }
