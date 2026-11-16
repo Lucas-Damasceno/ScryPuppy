@@ -8034,6 +8034,7 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrypuppy_core::library::CaptureFileDto;
     use scrypuppy_core::storage::open_or_create;
 
     #[test]
@@ -8059,6 +8060,63 @@ mod tests {
             "Notas pessoais do usuário"
         );
         assert_eq!(localized_ui_text("Configurações", false), "Configurações");
+    }
+
+    #[test]
+    fn legacy_doc_file_is_shown_as_a_cached_first_page_excerpt() {
+        let directory = tempfile::tempdir().unwrap();
+        let asset_root = directory.path().join("assets");
+        std::fs::create_dir_all(&asset_root).unwrap();
+        let source = asset_root.join("legacy-word-sample.doc");
+        std::fs::write(
+            &source,
+            include_bytes!("../../../crates/scrypuppy-core/tests/fixtures/legacy-word-sample.doc"),
+        )
+        .unwrap();
+        let capture = CaptureDto {
+            id: "legacy-doc-capture".into(),
+            content_text: "Documento Word".into(),
+            captured_at: "2026-11-16T12:00:00Z".into(),
+            source_app_name: None,
+            source_app_id: None,
+            source_process_id: None,
+            source_process_path: None,
+            window_title: None,
+            window_id: None,
+            platform: "windows".into(),
+            kind: "capture".into(),
+            content_kind: "file".into(),
+            metadata: serde_json::json!({}),
+            assets: Vec::new(),
+            representations: Vec::new(),
+            files: vec![CaptureFileDto {
+                id: "legacy-doc-file".into(),
+                representation_id: "legacy-doc-representation".into(),
+                ordinal: 0,
+                display_name: "legacy-word-sample.doc".into(),
+                original_path: None,
+                local_path: Some(source.to_string_lossy().into_owned()),
+                entry_kind: "file".into(),
+                extension: Some("doc".into()),
+                size_bytes: None,
+                sha256: None,
+                availability: "available".into(),
+                metadata: serde_json::json!({}),
+            }],
+            clipboard_formats: Vec::new(),
+            tags: Vec::new(),
+            entities: Vec::new(),
+            ocr: None,
+            contexts: Vec::new(),
+        };
+
+        let (images, text) = previews(&asset_root, &[capture]);
+
+        assert!(images.is_empty());
+        assert_eq!(text.len(), 1);
+        assert_eq!(text[0].0, "legacy-doc-capture");
+        assert!(text[0].1.contains("Concert du soir"));
+        assert!(directory.path().join("preview-cache").exists());
     }
 
     fn load_library_for_test(

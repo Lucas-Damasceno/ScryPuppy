@@ -5963,6 +5963,7 @@ dependencies = [
  "rfd",
  "rusqlite",
  "scrypuppy-core",
+ "serde_json",
  "tempfile",
  "tray-icon",
  "url",
