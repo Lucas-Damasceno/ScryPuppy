@@ -51,7 +51,10 @@ jobs:
       installer_name: ${{ steps.metadata.outputs.installer_name }}
       iced_installer_name: ${{ steps.metadata.outputs.iced_installer_name }}
       iced_installer_path: ${{ steps.metadata.outputs.iced_installer_path }}
+      iced_checksum_name: ${{ steps.metadata.outputs.iced_checksum_name }}
       iced_checksum_path: ${{ steps.metadata.outputs.iced_checksum_path }}
+      iced_update_manifest_path: ${{ steps.metadata.outputs.iced_update_manifest_path }}
+      iced_update_manifest_signature_path: ${{ steps.metadata.outputs.iced_update_manifest_signature_path }}
       checksum_name: ${{ steps.metadata.outputs.checksum_name }}
       signature_name: ${{ steps.metadata.outputs.signature_name }}
       public_version: ${{ steps.metadata.outputs.public_version }}
@@ -171,6 +174,15 @@ jobs:
           REQUIRE_UPDATER_SIGNATURE: ${{ startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true }}
         run: ./scripts/build-iced-windows.ps1
 
+      - name: Verify signed Iced update manifest and installer
+        if: startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true
+        shell: pwsh
+        env:
+          SCRYPUPPY_UPDATE_TEST_MANIFEST: ${{ steps.metadata.outputs.iced_update_manifest_path }}
+          SCRYPUPPY_UPDATE_TEST_MANIFEST_SIGNATURE: ${{ steps.metadata.outputs.iced_update_manifest_signature_path }}
+          SCRYPUPPY_UPDATE_TEST_BINARY: ${{ steps.metadata.outputs.iced_installer_path }}
+        run: cargo test --manifest-path apps/scrypuppy-iced/Cargo.toml --locked updater::tests::verifies_signed_update_manifest_and_installer_when_configured -- --exact
+
       - name: Smoke-test Iced NSIS install and uninstall
         run: ./scripts/test-iced-windows-installer.ps1
 
@@ -185,6 +197,7 @@ jobs:
             --repo Lucas-Damasceno/ScryPuppy `
             --pattern "ScryPuppy_beta_installer_v1.0.12.exe" `
             --pattern "ScryPuppy_beta_installer_v1.0.12.exe.sha256" `
+            --pattern "ScryPuppy_beta_installer_v1.0.12.exe.sig" `
             --dir $baselineRoot
           if ($LASTEXITCODE -ne 0) {
             throw "Could not download the released Tauri beta.12 migration baseline."
@@ -207,6 +220,7 @@ jobs:
           ICED_INSTALLER: ${{ steps.metadata.outputs.iced_installer_path }}
         run: ./scripts/test-tauri-to-iced-upgrade.ps1 `
           -TauriInstaller $env:TAURI_BASELINE_INSTALLER `
+          -TauriSignature "$env:TAURI_BASELINE_INSTALLER.sig" `
           -IcedInstaller $env:ICED_INSTALLER
 
       - name: Create SHA-256 checksum
@@ -257,6 +271,11 @@ jobs:
             ${{ steps.metadata.outputs.installer_path }}
             ${{ steps.metadata.outputs.checksum_path }}
             ${{ steps.metadata.outputs.signature_path }}
+            ${{ steps.metadata.outputs.iced_installer_path }}
+            ${{ steps.metadata.outputs.iced_checksum_path }}
+            ${{ steps.metadata.outputs.iced_installer_path }}.sig
+            ${{ steps.metadata.outputs.iced_update_manifest_path }}
+            ${{ steps.metadata.outputs.iced_update_manifest_signature_path }}
           if-no-files-found: error
           retention-days: 1
 
@@ -337,11 +356,20 @@ jobs:
         with:
           subject-path: release/${{ needs.build.outputs.installer_name }}
 
+      - name: Attest Iced installer provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release/${{ needs.build.outputs.iced_installer_name }}
+
       - name: Publish GitHub prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           INSTALLER_NAME: ${{ needs.build.outputs.installer_name }}
+          ICED_INSTALLER_NAME: ${{ needs.build.outputs.iced_installer_name }}
+          ICED_CHECKSUM_NAME: ${{ needs.build.outputs.iced_checksum_name }}
+          ICED_UPDATE_MANIFEST_NAME: latest.json
+          ICED_UPDATE_MANIFEST_SIGNATURE_NAME: latest.json.sig
           CHECKSUM_NAME: ${{ needs.build.outputs.checksum_name }}
           SIGNATURE_NAME: ${{ needs.build.outputs.signature_name }}
           PUBLIC_VERSION: ${{ needs.build.outputs.public_version }}
@@ -354,6 +382,9 @@ jobs:
               "release/$INSTALLER_NAME" \
               "release/$CHECKSUM_NAME" \
               "release/$SIGNATURE_NAME" \
+              "release/$ICED_INSTALLER_NAME" \
+              "release/$ICED_CHECKSUM_NAME" \
+              "release/$ICED_INSTALLER_NAME.sig" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
             gh release edit "$RELEASE_TAG" \
@@ -365,11 +396,35 @@ jobs:
               "release/$INSTALLER_NAME" \
               "release/$CHECKSUM_NAME" \
               "release/$SIGNATURE_NAME" \
+              "release/$ICED_INSTALLER_NAME" \
+              "release/$ICED_CHECKSUM_NAME" \
+              "release/$ICED_INSTALLER_NAME.sig" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --prerelease \
               --title "ScryPuppy Beta v$PUBLIC_VERSION" \
               --generate-notes
+          fi
+
+          if gh release view iced-updater-beta --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload iced-updater-beta \
+              "release/$ICED_UPDATE_MANIFEST_NAME" \
+              "release/$ICED_UPDATE_MANIFEST_SIGNATURE_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit iced-updater-beta \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "ScryPuppy Iced update channel" \
+              --notes "Signed update channel used by the Iced version of ScryPuppy."
+          else
+            gh release create iced-updater-beta \
+              "release/$ICED_UPDATE_MANIFEST_NAME" \
+              "release/$ICED_UPDATE_MANIFEST_SIGNATURE_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "ScryPuppy Iced update channel" \
+              --notes "Signed update channel used by the Iced version of ScryPuppy."
           fi
 
           release_notes="$(gh release view "$RELEASE_TAG" \

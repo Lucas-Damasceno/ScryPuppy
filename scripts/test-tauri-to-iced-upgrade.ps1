@@ -2,14 +2,17 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$TauriInstaller,
   [Parameter(Mandatory = $true)]
+  [string]$TauriSignature,
+  [Parameter(Mandatory = $true)]
   [string]$IcedInstaller
 )
 
 $ErrorActionPreference = "Stop"
 
 $TauriInstaller = [System.IO.Path]::GetFullPath($TauriInstaller)
+$TauriSignature = [System.IO.Path]::GetFullPath($TauriSignature)
 $IcedInstaller = [System.IO.Path]::GetFullPath($IcedInstaller)
-foreach ($installerPath in @($TauriInstaller, $IcedInstaller)) {
+foreach ($installerPath in @($TauriInstaller, $TauriSignature, $IcedInstaller)) {
   if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     throw "Required migration installer was not found: $installerPath"
   }
@@ -41,6 +44,27 @@ $expectedParent = $tempRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) +
   [System.IO.Path]::DirectorySeparatorChar
 if (-not $validationRoot.StartsWith($expectedParent, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw "Refusing to use a validation directory outside the temporary folder: $validationRoot"
+}
+
+$appManifest = Join-Path $PSScriptRoot "..\apps\scrypuppy-iced\Cargo.toml"
+$oldFixtureBinary = $env:SCRYPUPPY_UPDATE_TEST_BINARY
+$oldFixtureSignature = $env:SCRYPUPPY_UPDATE_TEST_SIGNATURE
+try {
+  $env:SCRYPUPPY_UPDATE_TEST_BINARY = $TauriInstaller
+  $env:SCRYPUPPY_UPDATE_TEST_SIGNATURE = $TauriSignature
+  Push-Location (Split-Path -Parent $PSScriptRoot)
+  try {
+    cargo test --manifest-path $appManifest --locked `
+      updater::tests::verifies_downloaded_installer_signature_fixture_when_configured -- --exact
+    if ($LASTEXITCODE -ne 0) {
+      throw "The released Tauri installer signature did not verify with the Iced update key."
+    }
+  } finally {
+    Pop-Location
+  }
+} finally {
+  $env:SCRYPUPPY_UPDATE_TEST_BINARY = $oldFixtureBinary
+  $env:SCRYPUPPY_UPDATE_TEST_SIGNATURE = $oldFixtureSignature
 }
 
 $installRoot = Join-Path $validationRoot "installed-app"

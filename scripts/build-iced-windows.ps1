@@ -13,6 +13,8 @@ $installerName = "ScryPuppy_Iced_beta_installer_v$($metadata.public_version).exe
 $installerPath = Join-Path $bundleRoot $installerName
 $checksumPath = "$installerPath.sha256"
 $signaturePath = "$installerPath.sig"
+$updateManifestPath = $metadata.iced_update_manifest_path
+$updateManifestSignaturePath = $metadata.iced_update_manifest_signature_path
 $makensis = Join-Path $env:LOCALAPPDATA "tauri\NSIS\makensis.exe"
 
 if (-not (Test-Path -LiteralPath $makensis)) {
@@ -67,6 +69,34 @@ try {
     if (-not (Test-Path -LiteralPath $signaturePath)) {
       throw "Expected Iced updater signature was not created: $signaturePath"
     }
+
+    $updateManifest = [ordered]@{
+      version = $metadata.manifest_version
+      notes = "ScryPuppy Iced $($metadata.manifest_version)"
+      pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+      platforms = @{
+        "windows-x86_64" = @{
+          url = "https://github.com/Lucas-Damasceno/ScryPuppy/releases/download/$($metadata.release_tag)/$installerName"
+          signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+        }
+      }
+    }
+    $manifestJson = $updateManifest | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText(
+      $updateManifestPath,
+      $manifestJson,
+      [System.Text.UTF8Encoding]::new($false)
+    )
+    if (Test-Path -LiteralPath $updateManifestSignaturePath) {
+      Remove-Item -LiteralPath $updateManifestSignaturePath -Force
+    }
+    & npm run tauri -- signer sign $updateManifestPath
+    if ($LASTEXITCODE -ne 0) {
+      throw "Iced update manifest signing failed with exit code $LASTEXITCODE."
+    }
+    if (-not (Test-Path -LiteralPath $updateManifestSignaturePath)) {
+      throw "Expected signed Iced update manifest was not created: $updateManifestSignaturePath"
+    }
   }
 
   $hash = & (Join-Path $PSScriptRoot "file-sha256.ps1") -Path $installerPath
@@ -80,5 +110,7 @@ try {
   installer_path = $installerPath
   checksum_path = $checksumPath
   signature_path = $signaturePath
+  update_manifest_path = $updateManifestPath
+  update_manifest_signature_path = $updateManifestSignaturePath
   manifest_version = $metadata.manifest_version
 } | ConvertTo-Json -Compress

@@ -33,6 +33,13 @@ The workflow uses only official GitHub actions pinned to immutable commit SHAs. 
 temporary Actions artifact expires after one day; the installer attached to the
 GitHub Release remains the supported public download.
 
+The migration branch also builds a direct Iced NSIS candidate. On a signed release,
+the Windows job validates an upgrade from the released Tauri beta.12 installer,
+publishes the Iced installer beside the Tauri installer, and updates a separate
+`iced-updater-beta` channel. The Iced client verifies the signed channel manifest
+and downloaded installer before offering installation. The existing `updater-beta`
+channel remains Tauri-only until the migration is approved for distribution.
+
 ## Local build command
 
 From the repository root, run:

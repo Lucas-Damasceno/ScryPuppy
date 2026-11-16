@@ -1,4 +1,6 @@
 //! Native Iced UI for the ScryPuppy migration.
+mod updater;
+
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use iced::widget::{
     button, column, container, image as iced_image, row, scrollable, text as iced_text,
@@ -198,6 +200,17 @@ fn localized_ui_text(value: &str, english: bool) -> String {
         "Prévia web: ligada" => "Web previews: on".into(),
         "Prévia web: desligada" => "Web previews: off".into(),
         "Tentar novamente / reindexar" => "Retry / reindex".into(),
+        "Atualizações" => "Updates".into(),
+        "Verificar atualizações assinadas" => "Check for signed updates".into(),
+        "Baixar atualização" => "Download update".into(),
+        "Instalar atualização e reiniciar" => "Install update and restart".into(),
+        "O canal de atualização e o instalador são validados com assinatura antes de qualquer instalação." => {
+            "The update channel and installer are signature-checked before anything is installed.".into()
+        }
+        "Ainda não verificado" => "Not checked yet".into(),
+        "Atualizações desativadas no modo de demonstração." => {
+            "Updates are disabled in demo mode.".into()
+        }
         "Baixar modelo e preparar busca local" => "Download model and prepare local search".into(),
         "Iniciar com o Windows: ligado" => "Start with Windows: on".into(),
         "Iniciar com o Windows: desligado" => "Start with Windows: off".into(),
@@ -777,6 +790,10 @@ struct App {
     quick_context_minimal: bool,
     quick_paste_style_changed: bool,
     quick_context_style_changed: bool,
+    update_status: String,
+    update_busy: bool,
+    available_update: Option<updater::UpdateInfo>,
+    verified_update_installer: Option<PathBuf>,
     revision: u64,
     snapshot: Option<Snapshot>,
     loading: bool,
@@ -917,6 +934,11 @@ enum Message {
     RetentionApplied(Result<usize, String>),
     RetentionCleanupFinished(usize),
     ToggleSettings,
+    CheckForUpdates,
+    UpdateCheckFinished(Result<Option<updater::UpdateInfo>, String>),
+    DownloadUpdate,
+    UpdateDownloadFinished(Result<PathBuf, String>),
+    ApplyVerifiedUpdate,
     ToggleCaptureScreenshots,
     ToggleMonitorScreenshots,
     ToggleMonitorQuickContext,
@@ -1084,6 +1106,10 @@ impl App {
             quick_context_minimal: true,
             quick_paste_style_changed: false,
             quick_context_style_changed: false,
+            update_status: "Ainda não verificado".into(),
+            update_busy: false,
+            available_update: None,
+            verified_update_installer: None,
             revision: 0,
             snapshot: None,
             loading: true,
@@ -2792,6 +2818,112 @@ impl App {
                     move |result| Message::AutostartSaved(enabled, result),
                 )
             }
+            Message::CheckForUpdates => {
+                if self.update_busy {
+                    return Task::none();
+                }
+                if self.is_demo_mode() {
+                    self.update_status = "Atualizações desativadas no modo de demonstração.".into();
+                    return Task::none();
+                }
+                if let Some(installer) = self.verified_update_installer.take() {
+                    let _ = std::fs::remove_file(installer);
+                }
+                self.update_busy = true;
+                self.available_update = None;
+                self.verified_update_installer = None;
+                self.update_status = if self.assistant_language == "en" {
+                    "Checking the signed update channel…".into()
+                } else {
+                    "Verificando o canal de atualizações assinado…".into()
+                };
+                Task::perform(updater::check_for_update(), Message::UpdateCheckFinished)
+            }
+            Message::UpdateCheckFinished(result) => {
+                self.update_busy = false;
+                match result {
+                    Ok(Some(update)) => {
+                        let update_version = update.version.clone();
+                        self.available_update = Some(update);
+                        self.update_status = if self.assistant_language == "en" {
+                            format!("Version {update_version} is available.")
+                        } else {
+                            format!("A versão {update_version} está disponível.")
+                        };
+                    }
+                    Ok(None) => {
+                        self.update_status = if self.assistant_language == "en" {
+                            "ScryPuppy is up to date.".into()
+                        } else {
+                            "O ScryPuppy está atualizado.".into()
+                        };
+                    }
+                    Err(error) => self.update_status = error,
+                }
+                Task::none()
+            }
+            Message::DownloadUpdate => {
+                let Some(update) = self.available_update.clone() else {
+                    return Task::none();
+                };
+                if self.update_busy {
+                    return Task::none();
+                }
+                self.update_busy = true;
+                self.update_status = if self.assistant_language == "en" {
+                    "Downloading and verifying the signed installer…".into()
+                } else {
+                    "Baixando e verificando o instalador assinado…".into()
+                };
+                Task::perform(
+                    updater::download_verified_update(update),
+                    Message::UpdateDownloadFinished,
+                )
+            }
+            Message::UpdateDownloadFinished(result) => {
+                self.update_busy = false;
+                match result {
+                    Ok(installer) => {
+                        self.verified_update_installer = Some(installer);
+                        self.update_status = if self.assistant_language == "en" {
+                            "The installer signature is valid and ready to apply.".into()
+                        } else {
+                            "A assinatura do instalador é válida; a atualização está pronta.".into()
+                        };
+                    }
+                    Err(error) => self.update_status = error,
+                }
+                Task::none()
+            }
+            Message::ApplyVerifiedUpdate => {
+                if self.action_busy
+                    || self.loading
+                    || self.link_previews_loading
+                    || self.local_search.operation_running()
+                    || OCR_WORKER_RUNNING.load(Ordering::Relaxed)
+                    || RETENTION_WORKER_RUNNING.load(Ordering::Relaxed)
+                    || DATA_RESET_IN_PROGRESS.load(Ordering::Relaxed)
+                {
+                    self.notice = Some(if self.assistant_language == "en" {
+                        "Wait for the current library operation to finish before restarting to update.".into()
+                    } else {
+                        "Aguarde a operação atual da biblioteca terminar antes de reiniciar para atualizar.".into()
+                    });
+                    return Task::none();
+                }
+                let Some(installer) = self.verified_update_installer.take() else {
+                    return Task::none();
+                };
+                let installer_cleanup_path = installer.clone();
+                match updater::launch_verified_installer(installer) {
+                    Ok(()) => iced::exit(),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(installer_cleanup_path);
+                        self.update_status = error;
+                        Task::none()
+                    }
+                }
+            }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
@@ -3976,6 +4108,34 @@ impl App {
                     .on_press(Message::ToggleLinkPreviewFetch),
                 )
                 .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12))
+                .push(text("Atualizações").size(20))
+                .push(text("O canal de atualização e o instalador são validados com assinatura antes de qualquer instalação.").size(12))
+                .push(text(self.update_status.as_str()).size(12))
+                .push(
+                    button(text("Verificar atualizações assinadas"))
+                        .on_press_maybe((!self.update_busy).then_some(Message::CheckForUpdates)),
+                );
+            if self.available_update.is_some() {
+                if let Some(update) = &self.available_update {
+                    content = content
+                        .push(text(format!("Publicado em: {}", update.pub_date)).size(11))
+                        .push(text(update.notes.as_str()).size(12));
+                }
+                content = content.push(
+                    button(text("Baixar atualização")).on_press_maybe(
+                        (!self.update_busy && self.verified_update_installer.is_none())
+                            .then_some(Message::DownloadUpdate),
+                    ),
+                );
+            }
+            if self.verified_update_installer.is_some() {
+                content = content.push(
+                    button(text("Instalar atualização e reiniciar")).on_press_maybe(
+                        (!self.update_busy).then_some(Message::ApplyVerifiedUpdate),
+                    ),
+                );
+            }
+            content = content
                 .push(text("Busca inteligente local").size(20))
                 .push(text(local_search_label).size(12))
                 .push(text("O modelo multilíngue é baixado sob demanda. As capturas e seus vetores permanecem na biblioteca local criptografada; a indexação não envia capturas a serviços externos.").size(12));
@@ -4794,6 +4954,14 @@ impl App {
                 }
             })
             .into()
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(installer) = self.verified_update_installer.take() {
+            let _ = std::fs::remove_file(installer);
+        }
     }
 }
 
@@ -8208,6 +8376,11 @@ mod tests {
     #[test]
     fn ui_localization_translates_labels_and_dynamic_statuses_without_translating_user_text() {
         assert_eq!(localized_ui_text("Configurações", true), "Settings");
+        assert_eq!(localized_ui_text("Atualizações", true), "Updates");
+        assert_eq!(
+            localized_ui_text("Verificar atualizações assinadas", true),
+            "Check for signed updates"
+        );
         assert_eq!(
             localized_ui_text(
                 "Controla o idioma da interface, das respostas e dos documentos gerados.",
