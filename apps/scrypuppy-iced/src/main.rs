@@ -2529,32 +2529,45 @@ impl App {
                 }
             }
             if let Some(document) = &self.selected_document {
+                let mut document_content = column![
+                    text(document.title.as_str()).size(18),
+                    text_editor(&self.document_editor)
+                        .on_action(Message::EditDocument)
+                        .height(Length::Fixed(220.0)),
+                    button(if self.action_busy {
+                        "Salvando documento…"
+                    } else {
+                        "Salvar edição"
+                    })
+                    .on_press_maybe((!self.action_busy).then_some(Message::SaveEditedDocument),),
+                    button("Exportar Markdown")
+                        .on_press_maybe((!self.action_busy).then_some(Message::ExportDocument)),
+                    text(format!("{} fonte(s) vinculada(s)", document.evidence.len())).size(11),
+                ]
+                .spacing(8);
+                for evidence in &document.evidence {
+                    let source = format!(
+                        "{} · {} · {}",
+                        evidence
+                            .app_name
+                            .as_deref()
+                            .unwrap_or("Aplicativo desconhecido"),
+                        evidence.captured_at,
+                        evidence.excerpt
+                    );
+                    document_content = document_content.push(
+                        button(text(source).size(11))
+                            .on_press_maybe(evidence.available.then_some(
+                                Message::OpenAssistantEvidence(evidence.capture_id.clone()),
+                            ))
+                            .width(Length::Fill),
+                    );
+                }
                 content = content.push(
-                    container(
-                        column![
-                            text(document.title.as_str()).size(18),
-                            text_editor(&self.document_editor)
-                                .on_action(Message::EditDocument)
-                                .height(Length::Fixed(220.0)),
-                            button(if self.action_busy {
-                                "Salvando documento…"
-                            } else {
-                                "Salvar edição"
-                            })
-                            .on_press_maybe(
-                                (!self.action_busy).then_some(Message::SaveEditedDocument),
-                            ),
-                            button("Exportar Markdown").on_press_maybe(
-                                (!self.action_busy).then_some(Message::ExportDocument)
-                            ),
-                            text(format!("{} fonte(s) vinculada(s)", document.evidence.len()))
-                                .size(11),
-                        ]
-                        .spacing(8),
-                    )
-                    .width(Length::Fill)
-                    .padding(14)
-                    .style(move |_| panel_style(dark, false)),
+                    container(document_content)
+                        .width(Length::Fill)
+                        .padding(14)
+                        .style(move |_| panel_style(dark, false)),
                 );
             }
         }

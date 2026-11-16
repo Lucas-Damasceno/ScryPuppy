@@ -23,6 +23,7 @@ pub struct DocumentEvidence {
     pub captured_at: String,
     pub app_name: Option<String>,
     pub excerpt: String,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -193,8 +194,11 @@ pub fn get(conn: &Connection, id: &str) -> Result<Document, String> {
         .map_err(|error| error.to_string())?;
     let mut statement = conn
         .prepare(
-            "SELECT capture_id, COALESCE(captured_at, ''), app_name, COALESCE(excerpt, '')
-             FROM magic_search_evidence WHERE document_id = ?1 ORDER BY rank",
+            "SELECT evidence.capture_id, COALESCE(evidence.captured_at, ''), evidence.app_name,
+                    COALESCE(evidence.excerpt, ''), captures.id IS NOT NULL
+             FROM magic_search_evidence evidence
+             LEFT JOIN captures ON captures.id = evidence.capture_id
+             WHERE evidence.document_id = ?1 ORDER BY evidence.rank",
         )
         .map_err(|error| error.to_string())?;
     document.evidence = statement
@@ -204,6 +208,7 @@ pub fn get(conn: &Connection, id: &str) -> Result<Document, String> {
                 captured_at: row.get(1)?,
                 app_name: row.get(2)?,
                 excerpt: row.get(3)?,
+                available: row.get(4)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -246,6 +251,19 @@ mod tests {
     fn saved_answer_keeps_source_links_and_can_be_edited() {
         let conn = Connection::open_in_memory().unwrap();
         crate::schema::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO contexts (id, name, slug, created_at, updated_at)
+             VALUES ('work', 'Trabalho', 'trabalho', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO captures
+             (id, context_id, content_text, content_hash, captured_at, platform, metadata_json, capture_kind, created_at)
+             VALUES ('source-1', 'work', 'Prazo sexta-feira', 'hash', '2026-11-01', 'windows', '{}', 'capture', 'now')",
+            [],
+        )
+        .unwrap();
         let answer = ChatAnswer {
             answer: "O prazo é sexta-feira.".into(),
             confidence: "alta".into(),
@@ -273,10 +291,14 @@ mod tests {
         assert_eq!(stored_filters["response_mode"], "direct");
         assert_eq!(document.evidence.len(), 1);
         assert_eq!(document.evidence[0].capture_id, "source-1");
+        assert!(document.evidence[0].available);
         assert!(document.markdown.contains("## Fontes"));
         update_markdown(&conn, &document.id, "# Revisado").unwrap();
         assert_eq!(get(&conn, &document.id).unwrap().markdown, "# Revisado");
         assert_eq!(list(&conn).unwrap().len(), 1);
+        conn.execute("DELETE FROM captures WHERE id = 'source-1'", [])
+            .unwrap();
+        assert!(!get(&conn, &document.id).unwrap().evidence[0].available);
         delete_root(&conn, &document.root_id).unwrap();
         assert!(list(&conn).unwrap().is_empty());
     }
