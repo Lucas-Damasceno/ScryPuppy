@@ -328,6 +328,7 @@ struct Snapshot {
     onboarding_completed: bool,
     launch_at_startup: bool,
     retention_policy: String,
+    assistant_language: String,
     ai_provider: String,
     ai_model: String,
     ai_api_key_configured: bool,
@@ -408,6 +409,8 @@ struct App {
     new_tag: String,
     ai_provider: String,
     ai_model: String,
+    assistant_language: String,
+    assistant_language_changed: bool,
     ai_api_key_input: String,
     ai_provider_changed: bool,
     ai_model_changed: bool,
@@ -508,6 +511,7 @@ enum Message {
     NewContextNameChanged(String),
     CreateContext,
     NewTagChanged(String),
+    CycleAssistantLanguage,
     CycleAiProvider,
     CycleAiModel,
     AiApiKeyChanged(String),
@@ -666,6 +670,8 @@ impl App {
             new_tag: String::new(),
             ai_provider: "deepseek".into(),
             ai_model: "deepseek-v4-flash".into(),
+            assistant_language: "en".into(),
+            assistant_language_changed: false,
             ai_api_key_input: String::new(),
             ai_provider_changed: false,
             ai_model_changed: false,
@@ -1561,6 +1567,30 @@ impl App {
                 Task::perform(
                     async move { save_ai_provider_model(&provider, &model) },
                     |result| Message::SettingSaved("ai_provider / ai_model", result),
+                )
+            }
+            Message::CycleAssistantLanguage => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.assistant_language = if self.assistant_language == "pt-BR" {
+                        "en"
+                    } else {
+                        "pt-BR"
+                    }
+                    .into();
+                    return Task::none();
+                }
+                self.assistant_language = if self.assistant_language == "pt-BR" {
+                    "en"
+                } else {
+                    "pt-BR"
+                }
+                .into();
+                self.assistant_language_changed = true;
+                let value = self.assistant_language.clone();
+                Task::perform(
+                    async move { save_setting_value("language", &value) },
+                    |result| Message::SettingSaved("language", result),
                 )
             }
             Message::CycleAiModel => {
@@ -2532,6 +2562,9 @@ impl App {
                         if !self.ai_model_changed {
                             self.ai_model = snapshot.ai_model.clone();
                         }
+                        if !self.assistant_language_changed {
+                            self.assistant_language = snapshot.assistant_language.clone();
+                        }
                         self.ai_api_key_configured = snapshot.ai_api_key_configured;
                         let fetch_links = self.link_preview_fetch_enabled;
                         self.link_previews_loading = fetch_links
@@ -3259,6 +3292,15 @@ impl App {
             }
             content = content
                 .push(text("Inteligência artificial").size(20))
+                .push(
+                    button(if self.assistant_language == "pt-BR" {
+                        "Idioma das respostas: Português"
+                    } else {
+                        "Idioma das respostas: English"
+                    })
+                    .on_press(Message::CycleAssistantLanguage),
+                )
+                .push(text("Controla o idioma das respostas e dos documentos gerados. A interface deste shell ainda está em português.").size(12))
                 .push(
                     button(text(format!("Provedor: {ai_provider_label}")))
                         .on_press(Message::CycleAiProvider),
@@ -4427,6 +4469,7 @@ fn demo_snapshot() -> Snapshot {
         onboarding_completed: true,
         launch_at_startup: false,
         retention_policy: "3_months".into(),
+        assistant_language: "pt-BR".into(),
         ai_provider: "deepseek".into(),
         ai_model: "deepseek-v4-flash".into(),
         ai_api_key_configured: false,
@@ -6349,6 +6392,13 @@ fn load_library(path: &Path, key: &str, filter: CaptureFilter) -> Result<Snapsho
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_else(|_| "deepseek".into());
+    let assistant_language = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'language'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "en".into());
     let ai_model = conn
         .query_row(
             "SELECT value FROM settings WHERE key = 'ai_model'",
@@ -6402,6 +6452,7 @@ fn load_library(path: &Path, key: &str, filter: CaptureFilter) -> Result<Snapsho
         onboarding_completed,
         launch_at_startup,
         retention_policy,
+        assistant_language,
         ai_provider,
         ai_model,
         ai_api_key_configured,
@@ -6847,6 +6898,7 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         scrypuppy_core::schema::migrate(&conn).unwrap();
         save_ai_provider_model_in(&mut conn, "openai", "gpt-5-mini").unwrap();
+        save_setting_value_in(&conn, "language", "pt-BR").unwrap();
 
         let provider: String = conn
             .query_row(
@@ -6864,6 +6916,15 @@ mod tests {
             .unwrap();
         assert_eq!(provider, "openai");
         assert_eq!(model, "gpt-5-mini");
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'language'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "pt-BR"
+        );
         assert!(save_ai_provider_model_in(&mut conn, "unknown", "model").is_err());
         assert_eq!(
             conn.query_row(
