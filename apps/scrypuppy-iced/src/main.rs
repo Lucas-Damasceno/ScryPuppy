@@ -213,6 +213,7 @@ struct App {
     dark: bool,
     query: String,
     context: Option<String>,
+    new_context_name: String,
     offset: usize,
     selected_capture: Option<String>,
     pending_delete_capture: Option<String>,
@@ -251,6 +252,9 @@ enum Message {
     PreviousPage,
     NextPage,
     SelectContext(Option<String>),
+    NewContextNameChanged(String),
+    CreateContext,
+    ContextCreated(Result<String, String>),
     SelectCapture(String),
     RequestDeleteCapture(String),
     CancelDeleteCapture,
@@ -306,6 +310,7 @@ impl App {
             dark: true,
             query: String::new(),
             context: None,
+            new_context_name: String::new(),
             offset: 0,
             selected_capture: None,
             pending_delete_capture: None,
@@ -555,6 +560,40 @@ impl App {
                 self.context = id;
                 self.offset = 0;
                 self.selected_capture = None;
+                self.reload()
+            }
+            Message::NewContextNameChanged(name) => {
+                self.new_context_name = name;
+                Task::none()
+            }
+            Message::CreateContext => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice =
+                        Some("Criação de Contextos desativada no modo de demonstração.".into());
+                    return Task::none();
+                }
+                let name = self.new_context_name.trim().to_string();
+                if name.is_empty() || self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { create_context_in_library(name) },
+                    Message::ContextCreated,
+                )
+            }
+            Message::ContextCreated(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(id) => {
+                        self.context = Some(id);
+                        self.new_context_name.clear();
+                        self.offset = 0;
+                        self.notice = Some("Contexto criado.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
                 self.reload()
             }
             Message::SelectCapture(id) => {
@@ -960,6 +999,13 @@ impl App {
                 .width(Length::Fill),
             Space::new().height(12),
             text("CONTEXTOS").size(11),
+            text_input("Novo contexto", &self.new_context_name)
+                .on_input(Message::NewContextNameChanged)
+                .on_submit(Message::CreateContext)
+                .padding(8),
+            button("Criar Contexto")
+                .on_press_maybe((!self.action_busy).then_some(Message::CreateContext))
+                .width(Length::Fill),
         ]
         .spacing(8);
         if let Some(snapshot) = &self.snapshot {
@@ -2090,6 +2136,121 @@ fn save_setting_value_in(
     Ok(())
 }
 
+fn create_context_in_library(raw_name: String) -> Result<String, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let context_key = CredentialEntry::new("Scryppy", "context-key-v1")
+        .map_err(|_| "Credencial local indisponível.")?
+        .get_password()
+        .map_err(|_| "Não foi possível acessar a chave dos Contextos.")?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    create_context_in(&mut conn, app_dir, &context_key, raw_name)
+}
+
+fn create_context_in(
+    conn: &mut rusqlite::Connection,
+    app_dir: &Path,
+    context_key: &str,
+    raw_name: String,
+) -> Result<String, String> {
+    let name = raw_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return Err("Informe um nome para o Contexto.".into());
+    }
+    if name.chars().count() > 80 {
+        return Err("O nome do Contexto deve ter até 80 caracteres.".into());
+    }
+    let normalized_name = name.to_lowercase();
+    if matches!(normalized_name.as_str(), "inbox" | "knowledge base") {
+        return Err("Esse nome é reservado pelo sistema.".into());
+    }
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM contexts WHERE normalized_name = ?1)",
+            [&normalized_name],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if exists {
+        return Err("Já existe um Contexto com esse nome.".into());
+    }
+    let base_slug = slugify_context(&name);
+    let mut slug = if base_slug.is_empty() {
+        "contexto".to_string()
+    } else {
+        base_slug.clone()
+    };
+    let mut suffix = 2;
+    while conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM contexts WHERE slug = ?1)",
+            [&slug],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        slug = format!("{base_slug}-{suffix}");
+        suffix += 1;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let context = ContextDto {
+        id: id.clone(),
+        name,
+        normalized_name,
+        slug,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        capture_count: 0,
+    };
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO contexts (id, name, normalized_name, slug, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                context.id,
+                context.name,
+                context.normalized_name,
+                context.slug,
+                context.created_at,
+                context.updated_at
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    let export_dir = app_dir.join("markdown").join("contexts");
+    std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+    scrypuppy_core::context_exports::write_context_export(
+        &conn,
+        &export_dir,
+        &context,
+        context_key,
+    )
+    .map_err(|error| {
+        format!("Contexto criado, mas o export criptografado não foi escrito: {error}")
+    })?;
+    Ok(id)
+}
+
+fn slugify_context(value: &str) -> String {
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            separator = false;
+        } else if !separator {
+            slug.push('-');
+            separator = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
 fn assign_capture_to_context(capture_id: String, context_id: String) -> Result<(), String> {
     assign_captures_to_context(vec![capture_id], context_id)
 }
@@ -2833,6 +2994,39 @@ mod tests {
         let preview = load_link_preview(dir.path(), url, false);
 
         assert_eq!(preview.title.as_deref(), Some("Local title"));
+    }
+
+    #[test]
+    fn create_context_writes_database_row_and_encrypted_export() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        scrypuppy_core::schema::migrate(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let id = create_context_in(
+            &mut conn,
+            dir.path(),
+            &"34".repeat(32),
+            "Pesquisa de produto".into(),
+        )
+        .unwrap();
+
+        let context = scrypuppy_core::library::list_contexts_from_conn(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|context| context.id == id)
+            .unwrap();
+        assert_eq!(context.slug, "pesquisa-de-produto");
+        let export = dir
+            .path()
+            .join("markdown/contexts")
+            .join(format!("{}.scryppy", context.slug));
+        assert!(export.is_file());
+        assert!(create_context_in(
+            &mut conn,
+            dir.path(),
+            &"34".repeat(32),
+            "Pesquisa de produto".into(),
+        )
+        .is_err());
     }
 
     #[test]
