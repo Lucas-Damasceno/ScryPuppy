@@ -45,7 +45,7 @@ jobs:
   build:
     name: Build Windows installer
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     outputs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
       installer_name: ${{ steps.metadata.outputs.installer_name }}
