@@ -108,7 +108,11 @@ try {
   if ([string]::IsNullOrWhiteSpace($tauriBinaryName)) {
     throw "Tauri baseline uninstall registration did not identify its installed executable."
   }
-  $tauriBinary = Join-Path $installRoot "$tauriBinaryName.exe"
+  $tauriExecutableFileName = $tauriBinaryName
+  if ([System.IO.Path]::GetExtension($tauriExecutableFileName) -ne ".exe") {
+    $tauriExecutableFileName += ".exe"
+  }
+  $tauriBinary = Join-Path $installRoot $tauriExecutableFileName
   if (-not (Test-Path -LiteralPath $tauriBinary)) {
     throw "Tauri baseline executable was not installed at the isolated path: $tauriBinary"
   }
