@@ -2220,12 +2220,20 @@ impl App {
                         self.selected_capture = None;
                         self.assistant_capture = None;
                         self.assistant_answer = None;
+                        self.quick_context_selected.clear();
                         self.snapshot = None;
                         self.notice = Some(
                             "Dados locais apagados. A biblioteca criptografada foi recriada."
                                 .into(),
                         );
-                        self.reload()
+                        let mut tasks = vec![self.reload()];
+                        if let Some(id) = self.quick_window.take() {
+                            tasks.push(window::close(id));
+                        }
+                        if let Some(id) = self.quick_context_window.take() {
+                            tasks.push(window::close(id));
+                        }
+                        Task::batch(tasks)
                     }
                     Err(error) => {
                         self.clipboard_monitor_enabled = monitor_was_enabled;
