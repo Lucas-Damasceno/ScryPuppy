@@ -7789,6 +7789,23 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                     ) {
                         images.push((capture.id.clone(), preview));
                     }
+                } else if extension.eq_ignore_ascii_case("doc") {
+                    if let Some(path) = file.local_path.as_deref().map(Path::new) {
+                        if let Ok(preview) = scrypuppy_core::preview::cached_preview(
+                            &cache_root,
+                            &capture.id,
+                            "doc-first-page-shell-thumbnail",
+                            &bytes,
+                            12 * 1024 * 1024,
+                            || {
+                                render_doc_first_page_thumbnail(path).map_err(|_| {
+                                    scrypuppy_core::preview::PreviewError::InvalidDocument
+                                })
+                            },
+                        ) {
+                            images.push((capture.id.clone(), preview));
+                        }
+                    }
                 }
                 let kind = if extension.eq_ignore_ascii_case("txt") {
                     "plain-text-excerpt"
@@ -7824,6 +7841,123 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
         }
     }
     (images, text)
+}
+
+#[cfg(windows)]
+fn render_doc_first_page_thumbnail(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Cursor;
+    use windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::SIZE,
+            Graphics::Gdi::{
+                CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP,
+                BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+            },
+            System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+            UI::Shell::{
+                IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY,
+            },
+        },
+    };
+
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 20 * 1024 * 1024 {
+        return Err("Documento Word acima do limite seguro de prévia.".into());
+    }
+
+    // Shell thumbnail providers may access disk, so this function is only called by the preview worker.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let item: IShellItemImageFactory =
+        unsafe { SHCreateItemFromParsingName(&HSTRING::from(path.display().to_string()), None) }
+            .map_err(|error| error.to_string())?;
+    let bitmap = unsafe { item.GetImage(SIZE { cx: 320, cy: 240 }, SIIGBF_THUMBNAILONLY) }
+        .map_err(|error| error.to_string())?;
+    struct BitmapGuard(HBITMAP);
+    impl Drop for BitmapGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.0 .0));
+            }
+        }
+    }
+    let bitmap = BitmapGuard(bitmap);
+    let mut dimensions = BITMAP::default();
+    let copied = unsafe {
+        GetObjectW(
+            HGDIOBJ(bitmap.0 .0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut dimensions as *mut BITMAP).cast()),
+        )
+    };
+    if copied != std::mem::size_of::<BITMAP>() as i32
+        || dimensions.bmWidth <= 0
+        || dimensions.bmHeight <= 0
+        || dimensions.bmWidth > 1024
+        || dimensions.bmHeight > 1024
+    {
+        return Err("O Shell retornou uma miniatura Word inválida.".into());
+    }
+    let width = dimensions.bmWidth as u32;
+    let height = dimensions.bmHeight as u32;
+    let byte_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|length| *length <= 4 * 1024 * 1024)
+        .ok_or("Miniatura Word excede o limite seguro.")?;
+    let mut pixels = vec![0_u8; byte_len];
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dc: HDC = unsafe { CreateCompatibleDC(None) };
+    if dc.0.is_null() {
+        return Err("Não foi possível criar o contexto para a miniatura Word.".into());
+    }
+    struct DcGuard(HDC);
+    impl Drop for DcGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteDC(self.0);
+            }
+        }
+    }
+    let _dc = DcGuard(dc);
+    let lines = unsafe {
+        GetDIBits(
+            dc,
+            bitmap.0,
+            0,
+            height,
+            Some(pixels.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    if lines <= 0 {
+        return Err("Não foi possível ler a miniatura Word.".into());
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        if pixel[3] == 0 {
+            pixel[3] = 255;
+        }
+    }
+    let image = ::image::RgbaImage::from_raw(width, height, pixels)
+        .ok_or("Não foi possível montar a miniatura Word.")?;
+    let mut png = Cursor::new(Vec::new());
+    ::image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut png, ::image::ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    Ok(png.into_inner())
 }
 
 #[cfg(windows)]
@@ -8112,7 +8246,14 @@ mod tests {
 
         let (images, text) = previews(&asset_root, &[capture]);
 
-        assert!(images.is_empty());
+        assert!(images.len() <= 1);
+        if let Some((capture_id, image)) = images.first() {
+            assert_eq!(capture_id, "legacy-doc-capture");
+            assert_eq!(
+                ::image::guess_format(image).unwrap(),
+                ::image::ImageFormat::Png
+            );
+        }
         assert_eq!(text.len(), 1);
         assert_eq!(text[0].0, "legacy-doc-capture");
         assert!(text[0].1.contains("Concert du soir"));
