@@ -9,6 +9,7 @@ pub mod context_rules;
 pub mod contexts;
 pub mod coordination;
 pub mod crypto;
+pub mod documents;
 pub mod library;
 pub mod link_fetch;
 pub mod link_metadata;

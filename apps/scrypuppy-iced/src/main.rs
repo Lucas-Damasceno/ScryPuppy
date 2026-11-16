@@ -207,6 +207,7 @@ fn context_rule_operator_label(operator: &str) -> &'static str {
 struct Snapshot {
     contexts: Vec<ContextDto>,
     captures: Vec<CaptureDto>,
+    documents: Vec<scrypuppy_core::documents::DocumentListItem>,
     total: usize,
     asset_root: PathBuf,
     dark: bool,
@@ -275,6 +276,7 @@ struct App {
     assistant_revision: u64,
     assistant_answer: Option<scrypuppy_core::assistant::ChatAnswer>,
     assistant_capture: Option<CaptureDto>,
+    selected_document: Option<scrypuppy_core::documents::Document>,
     context: Option<String>,
     new_context_name: String,
     new_rule_name: String,
@@ -347,6 +349,10 @@ enum Message {
     AssistantQueryChanged(String),
     AskAssistant,
     AssistantAnswered(u64, Result<scrypuppy_core::assistant::ChatAnswer, String>),
+    SaveAnswerAsDocument,
+    AnswerSavedAsDocument(Result<scrypuppy_core::documents::Document, String>),
+    OpenSavedDocument(String),
+    SavedDocumentLoaded(Result<scrypuppy_core::documents::Document, String>),
     OpenAssistantEvidence(String),
     AssistantEvidenceLoaded(u64, String, Result<Box<CaptureDto>, String>),
     Search,
@@ -481,6 +487,7 @@ impl App {
             assistant_revision: 0,
             assistant_answer: None,
             assistant_capture: None,
+            selected_document: None,
             context: None,
             new_context_name: String::new(),
             new_rule_name: String::new(),
@@ -808,6 +815,46 @@ impl App {
                 match result {
                     Ok(answer) => self.assistant_answer = Some(answer),
                     Err(error) => self.notice = Some(error),
+                }
+                Task::none()
+            }
+            Message::SaveAnswerAsDocument => {
+                let (Some(answer), query) = (
+                    self.assistant_answer.clone(),
+                    self.assistant_query.trim().to_string(),
+                ) else {
+                    return Task::none();
+                };
+                if self.is_demo_mode() {
+                    self.notice =
+                        Some("Documentos ficam desativados no modo de demonstração.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { save_answer_as_document(&query, &answer) },
+                    Message::AnswerSavedAsDocument,
+                )
+            }
+            Message::AnswerSavedAsDocument(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(document) => {
+                        self.notice = Some(format!("Documento salvo: {}", document.title));
+                        return self.reload();
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::OpenSavedDocument(id) => Task::perform(
+                async move { load_saved_document(&id) },
+                Message::SavedDocumentLoaded,
+            ),
+            Message::SavedDocumentLoaded(result) => {
+                match result {
+                    Ok(document) => self.selected_document = Some(document),
+                    Err(error) => self.error = Some(error),
                 }
                 Task::none()
             }
@@ -2307,6 +2354,10 @@ impl App {
                     .size(10),
                 ]
                 .spacing(8);
+                answer_content =
+                    answer_content.push(button("Salvar resposta como documento").on_press_maybe(
+                        (!self.action_busy).then_some(Message::SaveAnswerAsDocument),
+                    ));
                 for evidence in &answer.evidence {
                     let context = if evidence.context_names.is_empty() {
                         "Inbox".to_string()
@@ -2334,6 +2385,38 @@ impl App {
                         .width(Length::Fill)
                         .padding(14)
                         .style(move |_| panel_style(dark, false)),
+                );
+            }
+            if let Some(snapshot) = &self.snapshot {
+                if !snapshot.documents.is_empty() {
+                    let mut saved = column![text("Documentos salvos").size(16)].spacing(6);
+                    for document in snapshot.documents.iter().take(8) {
+                        saved = saved.push(
+                            button(text(format!(
+                                "{} · {} fonte(s) · v{}",
+                                document.title, document.evidence_count, document.version
+                            )))
+                            .on_press(Message::OpenSavedDocument(document.id.clone()))
+                            .width(Length::Fill),
+                        );
+                    }
+                    content = content.push(saved);
+                }
+            }
+            if let Some(document) = &self.selected_document {
+                content = content.push(
+                    container(
+                        column![
+                            text(document.title.as_str()).size(18),
+                            text(document.markdown.as_str()).size(13),
+                            text(format!("{} fonte(s) vinculada(s)", document.evidence.len()))
+                                .size(11),
+                        ]
+                        .spacing(8),
+                    )
+                    .width(Length::Fill)
+                    .padding(14)
+                    .style(move |_| panel_style(dark, false)),
                 );
             }
         }
@@ -2432,7 +2515,7 @@ impl App {
                 } else {
                     "Nenhuma chave de API está configurada."
                 }).size(12))
-                .push(text("A chave fica fora do banco local. A geração de respostas e documentos ainda não está disponível na interface Iced.").size(12))
+                .push(text("A chave fica fora do banco local. Perguntas e fontes podem ser salvas como documentos Markdown na biblioteca criptografada.").size(12))
                 .push(button(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" })
                     .on_press(Message::ToggleAutostart))
                 .push(text("Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows.").size(12));
@@ -3444,6 +3527,7 @@ fn demo_snapshot() -> Snapshot {
                 "Notas",
             ),
         ],
+        documents: Vec::new(),
         total: 3,
         asset_root: PathBuf::new(),
         dark: true,
@@ -3612,6 +3696,24 @@ fn load_capture_by_id(capture_id: &str) -> Result<CaptureDto, String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_only(&path, &database_key)?;
     scrypuppy_core::library::get_capture_by_id(&conn, capture_id)
+}
+
+fn save_answer_as_document(
+    query: &str,
+    answer: &scrypuppy_core::assistant::ChatAnswer,
+) -> Result<scrypuppy_core::documents::Document, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let document = scrypuppy_core::documents::save_answer(&transaction, query, answer, None)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(document)
+}
+
+fn load_saved_document(id: &str) -> Result<scrypuppy_core::documents::Document, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &database_key)?;
+    scrypuppy_core::documents::get(&conn, id)
 }
 
 fn save_theme_preference(dark: bool) -> Result<(), String> {
@@ -5132,6 +5234,7 @@ fn load_library(
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
         captures: list_captures_from_conn(&conn, &filter)?,
+        documents: scrypuppy_core::documents::list(&conn)?,
         asset_root: path
             .parent()
             .ok_or("Diretório da biblioteca indisponível")?
