@@ -3288,7 +3288,7 @@ impl App {
                 container(
                     column![
                         text("Bem-vindo ao ScryPuppy").size(20),
-                        text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar o clipboard e Ctrl + Shift + V para abrir o Quick Paste.").size(13),
+                        text("Suas capturas ficam na biblioteca local criptografada. Use Ctrl + Shift + C para salvar uma seleção, Ctrl + Shift + S para criar uma referência, Ctrl + Shift + F para perguntar à biblioteca e Ctrl + Shift + V para abrir o Quick Paste.").size(13),
                         text("A captura automática começa desligada. Você pode controlar imagens, Quick Context e prévias de links em Configurações.").size(12),
                         button("Continuar para a biblioteca").on_press(Message::CompleteOnboarding),
                     ]
