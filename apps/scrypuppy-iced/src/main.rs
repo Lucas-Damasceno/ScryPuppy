@@ -376,6 +376,7 @@ struct App {
     library_date_from: String,
     library_date_to: String,
     library_tag_filter: String,
+    library_kind_filter: String,
     assistant_query: String,
     assistant_app_filter: String,
     assistant_date_from: String,
@@ -463,6 +464,7 @@ enum Message {
     LibraryDateToChanged(String),
     LibraryTagFilterChanged(String),
     ClearLibraryFilters,
+    CycleLibraryKindFilter,
     AssistantQueryChanged(String),
     AssistantAppFilterChanged(String),
     AssistantDateFromChanged(String),
@@ -621,6 +623,7 @@ impl App {
             library_date_from: String::new(),
             library_date_to: String::new(),
             library_tag_filter: String::new(),
+            library_kind_filter: String::new(),
             assistant_query: String::new(),
             assistant_app_filter: String::new(),
             assistant_date_from: String::new(),
@@ -729,6 +732,11 @@ impl App {
                     .captures
                     .retain(|capture| capture.tags.iter().any(|tag| tag == tag_filter));
             }
+            if !self.library_kind_filter.is_empty() {
+                snapshot.captures.retain(|capture| {
+                    matches_library_content_kind(capture, &self.library_kind_filter)
+                });
+            }
             if let Ok(Some(date_from)) =
                 normalize_assistant_date_filter(&self.library_date_from, false)
             {
@@ -762,21 +770,26 @@ impl App {
         let revision = self.revision;
         self.loading = true;
         self.error = None;
-        let query = self.query.clone();
-        let context = self.context.clone();
-        let offset = self.offset;
-        let app_filter = self.library_app_filter.clone();
-        let date_from = self.library_date_from.clone();
-        let date_to = self.library_date_to.clone();
-        let tag_filter = self.library_tag_filter.clone();
-        Task::perform(
-            async move {
-                load_default_library(
-                    query, context, offset, app_filter, date_from, date_to, tag_filter,
-                )
-            },
-            move |result| Message::Loaded(revision, result),
-        )
+        let filter = CaptureFilter {
+            context_id: self.context.clone(),
+            search: (!self.query.trim().is_empty()).then(|| self.query.clone()),
+            tag: (!self.library_tag_filter.trim().is_empty())
+                .then(|| self.library_tag_filter.clone()),
+            app: (!self.library_app_filter.trim().is_empty())
+                .then(|| self.library_app_filter.clone()),
+            date_from: (!self.library_date_from.trim().is_empty())
+                .then(|| self.library_date_from.clone()),
+            date_to: (!self.library_date_to.trim().is_empty())
+                .then(|| self.library_date_to.clone()),
+            content_kind: (!self.library_kind_filter.is_empty())
+                .then(|| self.library_kind_filter.clone()),
+            limit: Some(PAGE_SIZE),
+            offset: Some(self.offset),
+            exclude_references: false,
+        };
+        Task::perform(async move { load_default_library(filter) }, move |result| {
+            Message::Loaded(revision, result)
+        })
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -852,6 +865,7 @@ impl App {
                 self.library_date_from.clear();
                 self.library_date_to.clear();
                 self.library_tag_filter.clear();
+                self.library_kind_filter.clear();
                 self.offset = 0;
                 Task::batch([open.map(Message::QuickPasteOpened), self.reload()])
             }
@@ -1012,8 +1026,21 @@ impl App {
                 self.library_date_from.clear();
                 self.library_date_to.clear();
                 self.library_tag_filter.clear();
+                self.library_kind_filter.clear();
                 self.offset = 0;
                 self.notice = None;
+                self.reload()
+            }
+            Message::CycleLibraryKindFilter => {
+                self.library_kind_filter = match self.library_kind_filter.as_str() {
+                    "" => "text",
+                    "text" => "image",
+                    "image" => "link",
+                    "link" => "files",
+                    _ => "",
+                }
+                .into();
+                self.offset = 0;
                 self.reload()
             }
             Message::AssistantQueryChanged(value) => {
@@ -2855,6 +2882,8 @@ impl App {
                         .on_submit(Message::Search)
                         .padding(8)
                         .width(145),
+                    button(library_kind_filter_label(&self.library_kind_filter))
+                        .on_press(Message::CycleLibraryKindFilter),
                     button("Limpar filtros").on_press(Message::ClearLibraryFilters),
                 ]
                 .spacing(6),
@@ -4293,31 +4322,45 @@ fn demo_assistant_answer(query: &str) -> scrypuppy_core::assistant::ChatAnswer {
     }
 }
 
-fn load_default_library(
-    query: String,
-    context: Option<String>,
-    offset: usize,
-    app_filter: String,
-    date_from: String,
-    date_to: String,
-    tag_filter: String,
-) -> Result<Snapshot, String> {
+fn load_default_library(mut filter: CaptureFilter) -> Result<Snapshot, String> {
     let (path, key) = default_database_credentials()?;
-    let date_from = normalize_assistant_date_filter(&date_from, false)?;
-    let date_to = normalize_assistant_date_filter(&date_to, true)?;
-    let filter = CaptureFilter {
-        context_id: context,
-        search: (!query.trim().is_empty()).then_some(query),
-        tag: (!tag_filter.trim().is_empty()).then_some(tag_filter),
-        app: (!app_filter.trim().is_empty()).then_some(app_filter),
-        date_from,
-        date_to,
-        limit: Some(PAGE_SIZE),
-        offset: Some(offset),
-        exclude_references: false,
-    };
+    filter.date_from = filter
+        .date_from
+        .as_deref()
+        .map(|value| normalize_assistant_date_filter(value, false))
+        .transpose()?
+        .flatten();
+    filter.date_to = filter
+        .date_to
+        .as_deref()
+        .map(|value| normalize_assistant_date_filter(value, true))
+        .transpose()?
+        .flatten();
     load_library(&path, &key, filter)
         .map_err(|_| "Não foi possível abrir a biblioteca existente com segurança.".into())
+}
+
+fn library_kind_filter_label(kind: &str) -> &'static str {
+    match kind {
+        "text" => "Tipo: Texto",
+        "image" => "Tipo: Imagem",
+        "link" => "Tipo: Link",
+        "files" => "Tipo: Arquivos",
+        _ => "Tipo: Todos",
+    }
+}
+
+fn matches_library_content_kind(capture: &CaptureDto, filter: &str) -> bool {
+    match filter {
+        "text" => matches!(
+            capture.content_kind.as_str(),
+            "plain_text" | "rich_text" | "html"
+        ),
+        "image" => capture.content_kind == "image",
+        "link" => capture.kind == "reference" || capture.content_kind == "url",
+        "files" => capture.content_kind == "files" || !capture.files.is_empty(),
+        _ => true,
+    }
 }
 
 fn default_database_credentials() -> Result<(PathBuf, String), String> {
@@ -6522,6 +6565,7 @@ mod tests {
                 app: None,
                 date_from: None,
                 date_to: None,
+                content_kind: None,
                 limit: Some(PAGE_SIZE),
                 offset: Some(offset),
                 exclude_references: false,

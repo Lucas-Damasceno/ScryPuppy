@@ -131,6 +131,8 @@ pub struct CaptureFilter {
     pub date_from: Option<String>,
     #[serde(default)]
     pub date_to: Option<String>,
+    #[serde(default)]
+    pub content_kind: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     #[serde(default)]
@@ -162,6 +164,7 @@ pub fn default_capture_filter() -> CaptureFilter {
         app: None,
         date_from: None,
         date_to: None,
+        content_kind: None,
         limit: None,
         offset: None,
         exclude_references: false,
@@ -253,6 +256,24 @@ fn capture_query_parts(filter: &CaptureFilter) -> CaptureQueryParts {
     {
         where_parts.push("c.captured_at < ?".to_string());
         args.push(date_to.clone());
+    }
+
+    if let Some(content_kind) = filter
+        .content_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let predicate = match content_kind {
+            "text" => Some("EXISTS (SELECT 1 FROM capture_representations kr WHERE kr.capture_id = c.id AND kr.kind IN ('plain_text', 'rich_text', 'html'))"),
+            "image" => Some("EXISTS (SELECT 1 FROM capture_representations kr WHERE kr.capture_id = c.id AND kr.kind = 'image')"),
+            "link" => Some("c.capture_kind = 'reference' OR EXISTS (SELECT 1 FROM capture_representations kr WHERE kr.capture_id = c.id AND kr.kind = 'url')"),
+            "files" => Some("EXISTS (SELECT 1 FROM capture_file_entries kf WHERE kf.capture_id = c.id) OR EXISTS (SELECT 1 FROM capture_representations kr WHERE kr.capture_id = c.id AND kr.kind = 'files')"),
+            _ => None,
+        };
+        if let Some(predicate) = predicate {
+            where_parts.push(format!("({predicate})"));
+        }
     }
 
     CaptureQueryParts {
@@ -724,7 +745,8 @@ pub fn get_capture_by_id(conn: &Connection, id: &str) -> Result<CaptureDto, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_query_parts, CaptureFilter};
+    use super::{capture_query_parts, count_captures_from_conn, CaptureFilter};
+    use rusqlite::Connection;
 
     #[test]
     fn capture_filters_add_app_and_exclusive_date_bounds() {
@@ -735,6 +757,7 @@ mod tests {
             app: Some("Visual Studio".into()),
             date_from: Some("2026-11-01T00:00:00".into()),
             date_to: Some("2026-12-01T00:00:00".into()),
+            content_kind: Some("image".into()),
             limit: None,
             offset: None,
             exclude_references: false,
@@ -748,6 +771,7 @@ mod tests {
             .contains("lower(coalesce(c.source_app_name, '')) LIKE lower(?)"));
         assert!(parts.where_clause.contains("c.captured_at >= ?"));
         assert!(parts.where_clause.contains("c.captured_at < ?"));
+        assert!(parts.where_clause.contains("kr.kind = 'image'"));
         assert_eq!(
             parts.args,
             [
@@ -768,6 +792,7 @@ mod tests {
             app: Some("  ".into()),
             date_from: Some(String::new()),
             date_to: None,
+            content_kind: Some("unrecognized".into()),
             limit: None,
             offset: None,
             exclude_references: false,
@@ -777,5 +802,46 @@ mod tests {
 
         assert!(parts.where_clause.is_empty());
         assert!(parts.args.is_empty());
+    }
+
+    #[test]
+    fn content_kind_filters_match_representation_and_file_records() {
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+        conn.execute_batch(
+            "CREATE TABLE captures(id TEXT, capture_kind TEXT, captured_at TEXT, source_app_name TEXT);
+             CREATE TABLE capture_ocr(capture_id TEXT, text TEXT);
+             CREATE TABLE capture_representations(capture_id TEXT, kind TEXT);
+             CREATE TABLE capture_file_entries(capture_id TEXT);
+             INSERT INTO captures VALUES ('text', 'clipboard', '', NULL);
+             INSERT INTO captures VALUES ('image', 'clipboard', '', NULL);
+             INSERT INTO captures VALUES ('link', 'clipboard', '', NULL);
+             INSERT INTO captures VALUES ('files', 'clipboard', '', NULL);
+             INSERT INTO captures VALUES ('reference', 'reference', '', NULL);
+             INSERT INTO capture_representations VALUES ('text', 'rich_text');
+             INSERT INTO capture_representations VALUES ('image', 'image');
+             INSERT INTO capture_representations VALUES ('link', 'url');
+             INSERT INTO capture_file_entries VALUES ('files');",
+        )
+        .expect("minimal library tables should initialize");
+
+        for (kind, expected) in [("text", 1), ("image", 1), ("link", 2), ("files", 1)] {
+            let filter = CaptureFilter {
+                context_id: None,
+                search: None,
+                tag: None,
+                app: None,
+                date_from: None,
+                date_to: None,
+                content_kind: Some(kind.into()),
+                limit: None,
+                offset: None,
+                exclude_references: false,
+            };
+            assert_eq!(
+                count_captures_from_conn(&conn, &filter).expect("kind filter count should work"),
+                expected,
+                "unexpected number of {kind} captures"
+            );
+        }
     }
 }
