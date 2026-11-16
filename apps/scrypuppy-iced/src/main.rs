@@ -32,6 +32,7 @@ static CLIPBOARD_EVENT_SENDER: OnceLock<
 > = OnceLock::new();
 static CLIPBOARD_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static OCR_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static RETENTION_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static CAPTURE_COORDINATOR: OnceLock<scrypuppy_core::coordination::CaptureCoordinator> =
     OnceLock::new();
 #[cfg(windows)]
@@ -194,7 +195,14 @@ struct Snapshot {
     quick_context_enabled: bool,
     onboarding_completed: bool,
     launch_at_startup: bool,
+    retention_policy: String,
     context_rules: Vec<ContextRuleRow>,
+}
+
+#[derive(Clone, Debug)]
+struct RetentionPreview {
+    token: String,
+    count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +250,9 @@ struct App {
     new_tag: String,
     launch_at_startup: bool,
     autostart_changed: bool,
+    retention_policy: String,
+    retention_changed: bool,
+    retention_preview: Option<RetentionPreview>,
     context_editor: Option<ContextEditor>,
     pending_delete_context: Option<String>,
     offset: usize,
@@ -340,6 +351,11 @@ enum Message {
     ToggleClipboardMonitor,
     ToggleLinkPreviewFetch,
     ToggleAutostart,
+    CycleRetentionPolicy,
+    RetentionPreviewLoaded(String, Result<RetentionPreview, String>),
+    ApplyRetention(bool),
+    RetentionApplied(Result<usize, String>),
+    RetentionCleanupFinished(usize),
     ToggleSettings,
     ToggleCaptureScreenshots,
     ToggleMonitorScreenshots,
@@ -402,6 +418,9 @@ impl App {
             new_tag: String::new(),
             launch_at_startup: false,
             autostart_changed: false,
+            retention_policy: "3_months".into(),
+            retention_changed: false,
+            retention_preview: None,
             context_editor: None,
             pending_delete_context: None,
             offset: 0,
@@ -493,16 +512,21 @@ impl App {
         match message {
             Message::CloseRequested(id) if id == self.main => hide_window(id),
             Message::CloseRequested(_) => Task::none(),
-            Message::MainOpened(id) if id == self.main => window::run(id, |_| {
+            Message::MainOpened(id) if id == self.main => {
                 #[cfg(windows)]
-                initialize_tray();
-                thread::spawn(|| {
-                    if let Err(error) = prepare_ocr_queue() {
-                        eprintln!("Não foi possível preparar a fila local de OCR: {error}");
-                    }
-                });
-            })
-            .discard(),
+                let tray_task = window::run(id, |_| initialize_tray()).discard::<Message>();
+                #[cfg(not(windows))]
+                let tray_task = Task::none();
+                if !self.is_demo_mode() {
+                    thread::spawn(|| {
+                        if let Err(error) = prepare_ocr_queue() {
+                            eprintln!("Não foi possível preparar a fila local de OCR: {error}");
+                        }
+                    });
+                    start_retention_worker();
+                }
+                tray_task
+            }
             Message::MainOpened(_) => Task::none(),
             Message::ShowMain => show_window(self.main),
             Message::QuitFromTray => iced::exit(),
@@ -1087,7 +1111,124 @@ impl App {
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    #[cfg(debug_assertions)]
+                    if self.demo {
+                        self.retention_preview = Some(RetentionPreview {
+                            token: String::new(),
+                            count: 0,
+                        });
+                        return Task::none();
+                    }
+                    let policy = self.retention_policy.clone();
+                    Task::perform(
+                        async move {
+                            load_retention_preview(policy.clone()).map(|preview| (policy, preview))
+                        },
+                        |result| match result {
+                            Ok((policy, preview)) => {
+                                Message::RetentionPreviewLoaded(policy, Ok(preview))
+                            }
+                            Err(error) => {
+                                Message::RetentionPreviewLoaded(String::new(), Err(error))
+                            }
+                        },
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CycleRetentionPolicy => {
+                let policies = scrypuppy_core::retention::POLICIES;
+                let index = policies
+                    .iter()
+                    .position(|policy| *policy == self.retention_policy)
+                    .unwrap_or(4);
+                self.retention_policy = policies[(index + 1) % policies.len()].into();
+                self.retention_changed = true;
+                self.retention_preview = None;
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.retention_preview = Some(RetentionPreview {
+                        token: String::new(),
+                        count: 0,
+                    });
+                    return Task::none();
+                }
+                let policy = self.retention_policy.clone();
+                Task::perform(
+                    async move {
+                        load_retention_preview(policy.clone()).map(|preview| (policy, preview))
+                    },
+                    |result| match result {
+                        Ok((policy, preview)) => {
+                            Message::RetentionPreviewLoaded(policy, Ok(preview))
+                        }
+                        Err(error) => Message::RetentionPreviewLoaded(String::new(), Err(error)),
+                    },
+                )
+            }
+            Message::RetentionPreviewLoaded(policy, result) => {
+                if policy.is_empty() || policy == self.retention_policy {
+                    match result {
+                        Ok(preview) => self.retention_preview = Some(preview),
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
                 Task::none()
+            }
+            Message::ApplyRetention(delete_existing) => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice =
+                        Some("Alterações de retenção desativadas no modo de demonstração.".into());
+                    return Task::none();
+                }
+                if self.action_busy {
+                    return Task::none();
+                }
+                let Some(preview) = self.retention_preview.clone() else {
+                    return Task::none();
+                };
+                let policy = self.retention_policy.clone();
+                self.action_busy = true;
+                Task::perform(
+                    async move { apply_retention_policy(policy, preview.token, delete_existing) },
+                    Message::RetentionApplied,
+                )
+            }
+            Message::RetentionApplied(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(count) => {
+                        self.notice = Some(if count == 0 {
+                            "Política de retenção salva; os itens existentes foram mantidos.".into()
+                        } else {
+                            format!("Política salva; {count} capturas antigas removidas.")
+                        })
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.retention_preview = None;
+                let policy = self.retention_policy.clone();
+                let preview = Task::perform(
+                    async move {
+                        load_retention_preview(policy.clone()).map(|preview| (policy, preview))
+                    },
+                    |result| match result {
+                        Ok((policy, preview)) => {
+                            Message::RetentionPreviewLoaded(policy, Ok(preview))
+                        }
+                        Err(error) => Message::RetentionPreviewLoaded(String::new(), Err(error)),
+                    },
+                );
+                Task::batch([self.reload(), preview])
+            }
+            Message::RetentionCleanupFinished(count) => {
+                self.notice = Some(format!(
+                    "A política de retenção removeu {count} capturas antigas."
+                ));
+                self.reload()
             }
             Message::CompleteOnboarding => {
                 self.onboarding_completed = true;
@@ -1305,6 +1446,9 @@ impl App {
                         }
                         if !self.autostart_changed {
                             self.launch_at_startup = snapshot.launch_at_startup;
+                        }
+                        if !self.retention_changed {
+                            self.retention_policy = snapshot.retention_policy.clone();
                         }
                         let fetch_links = self.link_preview_fetch_enabled;
                         self.link_previews_loading = fetch_links
@@ -1721,6 +1865,50 @@ impl App {
                 .push(button(if self.launch_at_startup { "Iniciar com o Windows: ligado" } else { "Iniciar com o Windows: desligado" })
                     .on_press(Message::ToggleAutostart))
                 .push(text("Adiciona ou remove ScryPuppy da inicialização da sua conta do Windows.").size(12));
+            let retention_label = match self.retention_policy.as_str() {
+                "1_day" => "1 dia",
+                "3_days" => "3 dias",
+                "7_days" => "7 dias",
+                "1_month" => "1 mês",
+                "3_months" => "3 meses",
+                "6_months" => "6 meses",
+                "12_months" => "12 meses",
+                "never" => "Nunca",
+                _ => "3 meses",
+            };
+            content = content
+                .push(text("Retenção da biblioteca").size(20))
+                .push(button(text(format!("Apagar capturas após: {retention_label}")))
+                    .on_press(Message::CycleRetentionPolicy))
+                .push(text("A prévia exclui referências e arquivos importados. A limpeza automática é executada no máximo uma vez por dia.").size(12));
+            if let Some(preview) = &self.retention_preview {
+                content = content
+                    .push(
+                        text(format!(
+                            "{} capturas seriam elegíveis agora.",
+                            preview.count
+                        ))
+                        .size(12),
+                    )
+                    .push(
+                        button("Salvar e manter as capturas existentes").on_press_maybe(
+                            (!self.action_busy).then_some(Message::ApplyRetention(false)),
+                        ),
+                    );
+                if preview.count > 0 {
+                    content = content.push(
+                        button(text(format!(
+                            "Salvar e excluir {} capturas antigas agora",
+                            preview.count
+                        )))
+                        .on_press_maybe(
+                            (!self.action_busy).then_some(Message::ApplyRetention(true)),
+                        ),
+                    );
+                }
+            } else {
+                content = content.push(text("Calculando prévia de retenção…").size(12));
+            }
         } else if self.loading {
             content = content.push(text("Carregando biblioteca…"));
         } else if let Some(error) = &self.error {
@@ -2693,6 +2881,7 @@ fn demo_snapshot() -> Snapshot {
         quick_context_enabled: true,
         onboarding_completed: true,
         launch_at_startup: false,
+        retention_policy: "3_months".into(),
         context_rules: Vec::new(),
     }
 }
@@ -2866,6 +3055,137 @@ fn set_autostart_preference(enabled: bool) -> Result<(), String> {
     }
     let save = save_setting_value("launch_at_startup", if enabled { "true" } else { "false" });
     save
+}
+
+fn load_retention_preview(policy: String) -> Result<RetentionPreview, String> {
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &key)?;
+    let candidates =
+        scrypuppy_core::retention::candidate_ids(&conn, &policy, None, chrono::Utc::now())?;
+    let ids = candidates
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let token = scrypuppy_core::crypto::sha256_hex(format!("{policy}\n{ids}").as_bytes());
+    Ok(RetentionPreview {
+        token,
+        count: candidates.len(),
+    })
+}
+
+fn apply_retention_policy(
+    policy: String,
+    selection_token: String,
+    delete_existing: bool,
+) -> Result<usize, String> {
+    if !scrypuppy_core::retention::is_valid_policy(&policy) {
+        return Err("Política de retenção inválida.".into());
+    }
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &key)?;
+    let candidates =
+        scrypuppy_core::retention::candidate_ids(&conn, &policy, None, chrono::Utc::now())?;
+    let ids = candidates
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let expected =
+        scrypuppy_core::crypto::sha256_hex(format!("{policy}\n{}", ids.join("\n")).as_bytes());
+    if expected != selection_token {
+        return Err("A biblioteca mudou após a prévia; confira os itens novamente.".into());
+    }
+    drop(conn);
+    if delete_existing {
+        for id in &ids {
+            delete_capture_from_library(id.clone())?;
+        }
+    }
+    let at = chrono::Utc::now().to_rfc3339();
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &key)?;
+    save_setting_value_in(&conn, "retention_policy", &policy)?;
+    save_setting_value_in(
+        &conn,
+        "retention_started_at",
+        if delete_existing {
+            "1970-01-01T00:00:00+00:00"
+        } else {
+            &at
+        },
+    )?;
+    save_setting_value_in(&conn, "retention_last_run_at", &at)?;
+    Ok(if delete_existing { ids.len() } else { 0 })
+}
+
+fn run_retention_cleanup() -> Result<usize, String> {
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &key)?;
+    let at = chrono::Utc::now();
+    let last_run = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'retention_last_run_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok());
+    if last_run.is_some_and(|last| {
+        at.signed_duration_since(last.with_timezone(&chrono::Utc)) < chrono::TimeDelta::hours(24)
+    }) {
+        return Ok(0);
+    }
+    let policy = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'retention_policy'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "3_months".into());
+    let policy = if scrypuppy_core::retention::is_valid_policy(&policy) {
+        policy
+    } else {
+        "3_months".into()
+    };
+    let started_at = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'retention_started_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let ids = scrypuppy_core::retention::candidate_ids(&conn, &policy, started_at.as_deref(), at)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    drop(conn);
+    for id in &ids {
+        delete_capture_from_library(id.clone())?;
+    }
+    let stamp = at.to_rfc3339();
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &key)?;
+    save_setting_value_in(&conn, "retention_last_run_at", &stamp)?;
+    Ok(ids.len())
+}
+
+fn start_retention_worker() {
+    if RETENTION_WORKER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(|| loop {
+        match run_retention_cleanup() {
+            Ok(count) if count > 0 => {
+                send_clipboard_message(Message::RetentionCleanupFinished(count));
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Limpeza automática por retenção falhou: {error}"),
+        }
+        thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+    });
 }
 
 fn persist_boolean_setting(key: &'static str, value: bool, demo: bool) -> Task<Message> {
@@ -3945,6 +4265,13 @@ fn load_library(
     let quick_context_enabled = read_boolean_setting(&conn, "quick_context_enabled", true);
     let onboarding_completed = read_boolean_setting(&conn, "onboarding_completed", false);
     let launch_at_startup = read_boolean_setting(&conn, "launch_at_startup", false);
+    let retention_policy = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'retention_policy'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "3_months".into());
     let context_rules = {
         let mut stmt = conn
             .prepare(
@@ -3987,6 +4314,7 @@ fn load_library(
         quick_context_enabled,
         onboarding_completed,
         launch_at_startup,
+        retention_policy,
         context_rules,
     })
 }

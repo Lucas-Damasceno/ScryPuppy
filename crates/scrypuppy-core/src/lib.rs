@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod ocr;
 pub mod preview;
 pub mod restore;
+pub mod retention;
 pub mod schema;
 pub mod search_index;
 pub mod storage;
