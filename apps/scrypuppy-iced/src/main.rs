@@ -31,6 +31,7 @@ static CLIPBOARD_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
 static CLIPBOARD_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static OCR_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static CAPTURE_COORDINATOR: OnceLock<scrypuppy_core::coordination::CaptureCoordinator> =
     OnceLock::new();
 #[cfg(windows)]
@@ -346,6 +347,7 @@ enum Message {
     ToggleQuickContext,
     CompleteOnboarding,
     ClipboardChanged(u32),
+    OcrUpdated(String),
     ClipboardCaptured(Result<Option<(String, bool)>, String>),
     ClipboardMonitorSaved(Result<(), String>),
     ToggleQuickPasteStyle,
@@ -494,6 +496,11 @@ impl App {
             Message::MainOpened(id) if id == self.main => window::run(id, |_| {
                 #[cfg(windows)]
                 initialize_tray();
+                thread::spawn(|| {
+                    if let Err(error) = prepare_ocr_queue() {
+                        eprintln!("Não foi possível preparar a fila local de OCR: {error}");
+                    }
+                });
             })
             .discard(),
             Message::MainOpened(_) => Task::none(),
@@ -1062,6 +1069,14 @@ impl App {
                 Task::batch([reload, save])
             }
             Message::ToggleAutostart => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some(
+                        "Configurações do Windows estão desativadas no modo de demonstração."
+                            .into(),
+                    );
+                    return Task::none();
+                }
                 self.launch_at_startup = !self.launch_at_startup;
                 self.autostart_changed = true;
                 let enabled = self.launch_at_startup;
@@ -1132,6 +1147,12 @@ impl App {
                     async { capture_monitored_clipboard() },
                     Message::ClipboardCaptured,
                 )
+            }
+            Message::OcrUpdated(capture_id) => {
+                if self.selected_capture.as_deref() == Some(capture_id.as_str()) {
+                    self.notice = Some("Análise local da imagem concluída.".into());
+                }
+                self.reload()
             }
             Message::ClipboardCaptured(result) => match result {
                 Ok(Some((id, open_quick_context))) => {
@@ -1953,6 +1974,15 @@ impl App {
                 if let Some(ocr) = &capture.ocr {
                     if let Some(ocr_text) = &ocr.text {
                         details = details.push(text(format!("Texto OCR: {ocr_text}")).size(12));
+                    } else {
+                        let label = match ocr.status.as_str() {
+                            "queued" => "OCR local aguardando análise…",
+                            "running" => "Analisando imagem local…",
+                            "failed" => "OCR local indisponível para esta imagem.",
+                            _ => "OCR local ainda não disponível.",
+                        };
+                        details =
+                            details.push(text(ocr.error.as_deref().unwrap_or(label)).size(11));
                     }
                 }
                 if self.pending_delete_capture.as_deref() == Some(capture.id.as_str()) {
@@ -3555,6 +3585,9 @@ fn capture_current_clipboard() -> Result<String, String> {
     )?;
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+    if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
+        start_ocr_worker();
+    }
     Ok(id)
 }
 
@@ -3648,6 +3681,9 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         Ok(id) => {
             let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
             sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+            if scrypuppy_core::ocr::enqueue_capture(&conn, &id)? {
+                start_ocr_worker();
+            }
             Ok(Some((id, prompt_quick_context)))
         }
         Err(error)
@@ -3658,6 +3694,105 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn prepare_ocr_queue() -> Result<(), String> {
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &key)?;
+    scrypuppy_core::ocr::recover_interrupted_jobs(&conn)?;
+    scrypuppy_core::ocr::enqueue_pending_jobs(&conn)?;
+    drop(conn);
+    start_ocr_worker();
+    Ok(())
+}
+
+fn start_ocr_worker() {
+    if OCR_WORKER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(|| {
+        let mut worker_failed = false;
+        loop {
+            let job = (|| -> Result<Option<(String, PathBuf, PathBuf)>, String> {
+                let (path, key) = default_database_credentials()?;
+                let mut conn = open_existing_read_write(&path, &key)?;
+                let Some((capture_id, asset_path)) =
+                    scrypuppy_core::ocr::claim_next_job(&mut conn)?
+                else {
+                    return Ok(None);
+                };
+                let app_dir = path
+                    .parent()
+                    .ok_or("Diretório da biblioteca indisponível.")?
+                    .to_path_buf();
+                Ok(Some((capture_id, PathBuf::from(asset_path), app_dir)))
+            })();
+            let (capture_id, asset_path, app_dir) = match job {
+                Ok(Some(job)) => job,
+                Ok(None) => break,
+                Err(error) => {
+                    worker_failed = true;
+                    eprintln!("Fila local de OCR indisponível: {error}");
+                    break;
+                }
+            };
+            let preview_root = app_dir.join("assets");
+            let result = scrypuppy_core::preview::read_managed_asset(&preview_root, &asset_path)
+                .map_err(|error| format!("Imagem local indisponível para OCR: {error:?}"))
+                .and_then(|_| scrypuppy_core::ocr::run_local(&asset_path));
+            let (path, key) = match default_database_credentials() {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    worker_failed = true;
+                    eprintln!("Não foi possível salvar o resultado de OCR: {error}");
+                    break;
+                }
+            };
+            let mut conn = match open_existing_read_write(&path, &key) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    worker_failed = true;
+                    eprintln!("Não foi possível abrir a biblioteca para salvar OCR: {error}");
+                    break;
+                }
+            };
+            match scrypuppy_core::ocr::finish_job(&mut conn, &capture_id, result) {
+                Ok(context_ids) => {
+                    if let Err(error) =
+                        sync_context_exports_for_capture(&conn, &app_dir, &context_ids)
+                    {
+                        eprintln!("OCR salvo, mas export de Contexto indisponível: {error}");
+                    }
+                    send_clipboard_message(Message::OcrUpdated(capture_id.clone()));
+                }
+                Err(error) => {
+                    worker_failed = true;
+                    eprintln!("Falha ao salvar resultado de OCR: {error}");
+                    break;
+                }
+            }
+        }
+        OCR_WORKER_RUNNING.store(false, Ordering::Release);
+        let queued = default_database_credentials()
+            .ok()
+            .and_then(|(path, key)| {
+                open_existing_read_only(&path, &key).ok().and_then(|conn| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM ocr_jobs WHERE status = 'queued')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .ok()
+                })
+            })
+            .unwrap_or(false);
+        if queued && !worker_failed {
+            start_ocr_worker();
+        }
+    });
 }
 
 fn paste_saved_capture(capture_id: String, target: isize) -> Result<(), String> {

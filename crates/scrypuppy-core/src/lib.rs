@@ -13,6 +13,7 @@ pub mod link_fetch;
 pub mod link_metadata;
 pub mod local_search;
 pub mod monitor;
+pub mod ocr;
 pub mod preview;
 pub mod restore;
 pub mod schema;
