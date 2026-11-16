@@ -841,6 +841,7 @@ impl App {
                     return Task::none();
                 }
                 self.action_busy = true;
+                self.notice = Some("Salvando resposta e fontes…".into());
                 Task::perform(
                     async move { save_answer_as_document(&query, &answer) },
                     Message::AnswerSavedAsDocument,
@@ -869,6 +870,7 @@ impl App {
                     return Task::none();
                 }
                 self.action_busy = true;
+                self.notice = Some("Gerando documento a partir das fontes selecionadas…".into());
                 Task::perform(
                     async move {
                         let (sender, receiver) = iced::futures::channel::oneshot::channel();
@@ -3807,7 +3809,7 @@ fn answer_library_question(
             app: None,
             date_from: None,
             date_to: None,
-            limit: Some(6),
+            limit: Some(12),
         },
     )
 }

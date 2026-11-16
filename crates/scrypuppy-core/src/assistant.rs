@@ -614,52 +614,95 @@ pub fn generate_document_markdown(
         return Err("Não há fontes suficientes para gerar este documento.".into());
     }
     let portuguese = settings.language == "pt-BR";
-    let evidence = answer
-        .evidence
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            format!(
-                "Fonte {} [capture:{}]\nData: {}\nContexto: {}\nAplicativo: {}\nJanela: {}\nTrecho: {}",
-                index + 1,
-                item.capture_id,
-                item.captured_at,
-                item.context_names.join(", "),
-                item.app_name.as_deref().unwrap_or("desconhecido"),
-                item.window_title.as_deref().unwrap_or("desconhecida"),
-                redact_sensitive_values(&item.excerpt),
+    generate_document_markdown_with(query, answer, portuguese, |system, prompt| {
+        crate::ai::call_provider(
+            &settings.provider,
+            &settings.api_key,
+            &settings.model,
+            system,
+            prompt,
+        )
+    })
+}
+
+fn generate_document_markdown_with<F>(
+    query: &str,
+    answer: &ChatAnswer,
+    portuguese: bool,
+    mut call_provider: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    let evidence_batches = answer.evidence.chunks(6).collect::<Vec<_>>();
+    let mut notes = Vec::with_capacity(evidence_batches.len());
+    for (batch_index, batch) in evidence_batches.iter().enumerate() {
+        let evidence = batch
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!(
+                    "Source {} [capture:{}]\nDate: {}\nContext: {}\nApplication: {}\nWindow: {}\nExcerpt: {}",
+                    batch_index * 6 + index + 1,
+                    item.capture_id,
+                    item.captured_at,
+                    item.context_names.join(", "),
+                    item.app_name.as_deref().unwrap_or("unknown"),
+                    item.window_title.as_deref().unwrap_or("unknown"),
+                    redact_sensitive_values(&item.excerpt),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (system, prompt) = if portuguese {
+            (
+                "Extraia fatos e relações úteis para um documento. Escreva em português brasileiro. Use apenas estas fontes e preserve as citações [capture:ID]. Não invente fatos.",
+                format!(
+                    "Pedido: {}\n\nLote {}/{} de evidências:\n{}",
+                    redact_sensitive_values(query),
+                    batch_index + 1,
+                    evidence_batches.len(),
+                    evidence
+                ),
             )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        } else {
+            (
+                "Extract useful facts and relationships for a document. Use only these sources and preserve the [capture:ID] citations. Do not invent facts.",
+                format!(
+                    "Request: {}\n\nEvidence batch {}/{}:\n{}",
+                    redact_sensitive_values(query),
+                    batch_index + 1,
+                    evidence_batches.len(),
+                    evidence
+                ),
+            )
+        };
+        notes.push(call_provider(system, &redact_sensitive_values(&prompt))?);
+    }
+
+    let notes = notes.join("\n\n---\n\n");
     let (system, prompt) = if portuguese {
         (
-            "Escreva em português brasileiro um documento Markdown claro, bem estruturado e útil. Use apenas as fontes fornecidas. Não invente fatos. Identifique afirmações com as referências [capture:ID] correspondentes e termine com uma seção Fontes.",
+            "Escreva em português brasileiro um documento Markdown claro, bem estruturado e útil. Use somente as notas e citações fornecidas. Não invente fatos. Identifique afirmações com [capture:ID] e termine com uma seção Fontes.",
             format!(
-                "Pedido: {}\n\nSíntese preliminar: {}\n\nEvidências locais:\n{}\n\nGere o documento final com título e subtítulos quando forem úteis.",
+                "Pedido: {}\n\nSíntese preliminar: {}\n\nNotas extraídas das capturas locais:\n{}\n\nGere o documento final com título e subtítulos quando forem úteis.",
                 redact_sensitive_values(query),
                 redact_sensitive_values(&answer.answer),
-                evidence
+                notes
             ),
         )
     } else {
         (
-            "Write a clear, useful, well-structured Markdown document in English. Use only the supplied evidence. Do not invent facts. Mark claims with matching [capture:ID] references and end with a Sources section.",
+            "Write a clear, useful, well-structured Markdown document in English. Use only the supplied notes and citations. Do not invent facts. Mark claims with [capture:ID] references and end with a Sources section.",
             format!(
-                "Request: {}\n\nPreliminary synthesis: {}\n\nLocal evidence:\n{}\n\nWrite the final document with a title and useful section headings.",
+                "Request: {}\n\nPreliminary synthesis: {}\n\nNotes extracted from local captures:\n{}\n\nWrite the final document with a title and useful section headings.",
                 redact_sensitive_values(query),
                 redact_sensitive_values(&answer.answer),
-                evidence
+                notes
             ),
         )
     };
-    crate::ai::call_provider(
-        &settings.provider,
-        &settings.api_key,
-        &settings.model,
-        &redact_sensitive_values(system),
-        &redact_sensitive_values(&prompt),
-    )
+    call_provider(system, &redact_sensitive_values(&prompt))
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -930,7 +973,8 @@ fn secret_pattern() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_chat, generate_document_markdown, AssistantSettings, ChatAnswer, ChatRequest,
+        answer_chat, generate_document_markdown, generate_document_markdown_with,
+        AssistantSettings, ChatAnswer, ChatRequest, EvidenceItem,
     };
     use crate::{
         capture_store::save_clipboard_capture,
@@ -1081,5 +1125,52 @@ mod tests {
         assert!(generate_document_markdown(&no_key, "Pedido", &answer)
             .unwrap_err()
             .contains("chave de API"));
+    }
+
+    #[test]
+    fn document_generation_batches_sources_and_redacts_provider_prompts() {
+        let answer = ChatAnswer {
+            answer: "Síntese com sk-proj-abcdefghijklmnop".into(),
+            confidence: "high".into(),
+            evidence: (0..7)
+                .map(|index| EvidenceItem {
+                    capture_id: format!("capture-{index}"),
+                    captured_at: "2026-11-01".into(),
+                    context_names: vec!["Trabalho".into()],
+                    app_name: Some("Editor".into()),
+                    application_id: None,
+                    window_title: None,
+                    excerpt: if index == 6 {
+                        "Plano sk-proj-abcdefghijklmnop".into()
+                    } else {
+                        format!("Item {index}")
+                    },
+                    matched_fields: vec!["text".into()],
+                })
+                .collect(),
+        };
+        let mut prompts = Vec::new();
+        let generated = generate_document_markdown_with(
+            "Resumo sk-proj-abcdefghijklmnop",
+            &answer,
+            true,
+            |system, prompt| {
+                prompts.push((system.to_string(), prompt.to_string()));
+                Ok(format!("Lote {}", prompts.len()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generated, "Lote 3");
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].1.contains("capture:capture-0"));
+        assert!(!prompts[0].1.contains("capture:capture-6"));
+        assert!(prompts[1].1.contains("capture:capture-6"));
+        assert!(prompts
+            .iter()
+            .all(|(_, prompt)| !prompt.contains("sk-proj-")));
+        assert!(prompts
+            .iter()
+            .any(|(_, prompt)| prompt.contains("[redigido]")));
     }
 }
