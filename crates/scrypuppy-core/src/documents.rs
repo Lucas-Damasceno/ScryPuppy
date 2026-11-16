@@ -45,6 +45,17 @@ pub fn save_answer(
     answer: &ChatAnswer,
     title: Option<&str>,
 ) -> Result<Document, String> {
+    save_answer_revision(conn, query, answer, title, None)
+}
+
+/// Saves another revision under the same document root when `previous_id` is set.
+pub fn save_answer_revision(
+    conn: &Connection,
+    query: &str,
+    answer: &ChatAnswer,
+    title: Option<&str>,
+    previous_id: Option<&str>,
+) -> Result<Document, String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("A pergunta do documento não pode ficar vazia.".into());
@@ -52,15 +63,41 @@ pub fn save_answer(
     if answer.answer.trim().is_empty() {
         return Err("O documento não pode ficar vazio.".into());
     }
+    let id = Uuid::new_v4().to_string();
+    let (root_id, version, carried_title) = if let Some(previous_id) = previous_id {
+        let root_id = conn
+            .query_row(
+                "SELECT root_id FROM magic_search_documents WHERE id = ?1",
+                [previous_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "Documento anterior não encontrado.".to_string())?;
+        let version = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM magic_search_documents WHERE root_id = ?1",
+                [&root_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let carried_title = conn
+            .query_row(
+                "SELECT title FROM magic_search_documents WHERE root_id = ?1 ORDER BY version DESC LIMIT 1",
+                [&root_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        (root_id, version, carried_title)
+    } else {
+        (id.clone(), 1, None)
+    };
     let title = title
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or(carried_title.as_deref())
         .unwrap_or(query)
         .chars()
         .take(120)
         .collect::<String>();
-    let root_id = Uuid::new_v4().to_string();
-    let id = Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
     let markdown = format!(
         "# {title}\n\n**Pergunta:** {query}\n\n{}\n\n## Fontes\n{}",
@@ -95,16 +132,19 @@ pub fn save_answer(
         "context_ids": [],
         "include_knowledge_base": false,
         "include_inbox": false,
+        "previous_document_id": previous_id,
         "response_mode": "direct"
     });
     conn.execute(
         "INSERT INTO magic_search_documents
          (id, root_id, previous_document_id, version, title, query, markdown, provider, model,
           filters_json, generation_warning, evidence_count, created_at)
-         VALUES (?1, ?2, NULL, 1, ?3, ?4, ?5, 'local', 'evidence-assistant', ?6, NULL, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'local', 'evidence-assistant', ?8, NULL, ?9, ?10)",
         params![
             id,
             root_id,
+            previous_id,
+            version,
             title,
             query,
             markdown,
@@ -295,7 +335,21 @@ mod tests {
         assert!(document.markdown.contains("## Fontes"));
         update_markdown(&conn, &document.id, "# Revisado").unwrap();
         assert_eq!(get(&conn, &document.id).unwrap().markdown, "# Revisado");
-        assert_eq!(list(&conn).unwrap().len(), 1);
+        let revision =
+            save_answer_revision(&conn, "Qual é o prazo?", &answer, None, Some(&document.id))
+                .unwrap();
+        assert_eq!(revision.root_id, document.root_id);
+        assert_eq!(revision.version, 2);
+        assert_eq!(revision.title, document.title);
+        let previous_id: Option<String> = conn
+            .query_row(
+                "SELECT previous_document_id FROM magic_search_documents WHERE id = ?1",
+                [&revision.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous_id.as_deref(), Some(document.id.as_str()));
+        assert_eq!(list(&conn).unwrap().len(), 2);
         conn.execute("DELETE FROM captures WHERE id = 'source-1'", [])
             .unwrap();
         assert!(!get(&conn, &document.id).unwrap().evidence[0].available);

@@ -7789,6 +7789,24 @@ mod tests {
         assert_eq!(loaded.response_mode, "direct");
         assert_eq!(loaded.query, "Quando será a revisão?");
         assert!(loaded.markdown.contains("sexta-feira"));
+
+        let revised = scrypuppy_core::documents::save_answer_revision(
+            &conn,
+            "Quando será a revisão?",
+            &answer,
+            None,
+            Some(&created.id),
+        )
+        .expect("Iced saves a revision in the shared schema");
+        let loaded_revision = get_magic_search_document(&conn, &revised.id)
+            .expect("Tauri Magic Search reads the Iced revision");
+        assert_eq!(loaded_revision.root_id, created.root_id);
+        assert_eq!(loaded_revision.version, 2);
+        assert_eq!(
+            loaded_revision.previous_document_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        assert_eq!(loaded_revision.response_mode, "direct");
     }
 
     #[test]

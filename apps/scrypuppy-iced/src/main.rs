@@ -362,6 +362,8 @@ enum Message {
     AssistantAnswered(u64, Result<scrypuppy_core::assistant::ChatAnswer, String>),
     SaveAnswerAsDocument,
     AnswerSavedAsDocument(Result<scrypuppy_core::documents::Document, String>),
+    SaveAnswerAsNewVersion,
+    AnswerSavedAsNewVersion(Result<scrypuppy_core::documents::Document, String>),
     GenerateAiDocument,
     AiDocumentGenerated(Result<scrypuppy_core::documents::Document, String>),
     OpenSavedDocument(String),
@@ -868,6 +870,39 @@ impl App {
                 match result {
                     Ok(document) => {
                         self.notice = Some(format!("Documento salvo: {}", document.title));
+                        return self.reload();
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::SaveAnswerAsNewVersion => {
+                let (Some(answer), Some(document), query) = (
+                    self.assistant_answer.clone(),
+                    self.selected_document.clone(),
+                    self.assistant_query.trim().to_string(),
+                ) else {
+                    return Task::none();
+                };
+                if self.is_demo_mode() {
+                    self.notice = Some("Versionamento desativado no modo de demonstração.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                self.notice = Some("Salvando nova versão do documento…".into());
+                Task::perform(
+                    async move { save_answer_as_new_document_version(&query, &answer, &document.id) },
+                    Message::AnswerSavedAsNewVersion,
+                )
+            }
+            Message::AnswerSavedAsNewVersion(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(document) => {
+                        self.document_editor = text_editor::Content::with_text(&document.markdown);
+                        self.selected_document = Some(document.clone());
+                        self.notice =
+                            Some(format!("Versão {} do documento salva.", document.version));
                         return self.reload();
                     }
                     Err(error) => self.error = Some(error),
@@ -2534,6 +2569,10 @@ impl App {
                     text_editor(&self.document_editor)
                         .on_action(Message::EditDocument)
                         .height(Length::Fixed(220.0)),
+                    button("Salvar resposta atual como nova versão").on_press_maybe(
+                        (self.assistant_answer.is_some() && !self.action_busy)
+                            .then_some(Message::SaveAnswerAsNewVersion),
+                    ),
                     button(if self.action_busy {
                         "Salvando documento…"
                     } else {
@@ -3857,6 +3896,25 @@ fn save_answer_as_document(
     let mut conn = open_existing_read_write(&path, &database_key)?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
     let document = scrypuppy_core::documents::save_answer(&transaction, query, answer, None)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(document)
+}
+
+fn save_answer_as_new_document_version(
+    query: &str,
+    answer: &scrypuppy_core::assistant::ChatAnswer,
+    previous_id: &str,
+) -> Result<scrypuppy_core::documents::Document, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let document = scrypuppy_core::documents::save_answer_revision(
+        &transaction,
+        query,
+        answer,
+        None,
+        Some(previous_id),
+    )?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(document)
 }
