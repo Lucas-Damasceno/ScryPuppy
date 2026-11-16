@@ -247,6 +247,11 @@ struct App {
     new_rule_name: String,
     new_rule_conditions: Vec<String>,
     new_rule_match_mode: String,
+    new_rule_field: String,
+    new_rule_operator: String,
+    rule_preview_revision: u64,
+    rule_preview: Option<(u64, String, usize)>,
+    rule_preview_loading: bool,
     new_tag: String,
     launch_at_startup: bool,
     autostart_changed: bool,
@@ -315,8 +320,12 @@ enum Message {
     AddRuleCondition,
     RemoveRuleCondition,
     ToggleRuleMatchMode,
+    CycleRuleField,
+    CycleRuleOperator,
+    PreviewContextRule,
+    ContextRulePreviewLoaded(u64, String, Result<usize, String>),
     CreateContextRule,
-    ContextRuleCreated(Result<(), String>),
+    ContextRuleCreated(Result<usize, String>),
     ToggleContextRule(String, bool),
     DeleteContextRule(String),
     ContextRuleChanged(Result<(), String>),
@@ -383,6 +392,12 @@ enum Message {
 }
 
 impl App {
+    fn invalidate_rule_preview(&mut self) {
+        self.rule_preview_revision = self.rule_preview_revision.wrapping_add(1);
+        self.rule_preview = None;
+        self.rule_preview_loading = false;
+    }
+
     fn is_demo_mode(&self) -> bool {
         #[cfg(debug_assertions)]
         {
@@ -415,6 +430,11 @@ impl App {
             new_rule_name: String::new(),
             new_rule_conditions: vec![String::new()],
             new_rule_match_mode: "all".into(),
+            new_rule_field: "text".into(),
+            new_rule_operator: "contains".into(),
+            rule_preview_revision: 0,
+            rule_preview: None,
+            rule_preview_loading: false,
             new_tag: String::new(),
             launch_at_startup: false,
             autostart_changed: false,
@@ -697,6 +717,9 @@ impl App {
                 }
             }
             Message::SelectContext(id) => {
+                if id != self.context {
+                    self.invalidate_rule_preview();
+                }
                 self.context = id;
                 self.offset = 0;
                 self.selected_capture = None;
@@ -759,23 +782,27 @@ impl App {
             }
             Message::NewRuleNameChanged(value) => {
                 self.new_rule_name = value;
+                self.invalidate_rule_preview();
                 Task::none()
             }
             Message::NewRuleConditionChanged(index, value) => {
                 if let Some(condition) = self.new_rule_conditions.get_mut(index) {
                     *condition = value;
                 }
+                self.invalidate_rule_preview();
                 Task::none()
             }
             Message::AddRuleCondition => {
                 if self.new_rule_conditions.len() < 12 {
                     self.new_rule_conditions.push(String::new());
+                    self.invalidate_rule_preview();
                 }
                 Task::none()
             }
             Message::RemoveRuleCondition => {
                 if self.new_rule_conditions.len() > 1 {
                     self.new_rule_conditions.pop();
+                    self.invalidate_rule_preview();
                 }
                 Task::none()
             }
@@ -786,6 +813,84 @@ impl App {
                     "all"
                 }
                 .into();
+                self.invalidate_rule_preview();
+                Task::none()
+            }
+            Message::CycleRuleField => {
+                let fields = [
+                    "text",
+                    "application",
+                    "window_title",
+                    "content_type",
+                    "file_extension",
+                    "file_path",
+                ];
+                let index = fields
+                    .iter()
+                    .position(|field| *field == self.new_rule_field)
+                    .unwrap_or(0);
+                self.new_rule_field = fields[(index + 1) % fields.len()].into();
+                self.invalidate_rule_preview();
+                Task::none()
+            }
+            Message::CycleRuleOperator => {
+                let operators = ["contains", "equals", "matches"];
+                let index = operators
+                    .iter()
+                    .position(|operator| *operator == self.new_rule_operator)
+                    .unwrap_or(0);
+                self.new_rule_operator = operators[(index + 1) % operators.len()].into();
+                self.invalidate_rule_preview();
+                Task::none()
+            }
+            Message::PreviewContextRule => {
+                let Some(context_id) = self.context.clone() else {
+                    return Task::none();
+                };
+                let conditions = self
+                    .new_rule_conditions
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .collect::<Vec<_>>();
+                if conditions.is_empty()
+                    || conditions.len() > 12
+                    || conditions.iter().any(String::is_empty)
+                {
+                    self.notice =
+                        Some("Preencha todas as condições antes de gerar a prévia.".into());
+                    return Task::none();
+                }
+                let field = self.new_rule_field.clone();
+                let operator = self.new_rule_operator.clone();
+                let mode = self.new_rule_match_mode.clone();
+                self.rule_preview_revision = self.rule_preview_revision.wrapping_add(1);
+                let revision = self.rule_preview_revision;
+                self.rule_preview = None;
+                self.rule_preview_loading = true;
+                let task_context_id = context_id.clone();
+                Task::perform(
+                    async move {
+                        preview_context_rule(
+                            &task_context_id,
+                            &conditions,
+                            &mode,
+                            &field,
+                            &operator,
+                        )
+                    },
+                    move |result| Message::ContextRulePreviewLoaded(revision, context_id, result),
+                )
+            }
+            Message::ContextRulePreviewLoaded(revision, context_id, result) => {
+                if revision == self.rule_preview_revision
+                    && self.context.as_deref() == Some(context_id.as_str())
+                {
+                    self.rule_preview_loading = false;
+                    match result {
+                        Ok(count) => self.rule_preview = Some((revision, context_id, count)),
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
                 Task::none()
             }
             Message::CreateContextRule => {
@@ -797,6 +902,17 @@ impl App {
                 let Some(context_id) = self.context.clone() else {
                     return Task::none();
                 };
+                if !self
+                    .rule_preview
+                    .as_ref()
+                    .is_some_and(|(revision, context, _)| {
+                        *revision == self.rule_preview_revision && context == &context_id
+                    })
+                {
+                    self.notice =
+                        Some("Gere uma prévia atualizada antes de salvar a regra.".into());
+                    return Task::none();
+                }
                 let name = self.new_rule_name.trim().to_string();
                 let conditions = self
                     .new_rule_conditions
@@ -804,13 +920,22 @@ impl App {
                     .map(|value| value.trim().to_string())
                     .collect::<Vec<_>>();
                 let match_mode = self.new_rule_match_mode.clone();
+                let field = self.new_rule_field.clone();
+                let operator = self.new_rule_operator.clone();
                 if name.is_empty() || conditions.iter().any(String::is_empty) || self.action_busy {
                     return Task::none();
                 }
                 self.action_busy = true;
                 Task::perform(
                     async move {
-                        create_text_context_rule(&context_id, &name, &conditions, &match_mode)
+                        create_text_context_rule(
+                            &context_id,
+                            &name,
+                            &conditions,
+                            &match_mode,
+                            &field,
+                            &operator,
+                        )
                     },
                     Message::ContextRuleCreated,
                 )
@@ -818,10 +943,13 @@ impl App {
             Message::ContextRuleCreated(result) => {
                 self.action_busy = false;
                 match result {
-                    Ok(()) => {
+                    Ok(count) => {
                         self.new_rule_name.clear();
                         self.new_rule_conditions = vec![String::new()];
-                        self.notice = Some("Regra automática criada.".into());
+                        self.invalidate_rule_preview();
+                        self.notice = Some(format!(
+                            "Regra automática criada e aplicada a {count} capturas."
+                        ));
                     }
                     Err(error) => self.notice = Some(error),
                 }
@@ -1693,6 +1821,14 @@ impl App {
                             text_input("Nome da regra", &self.new_rule_name)
                                 .on_input(Message::NewRuleNameChanged)
                                 .padding(8),
+                        )
+                        .push(
+                            button(text(format!("Campo: {}", self.new_rule_field)))
+                                .on_press(Message::CycleRuleField),
+                        )
+                        .push(
+                            button(text(format!("Operador: {}", self.new_rule_operator)))
+                                .on_press(Message::CycleRuleOperator),
                         );
                     for (index, condition) in self.new_rule_conditions.iter().enumerate() {
                         navigation = navigation.push(
@@ -1710,10 +1846,35 @@ impl App {
                         ].spacing(5))
                         .push(button(if self.new_rule_match_mode == "all" { "Combinar: todas (E)" } else { "Combinar: qualquer (OU)" })
                             .on_press(Message::ToggleRuleMatchMode))
-                        .push(text("As condições comparam o texto da captura e valem para as próximas capturas.").size(10))
-                        .push(button("Criar regra de texto")
-                            .on_press_maybe((!self.action_busy).then_some(Message::CreateContextRule))
+                        .push(text("Cada condição usa o campo e operador selecionados; novas capturas seguem a regra.").size(10))
+                        .push(button(if self.rule_preview_loading { "Calculando prévia…" } else { "Prévia das capturas" })
+                            .on_press_maybe((!self.rule_preview_loading && !self.action_busy).then_some(Message::PreviewContextRule))
                             .width(Length::Fill));
+                    let preview_ready = if let Some((revision, preview_context, count)) =
+                        &self.rule_preview
+                    {
+                        if *revision == self.rule_preview_revision && preview_context == context_id
+                        {
+                            navigation = navigation.push(text(format!("A regra corresponderá a {count} capturas ainda não vinculadas a este Contexto.")).size(10));
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    navigation = navigation.push(
+                        button(if self.action_busy {
+                            "Salvando regra…"
+                        } else {
+                            "Salvar regra"
+                        })
+                        .on_press_maybe(
+                            (preview_ready && !self.action_busy)
+                                .then_some(Message::CreateContextRule),
+                        )
+                        .width(Length::Fill),
+                    );
                     if let Some(snapshot) = &self.snapshot {
                         for rule in snapshot
                             .context_rules
@@ -3263,21 +3424,110 @@ fn update_capture_tag(capture_id: &str, raw_tag: &str, remove: bool) -> Result<(
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)
 }
 
+fn preview_context_rule(
+    context_id: &str,
+    values: &[String],
+    match_mode: &str,
+    field: &str,
+    operator: &str,
+) -> Result<usize, String> {
+    if !matches!(match_mode, "all" | "any")
+        || !matches!(
+            field,
+            "text"
+                | "application"
+                | "window_title"
+                | "content_type"
+                | "file_extension"
+                | "file_path"
+        )
+        || !matches!(operator, "contains" | "equals" | "matches")
+        || values.is_empty()
+        || values.len() > 12
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.trim().chars().count() > 500)
+        || (operator == "matches"
+            && values.iter().any(|value| {
+                regex::RegexBuilder::new(value.trim())
+                    .case_insensitive(true)
+                    .build()
+                    .is_err()
+            }))
+    {
+        return Err("Revise o campo, operador e condições da regra.".into());
+    }
+    let (path, key) = default_database_credentials()?;
+    let conn = open_existing_read_only(&path, &key)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM captures c WHERE NOT EXISTS (
+             SELECT 1 FROM capture_contexts cc WHERE cc.capture_id = c.id AND cc.context_id = ?1
+         ) ORDER BY c.captured_at DESC, c.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let ids = stmt
+        .query_map([context_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+    let conditions = values
+        .iter()
+        .map(|value| {
+            (
+                field.to_string(),
+                operator.to_string(),
+                value.trim().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut matched = 0;
+    for id in ids {
+        let capture = scrypuppy_core::library::get_capture_by_id(&conn, &id)?;
+        matched += usize::from(scrypuppy_core::context_rules::matches_rule(
+            &capture,
+            &conditions,
+            match_mode,
+        ));
+    }
+    Ok(matched)
+}
+
 fn create_text_context_rule(
     context_id: &str,
     name: &str,
     values: &[String],
     match_mode: &str,
-) -> Result<(), String> {
+    field: &str,
+    operator: &str,
+) -> Result<usize, String> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > 80
         || values.is_empty()
         || values.len() > 12
         || !matches!(match_mode, "all" | "any")
+        || !matches!(
+            field,
+            "text"
+                | "application"
+                | "window_title"
+                | "content_type"
+                | "file_extension"
+                | "file_path"
+        )
+        || !matches!(operator, "contains" | "equals" | "matches")
         || values
             .iter()
             .any(|value| value.trim().is_empty() || value.trim().chars().count() > 500)
+        || (operator == "matches"
+            && values.iter().any(|value| {
+                regex::RegexBuilder::new(value.trim())
+                    .case_insensitive(true)
+                    .build()
+                    .is_err()
+            }))
     {
         return Err("Informe um nome (até 80 caracteres) e até 12 condições de texto (até 500 caracteres cada).".into());
     }
@@ -3304,11 +3554,39 @@ fn create_text_context_rule(
     for (ordinal, value) in values.iter().enumerate() {
         transaction.execute(
             "INSERT INTO context_rule_conditions (id, rule_id, ordinal, field, operator, value, created_at)
-             VALUES (?1, ?2, ?3, 'text', 'contains', ?4, ?5)",
-            rusqlite::params![uuid::Uuid::new_v4().to_string(), id, ordinal as i64, value.trim(), at],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), id, ordinal as i64, field, operator, value.trim(), at],
         ).map_err(|e| e.to_string())?;
     }
-    transaction.commit().map_err(|e| e.to_string())
+    transaction.commit().map_err(|e| e.to_string())?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM captures c WHERE NOT EXISTS (
+             SELECT 1 FROM capture_contexts cc WHERE cc.capture_id = c.id AND cc.context_id = ?1
+         ) ORDER BY c.captured_at DESC, c.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let capture_ids = stmt
+        .query_map([context_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+    let mut added = 0;
+    for capture_id in capture_ids {
+        let assigned = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &capture_id)?;
+        if assigned
+            .iter()
+            .any(|assigned_context| assigned_context == context_id)
+        {
+            added += 1;
+        }
+        sync_context_exports_for_capture(&conn, app_dir, &assigned)?;
+    }
+    Ok(added)
 }
 
 fn set_context_rule_enabled(id: &str, enabled: bool) -> Result<(), String> {
@@ -4275,7 +4553,8 @@ fn load_library(
     let context_rules = {
         let mut stmt = conn
             .prepare(
-                "SELECT r.id, r.context_id, r.name, r.enabled, COALESCE(c.value, '')
+                "SELECT r.id, r.context_id, r.name, r.enabled,
+                        COALESCE(c.field || ' ' || c.operator || ': ' || c.value, '')
              FROM context_rules r LEFT JOIN context_rule_conditions c
              ON c.rule_id = r.id AND c.ordinal = 0 ORDER BY r.created_at",
             )

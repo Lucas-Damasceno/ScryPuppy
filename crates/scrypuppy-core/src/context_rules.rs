@@ -63,17 +63,21 @@ pub fn apply_enabled_rules(conn: &Connection, capture_id: &str) -> Result<Vec<St
     let at = chrono::Utc::now().to_rfc3339();
     let mut assigned = Vec::new();
     for rule in rules.values() {
-        let matched = if rule.match_mode == "any" {
-            rule.conditions
+        let matched = matches_rule(
+            &capture,
+            &rule
+                .conditions
                 .iter()
-                .any(|condition| condition_matches(&capture, condition))
-        } else {
-            !rule.conditions.is_empty()
-                && rule
-                    .conditions
-                    .iter()
-                    .all(|condition| condition_matches(&capture, condition))
-        };
+                .map(|condition| {
+                    (
+                        condition.field.clone(),
+                        condition.operator.clone(),
+                        condition.value.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &rule.match_mode,
+        );
         if matched
             && conn
                 .execute(
@@ -94,6 +98,33 @@ pub fn apply_enabled_rules(conn: &Connection, capture_id: &str) -> Result<Vec<St
         search_index::refresh_search_document(conn, capture_id, &at)?;
     }
     Ok(assigned)
+}
+
+/// Evaluate a draft rule with the same matcher used for stored rules.
+pub fn matches_rule(
+    capture: &crate::library::CaptureDto,
+    conditions: &[(String, String, String)],
+    match_mode: &str,
+) -> bool {
+    let conditions = conditions
+        .iter()
+        .map(|(field, operator, value)| Condition {
+            field: field.clone(),
+            operator: operator.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    if match_mode == "any" {
+        !conditions.is_empty()
+            && conditions
+                .iter()
+                .any(|condition| condition_matches(capture, condition))
+    } else {
+        !conditions.is_empty()
+            && conditions
+                .iter()
+                .all(|condition| condition_matches(capture, condition))
+    }
 }
 
 fn condition_matches(capture: &crate::library::CaptureDto, condition: &Condition) -> bool {
@@ -197,7 +228,7 @@ fn content_types(capture: &crate::library::CaptureDto) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_enabled_rules;
+    use super::{apply_enabled_rules, matches_rule};
     use crate::{
         capture_store::save_clipboard_capture,
         clipboard::{ClipboardRepresentation, ClipboardSnapshot},
@@ -247,6 +278,14 @@ mod tests {
 
         assert_eq!(assigned, ["work"]);
         let capture = get_capture_by_id(&conn, &capture_id).unwrap();
+        assert!(matches_rule(
+            &capture,
+            &[
+                ("text".into(), "matches".into(), "launch.*notes".into()),
+                ("content_type".into(), "equals".into(), "text".into()),
+            ],
+            "all",
+        ));
         assert_eq!(capture.contexts[0].assignment_origin, "automatic");
         let indexed_metadata: String = conn
             .query_row(

@@ -4800,6 +4800,7 @@ dependencies = [
  "image",
  "keyring",
  "raw-window-handle",
+ "regex",
  "rusqlite",
  "scrypuppy-core",
  "tempfile",
