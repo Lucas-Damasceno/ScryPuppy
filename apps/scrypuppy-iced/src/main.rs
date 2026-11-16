@@ -204,6 +204,8 @@ fn localized_ui_text(value: &str, english: bool) -> String {
         "Verificar atualizações assinadas" => "Check for signed updates".into(),
         "Baixar atualização" => "Download update".into(),
         "Instalar atualização e reiniciar" => "Install update and restart".into(),
+        "Agora não" => "Later".into(),
+        "Nova versão do ScryPuppy" => "New ScryPuppy version".into(),
         "O canal de atualização e o instalador são validados com assinatura antes de qualquer instalação." => {
             "The update channel and installer are signature-checked before anything is installed.".into()
         }
@@ -473,6 +475,9 @@ fn main() -> iced::Result {
             ];
             if app.local_search.operation_running() {
                 subscriptions.push(iced::Subscription::run(local_search_ticks));
+            }
+            if !app.is_demo_mode() {
+                subscriptions.push(iced::Subscription::run(automatic_update_ticks));
             }
             iced::Subscription::batch(subscriptions)
         })
@@ -794,6 +799,7 @@ struct App {
     update_busy: bool,
     available_update: Option<updater::UpdateInfo>,
     verified_update_installer: Option<PathBuf>,
+    update_notice_dismissed: bool,
     revision: u64,
     snapshot: Option<Snapshot>,
     loading: bool,
@@ -935,10 +941,12 @@ enum Message {
     RetentionCleanupFinished(usize),
     ToggleSettings,
     CheckForUpdates,
-    UpdateCheckFinished(Result<Option<updater::UpdateInfo>, String>),
+    AutomaticUpdateCheck,
+    UpdateCheckFinished(bool, Result<Option<updater::UpdateInfo>, String>),
     DownloadUpdate,
     UpdateDownloadFinished(Result<PathBuf, String>),
     ApplyVerifiedUpdate,
+    DismissUpdateNotice,
     ToggleCaptureScreenshots,
     ToggleMonitorScreenshots,
     ToggleMonitorQuickContext,
@@ -969,6 +977,30 @@ enum Message {
 }
 
 impl App {
+    fn begin_update_check(&mut self, manual: bool) -> Task<Message> {
+        if self.update_busy {
+            return Task::none();
+        }
+        if manual {
+            if let Some(installer) = self.verified_update_installer.take() {
+                let _ = std::fs::remove_file(installer);
+            }
+            self.available_update = None;
+            self.update_notice_dismissed = false;
+        }
+        self.update_busy = true;
+        if manual {
+            self.update_status = if self.assistant_language == "en" {
+                "Checking the signed update channel…".into()
+            } else {
+                "Verificando o canal de atualizações assinado…".into()
+            };
+        }
+        Task::perform(updater::check_for_update(), move |result| {
+            Message::UpdateCheckFinished(manual, result)
+        })
+    }
+
     fn refresh_local_search(&mut self) -> Task<Message> {
         if !self.local_search.installed() {
             return Task::none();
@@ -1110,6 +1142,7 @@ impl App {
             update_busy: false,
             available_update: None,
             verified_update_installer: None,
+            update_notice_dismissed: false,
             revision: 0,
             snapshot: None,
             loading: true,
@@ -2819,31 +2852,30 @@ impl App {
                 )
             }
             Message::CheckForUpdates => {
-                if self.update_busy {
-                    return Task::none();
-                }
                 if self.is_demo_mode() {
                     self.update_status = "Atualizações desativadas no modo de demonstração.".into();
                     return Task::none();
                 }
-                if let Some(installer) = self.verified_update_installer.take() {
-                    let _ = std::fs::remove_file(installer);
-                }
-                self.update_busy = true;
-                self.available_update = None;
-                self.verified_update_installer = None;
-                self.update_status = if self.assistant_language == "en" {
-                    "Checking the signed update channel…".into()
-                } else {
-                    "Verificando o canal de atualizações assinado…".into()
-                };
-                Task::perform(updater::check_for_update(), Message::UpdateCheckFinished)
+                self.begin_update_check(true)
             }
-            Message::UpdateCheckFinished(result) => {
+            Message::AutomaticUpdateCheck => {
+                if self.is_demo_mode() {
+                    return Task::none();
+                }
+                self.begin_update_check(false)
+            }
+            Message::UpdateCheckFinished(manual, result) => {
                 self.update_busy = false;
                 match result {
                     Ok(Some(update)) => {
                         let update_version = update.version.clone();
+                        if self
+                            .available_update
+                            .as_ref()
+                            .is_none_or(|current| current.version != update.version)
+                        {
+                            self.update_notice_dismissed = false;
+                        }
                         self.available_update = Some(update);
                         self.update_status = if self.assistant_language == "en" {
                             format!("Version {update_version} is available.")
@@ -2852,14 +2884,21 @@ impl App {
                         };
                     }
                     Ok(None) => {
+                        self.available_update = None;
+                        self.update_notice_dismissed = false;
                         self.update_status = if self.assistant_language == "en" {
                             "ScryPuppy is up to date.".into()
                         } else {
                             "O ScryPuppy está atualizado.".into()
                         };
                     }
-                    Err(error) => self.update_status = error,
+                    Err(error) if manual => self.update_status = error,
+                    Err(_) => {}
                 }
+                Task::none()
+            }
+            Message::DismissUpdateNotice => {
+                self.update_notice_dismissed = true;
                 Task::none()
             }
             Message::DownloadUpdate => {
@@ -2904,11 +2943,11 @@ impl App {
                     || RETENTION_WORKER_RUNNING.load(Ordering::Relaxed)
                     || DATA_RESET_IN_PROGRESS.load(Ordering::Relaxed)
                 {
-                    self.notice = Some(if self.assistant_language == "en" {
+                    self.update_status = if self.assistant_language == "en" {
                         "Wait for the current library operation to finish before restarting to update.".into()
                     } else {
                         "Aguarde a operação atual da biblioteca terminar antes de reiniciar para atualizar.".into()
-                    });
+                    };
                     return Task::none();
                 }
                 let Some(installer) = self.verified_update_installer.take() else {
@@ -3786,6 +3825,41 @@ impl App {
                 .padding(18)
                 .style(move |_| panel_style(dark, false)),
             );
+        }
+        if !self.settings_open && !self.update_notice_dismissed {
+            if let Some(update) = &self.available_update {
+                let primary_action = if self.verified_update_installer.is_some() {
+                    Message::ApplyVerifiedUpdate
+                } else {
+                    Message::DownloadUpdate
+                };
+                let primary_label = if self.verified_update_installer.is_some() {
+                    "Instalar atualização e reiniciar"
+                } else {
+                    "Baixar atualização"
+                };
+                content = content.push(
+                    container(
+                        column![
+                            text("Nova versão do ScryPuppy").size(16),
+                            text(format!("{} · {}", update.version, update.pub_date)).size(11),
+                            text(update.notes.as_str()).size(12),
+                            text(self.update_status.as_str()).size(11),
+                            row![
+                                button(text(primary_label))
+                                    .on_press_maybe((!self.update_busy).then_some(primary_action)),
+                                button(text("Agora não")).on_press(Message::DismissUpdateNotice),
+                            ]
+                            .spacing(8),
+                        ]
+                        .spacing(8)
+                        .width(Length::Fill),
+                    )
+                    .width(Length::Fill)
+                    .padding(14)
+                    .style(move |_| panel_style(dark, false)),
+                );
+            }
         }
         if !self.settings_open {
             content = content.push(search).push(library_actions);
@@ -4963,6 +5037,51 @@ impl Drop for App {
             let _ = std::fs::remove_file(installer);
         }
     }
+}
+
+fn automatic_update_ticks() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        1,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::{channel::mpsc, sink::SinkExt, StreamExt};
+            let (sender, mut receiver) = mpsc::unbounded();
+            let (cancel_sender, cancel_receiver) = std::sync::mpsc::channel::<()>();
+            thread::spawn(move || {
+                if !matches!(
+                    cancel_receiver.recv_timeout(std::time::Duration::from_secs(8)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                if sender
+                    .unbounded_send(Message::AutomaticUpdateCheck)
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    if !matches!(
+                        cancel_receiver.recv_timeout(std::time::Duration::from_secs(6 * 60 * 60)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        break;
+                    }
+                    if sender
+                        .unbounded_send(Message::AutomaticUpdateCheck)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let _cancel_guard = cancel_sender;
+            while let Some(message) = receiver.next().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
 }
 
 fn local_search_ticks() -> impl iced::futures::Stream<Item = Message> {
