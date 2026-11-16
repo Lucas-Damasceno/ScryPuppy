@@ -575,7 +575,7 @@ enum Message {
     AssignContext(String, String),
     RemoveContext(String, String),
     CaptureClipboard,
-    CaptureReference,
+    CaptureSelection(bool),
     OpenQuickPaste(isize),
     QuickPasteOpened(window::Id),
     FinishQuickPaste,
@@ -614,7 +614,7 @@ enum Message {
     ContextAssigned(u64, Result<(), String>),
     ContextRemoved(u64, Result<(), String>),
     Captured(u64, Result<String, String>),
-    ReferenceCaptured(u64, Result<String, String>),
+    SelectedCaptureSaved(u64, bool, Result<String, String>),
     Pasted(Result<(), String>),
     ThemeSaved(Result<(), String>),
     QuickStyleSaved(Result<(), String>),
@@ -2364,7 +2364,7 @@ impl App {
                     Message::Captured(revision, result)
                 })
             }
-            Message::CaptureReference => {
+            Message::CaptureSelection(is_reference) => {
                 if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
                     return Task::none();
                 }
@@ -2379,9 +2379,12 @@ impl App {
                 self.action_busy = true;
                 self.notice = None;
                 let revision = self.revision;
-                Task::perform(async move { capture_selected_reference() }, move |result| {
-                    Message::ReferenceCaptured(revision, result)
-                })
+                Task::perform(
+                    async move {
+                        capture_selected_content(if is_reference { "reference" } else { "capture" })
+                    },
+                    move |result| Message::SelectedCaptureSaved(revision, is_reference, result),
+                )
             }
             Message::ToggleTheme => {
                 self.dark = !self.dark;
@@ -2982,17 +2985,23 @@ impl App {
                 }
                 self.reload()
             }
-            Message::ReferenceCaptured(revision, result) => {
+            Message::SelectedCaptureSaved(revision, is_reference, result) => {
                 self.action_busy = false;
                 if revision != self.revision {
                     return Task::none();
                 }
                 match result {
                     Ok(id) => {
-                        self.notice = Some("Referência salva na Knowledge Base.".into());
+                        self.notice = Some(if is_reference {
+                            "Referência salva na Knowledge Base.".into()
+                        } else {
+                            "Seleção salva.".into()
+                        });
                         self.selected_capture = Some(id.clone());
                         let refresh = self.refresh_local_search();
-                        if self.quick_context_enabled && self.quick_context_after_reference {
+                        if self.quick_context_enabled
+                            && (!is_reference || self.quick_context_after_reference)
+                        {
                             return Task::batch([
                                 Task::done(Message::OpenQuickContext(id)),
                                 refresh,
@@ -4454,13 +4463,19 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
                             continue;
                         }
                         if Some(event.id) == capture_id {
-                            if sender.unbounded_send(Message::CaptureClipboard).is_err() {
+                            if sender
+                                .unbounded_send(Message::CaptureSelection(false))
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
                         }
                         if Some(event.id) == reference_id {
-                            if sender.unbounded_send(Message::CaptureReference).is_err() {
+                            if sender
+                                .unbounded_send(Message::CaptureSelection(true))
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -6577,7 +6592,7 @@ fn capture_current_clipboard() -> Result<String, String> {
     Ok(id)
 }
 
-fn capture_selected_reference() -> Result<String, String> {
+fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     use std::{thread, time::Duration};
 
@@ -6649,7 +6664,7 @@ fn capture_selected_reference() -> Result<String, String> {
         }
     };
     clipboard.shutdown();
-    if snapshot.files().is_some() {
+    if capture_kind == "reference" && snapshot.files().is_some() {
         if let Some(previous) = previous.as_ref() {
             let _ = restore_reference_clipboard(previous);
         }
@@ -6659,7 +6674,11 @@ fn capture_selected_reference() -> Result<String, String> {
         if let Some(previous) = previous.as_ref() {
             let _ = restore_reference_clipboard(previous);
         }
-        return Err("Selecione texto ou uma imagem antes do atalho de referência.".into());
+        return Err(if capture_kind == "reference" {
+            "Selecione texto ou uma imagem antes do atalho de referência.".into()
+        } else {
+            "Não havia conteúdo selecionado para salvar.".into()
+        });
     }
 
     #[cfg(windows)]
@@ -6681,7 +6700,7 @@ fn capture_selected_reference() -> Result<String, String> {
         &mut conn,
         app_dir,
         &snapshot,
-        "reference",
+        capture_kind,
         scrypuppy_core::capture_store::CaptureSourceMetadata {
             capture_origin: "explicit_hotkey",
             source_app_name: active.app_name.as_deref(),
