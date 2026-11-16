@@ -4350,6 +4350,7 @@ fn library_kind_filter_label(kind: &str) -> &'static str {
     }
 }
 
+#[cfg(debug_assertions)]
 fn matches_library_content_kind(capture: &CaptureDto, filter: &str) -> bool {
     match filter {
         "text" => matches!(
