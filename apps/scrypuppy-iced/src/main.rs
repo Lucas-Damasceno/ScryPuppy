@@ -146,6 +146,16 @@ fn main() -> iced::Result {
                     {
                         Some(Message::QuickPasteToggleStyle(id))
                     }
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::PageDown),
+                        modifiers,
+                        ..
+                    }) if modifiers.control() => Some(Message::QuickPastePage(id, true)),
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::PageUp),
+                        modifiers,
+                        ..
+                    }) if modifiers.control() => Some(Message::QuickPastePage(id, false)),
                     _ => None,
                 }),
                 iced::Subscription::run(hotkey_events),
@@ -595,6 +605,7 @@ enum Message {
     FinishQuickPaste,
     QuickPasteEscape(window::Id),
     QuickPasteToggleStyle(window::Id),
+    QuickPastePage(window::Id, bool),
     OpenQuickContext(String),
     ToggleQuickContextCapture(String),
     AssignQuickContext(String),
@@ -1071,6 +1082,15 @@ impl App {
                     Task::done(Message::ToggleQuickPasteStyle)
                 } else {
                     Task::none()
+                }
+            }
+            Message::QuickPastePage(id, next) => {
+                if self.quick_window != Some(id) {
+                    Task::none()
+                } else if next {
+                    Task::done(Message::NextPage)
+                } else {
+                    Task::done(Message::PreviousPage)
                 }
             }
             Message::OpenQuickContext(capture_id) => {
@@ -4217,7 +4237,7 @@ impl App {
                     .width(Length::Fill),
                 );
             }
-            if snapshot.total > PAGE_SIZE {
+            if !minimal && snapshot.total > PAGE_SIZE {
                 items = items.push(
                     row![
                         button("‹")
