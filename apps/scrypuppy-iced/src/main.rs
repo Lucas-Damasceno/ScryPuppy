@@ -519,6 +519,8 @@ enum Message {
     DeleteContext(String),
     ContextDeleted(Result<(), String>),
     SelectCapture(String),
+    OpenCaptureFile(PathBuf),
+    CaptureFileOpened(Result<(), String>),
     RequestDeleteCapture(String),
     CancelDeleteCapture,
     DeleteCapture(String),
@@ -1765,6 +1767,25 @@ impl App {
             Message::SelectCapture(id) => {
                 self.selected_capture = Some(id);
                 self.assistant_capture = None;
+                Task::none()
+            }
+            Message::OpenCaptureFile(path) => Task::perform(
+                async move {
+                    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                    thread::spawn(move || {
+                        let _ = sender.send(open_capture_file(&path));
+                    });
+                    receiver
+                        .await
+                        .unwrap_or_else(|_| Err("A abertura do arquivo foi interrompida.".into()))
+                },
+                Message::CaptureFileOpened,
+            ),
+            Message::CaptureFileOpened(result) => {
+                match result {
+                    Ok(()) => self.notice = Some("Arquivo aberto no aplicativo padrão.".into()),
+                    Err(error) => self.error = Some(error),
+                }
                 Task::none()
             }
             Message::RequestDeleteCapture(id) => {
@@ -3241,13 +3262,22 @@ impl App {
                         details.push(text(format!("{} · {}", asset.kind, asset.status)).size(11));
                 }
                 for file in &capture.files {
-                    details = details.push(
-                        text(format!(
-                            "Arquivo: {} · {}",
-                            file.display_name, file.availability
-                        ))
-                        .size(12),
-                    );
+                    let mut file_details = column![text(format!(
+                        "Arquivo: {} · {}",
+                        file.display_name, file.availability
+                    ))
+                    .size(12),]
+                    .spacing(4);
+                    if file.availability == "available" {
+                        if let Some(path) = file.local_path.as_ref().or(file.original_path.as_ref())
+                        {
+                            file_details = file_details.push(
+                                button("Abrir arquivo")
+                                    .on_press(Message::OpenCaptureFile(PathBuf::from(path))),
+                            );
+                        }
+                    }
+                    details = details.push(file_details);
                 }
                 if !self.action_busy {
                     for context in snapshot.contexts.iter().filter(|context| {
@@ -4175,6 +4205,60 @@ fn load_capture_by_id(capture_id: &str) -> Result<CaptureDto, String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_only(&path, &database_key)?;
     scrypuppy_core::library::get_capture_by_id(&conn, capture_id)
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    #[link_name = "ShellExecuteW"]
+    fn shell_execute_w(
+        window: *mut std::ffi::c_void,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show_command: i32,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(windows)]
+fn open_capture_file(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if !path.is_absolute() {
+        return Err("O caminho do arquivo não é absoluto.".into());
+    }
+    let operation = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let file = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        shell_execute_w(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    } as isize;
+    if result <= 32 {
+        Err(format!(
+            "O Windows não conseguiu abrir o arquivo ({result})."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn open_capture_file(_: &Path) -> Result<(), String> {
+    Err("A abertura de arquivos está disponível apenas no Windows.".into())
 }
 
 fn save_answer_as_document(
