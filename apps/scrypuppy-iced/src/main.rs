@@ -203,6 +203,11 @@ struct LinkPreviewHandles {
     favicon: Option<iced_image::Handle>,
 }
 
+struct ContextEditor {
+    id: String,
+    name: String,
+}
+
 struct App {
     main: window::Id,
     quick_window: Option<window::Id>,
@@ -214,6 +219,8 @@ struct App {
     query: String,
     context: Option<String>,
     new_context_name: String,
+    context_editor: Option<ContextEditor>,
+    pending_delete_context: Option<String>,
     offset: usize,
     selected_capture: Option<String>,
     pending_delete_capture: Option<String>,
@@ -255,6 +262,15 @@ enum Message {
     NewContextNameChanged(String),
     CreateContext,
     ContextCreated(Result<String, String>),
+    BeginRenameContext(String),
+    ContextEditorNameChanged(String),
+    SaveRenameContext,
+    CancelRenameContext,
+    ContextRenamed(Result<String, String>),
+    RequestDeleteContext(String),
+    CancelDeleteContext,
+    DeleteContext(String),
+    ContextDeleted(Result<(), String>),
     SelectCapture(String),
     RequestDeleteCapture(String),
     CancelDeleteCapture,
@@ -311,6 +327,8 @@ impl App {
             query: String::new(),
             context: None,
             new_context_name: String::new(),
+            context_editor: None,
+            pending_delete_context: None,
             offset: 0,
             selected_capture: None,
             pending_delete_capture: None,
@@ -591,6 +609,91 @@ impl App {
                         self.new_context_name.clear();
                         self.offset = 0;
                         self.notice = Some("Contexto criado.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.reload()
+            }
+            Message::BeginRenameContext(id) => {
+                let name = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.contexts.iter().find(|context| context.id == id))
+                    .map(|context| context.name.clone());
+                if let Some(name) = name {
+                    self.context_editor = Some(ContextEditor { id, name });
+                }
+                Task::none()
+            }
+            Message::ContextEditorNameChanged(name) => {
+                if let Some(editor) = self.context_editor.as_mut() {
+                    editor.name = name;
+                }
+                Task::none()
+            }
+            Message::CancelRenameContext => {
+                self.context_editor = None;
+                Task::none()
+            }
+            Message::SaveRenameContext => {
+                let Some(editor) = self.context_editor.take() else {
+                    return Task::none();
+                };
+                if self.action_busy {
+                    self.context_editor = Some(editor);
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { rename_context_in_library(editor.id, editor.name) },
+                    Message::ContextRenamed,
+                )
+            }
+            Message::ContextRenamed(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(id) => {
+                        self.context = Some(id);
+                        self.notice = Some("Contexto renomeado.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.reload()
+            }
+            Message::RequestDeleteContext(id) => {
+                self.pending_delete_context = Some(id);
+                Task::none()
+            }
+            Message::CancelDeleteContext => {
+                self.pending_delete_context = None;
+                Task::none()
+            }
+            Message::DeleteContext(id) => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice =
+                        Some("Exclusão de Contextos desativada no modo de demonstração.".into());
+                    self.pending_delete_context = None;
+                    return Task::none();
+                }
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { delete_context_from_library(id) },
+                    Message::ContextDeleted,
+                )
+            }
+            Message::ContextDeleted(result) => {
+                self.action_busy = false;
+                self.pending_delete_context = None;
+                match result {
+                    Ok(()) => {
+                        self.context = None;
+                        self.offset = 0;
+                        self.notice =
+                            Some("Contexto excluído; as capturas permanecem na biblioteca.".into());
                     }
                     Err(error) => self.notice = Some(error),
                 }
@@ -1024,6 +1127,69 @@ impl App {
                     navigation = navigation.push(
                         button("Quick Context · demo")
                             .on_press(Message::OpenQuickContext(capture.id.clone()))
+                            .width(Length::Fill),
+                    );
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        let can_manage_contexts = !self.demo;
+        #[cfg(not(debug_assertions))]
+        let can_manage_contexts = true;
+        if can_manage_contexts {
+            if let Some(context_id) = self
+                .context
+                .as_deref()
+                .filter(|id| !matches!(*id, "inbox" | "knowledge-base"))
+            {
+                if let Some(editor) = self
+                    .context_editor
+                    .as_ref()
+                    .filter(|editor| editor.id == context_id)
+                {
+                    navigation = navigation.push(
+                        text_input("Nome do Contexto", &editor.name)
+                            .on_input(Message::ContextEditorNameChanged)
+                            .on_submit(Message::SaveRenameContext)
+                            .padding(8),
+                    );
+                    navigation = navigation.push(
+                        row![
+                            button("Salvar")
+                                .on_press(Message::SaveRenameContext)
+                                .width(Length::Fill),
+                            button("Cancelar")
+                                .on_press(Message::CancelRenameContext)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(6),
+                    );
+                } else {
+                    navigation = navigation.push(
+                        button("Renomear Contexto")
+                            .on_press(Message::BeginRenameContext(context_id.to_string()))
+                            .width(Length::Fill),
+                    );
+                }
+                if self.pending_delete_context.as_deref() == Some(context_id) {
+                    navigation = navigation.push(
+                        text("As capturas permanecem na biblioteca sem este vínculo.").size(11),
+                    );
+                    navigation = navigation.push(
+                        row![
+                            button("Confirmar exclusão")
+                                .on_press(Message::DeleteContext(context_id.to_string()))
+                                .width(Length::Fill),
+                            button("Cancelar")
+                                .on_press(Message::CancelDeleteContext)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(6),
+                    );
+                } else {
+                    navigation = navigation.push(
+                        button("Excluir Contexto")
+                            .on_press(Message::RequestDeleteContext(context_id.to_string()))
                             .width(Length::Fill),
                     );
                 }
@@ -2236,6 +2402,174 @@ fn create_context_in(
     Ok(id)
 }
 
+fn rename_context_in_library(id: String, name: String) -> Result<String, String> {
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let context_key = CredentialEntry::new("Scryppy", "context-key-v1")
+        .map_err(|_| "Credencial local indisponível.")?
+        .get_password()
+        .map_err(|_| "Não foi possível acessar a chave dos Contextos.")?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    rename_context_in(&mut conn, app_dir, &context_key, &id, &name)
+}
+
+fn rename_context_in(
+    conn: &mut rusqlite::Connection,
+    app_dir: &Path,
+    context_key: &str,
+    id: &str,
+    raw_name: &str,
+) -> Result<String, String> {
+    if matches!(id, "inbox" | "knowledge-base") {
+        return Err("Esse Contexto é protegido e não pode ser renomeado.".into());
+    }
+    let name = raw_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err("Informe um nome de até 80 caracteres.".into());
+    }
+    let normalized_name = name.to_lowercase();
+    if matches!(normalized_name.as_str(), "inbox" | "knowledge base") {
+        return Err("Esse nome é reservado pelo sistema.".into());
+    }
+    let contexts = scrypuppy_core::library::list_contexts_from_conn(conn)?;
+    let old_context = contexts
+        .iter()
+        .find(|context| context.id == id)
+        .ok_or("Contexto não encontrado.")?;
+    if contexts
+        .iter()
+        .any(|context| context.id != id && context.normalized_name == normalized_name)
+    {
+        return Err("Já existe um Contexto com esse nome.".into());
+    }
+    let affected = context_capture_ids(conn, id)?;
+    let base_slug = slugify_context(&name);
+    let base_slug = if base_slug.is_empty() {
+        "contexto".to_string()
+    } else {
+        base_slug
+    };
+    let mut slug = base_slug.clone();
+    let mut suffix = 2;
+    while conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM contexts WHERE slug = ?1 AND id <> ?2)",
+            rusqlite::params![slug, id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        slug = format!("{base_slug}-{suffix}");
+        suffix += 1;
+    }
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE contexts SET name = ?1, normalized_name = ?2, slug = ?3, updated_at = ?4 WHERE id = ?5",
+            rusqlite::params![name, normalized_name, slug, timestamp, id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    let export_dir = app_dir.join("markdown").join("contexts");
+    remove_context_export_file(&export_dir, &old_context.slug)?;
+    let updated = scrypuppy_core::library::list_contexts_from_conn(conn)?
+        .into_iter()
+        .find(|context| context.id == id)
+        .ok_or("Contexto não encontrado após a gravação.")?;
+    std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+    scrypuppy_core::context_exports::write_context_export(conn, &export_dir, &updated, context_key)
+        .map_err(|error| {
+            format!("Contexto renomeado, mas o export criptografado falhou: {error}")
+        })?;
+    for capture_id in affected {
+        scrypuppy_core::search_index::refresh_search_document(conn, &capture_id, &timestamp)?;
+    }
+    Ok(id.to_string())
+}
+
+fn delete_context_from_library(id: String) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    delete_context_in(&mut conn, app_dir, &id)
+}
+
+fn delete_context_in(
+    conn: &mut rusqlite::Connection,
+    app_dir: &Path,
+    id: &str,
+) -> Result<(), String> {
+    if matches!(id, "inbox" | "knowledge-base") {
+        return Err("Esse Contexto é protegido e não pode ser excluído.".into());
+    }
+    let context = scrypuppy_core::library::list_contexts_from_conn(conn)?
+        .into_iter()
+        .find(|context| context.id == id)
+        .ok_or("Contexto não encontrado.")?;
+    let affected = context_capture_ids(conn, id)?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let deleted = transaction
+        .execute("DELETE FROM contexts WHERE id = ?", [id])
+        .map_err(|error| error.to_string())?;
+    if deleted == 0 {
+        return Err("Contexto não encontrado.".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    remove_context_export_file(&app_dir.join("markdown").join("contexts"), &context.slug)?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    for capture_id in affected {
+        scrypuppy_core::search_index::refresh_search_document(conn, &capture_id, &timestamp)?;
+    }
+    Ok(())
+}
+
+fn context_capture_ids(conn: &rusqlite::Connection, id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT capture_id FROM capture_contexts WHERE context_id = ?")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+fn remove_context_export_file(export_dir: &Path, slug: &str) -> Result<(), String> {
+    if slug.is_empty()
+        || !slug
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("Slug do Contexto inválido.".into());
+    }
+    let path = export_dir.join(format!("{slug}.scryppy"));
+    let directory_metadata = match std::fs::symlink_metadata(export_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Ok(());
+    }
+    let file_metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+        return Ok(());
+    }
+    scrypuppy_core::context_exports::secure_remove_file(&path)
+}
+
 fn slugify_context(value: &str) -> String {
     let mut slug = String::new();
     let mut separator = false;
@@ -3027,6 +3361,84 @@ mod tests {
             "Pesquisa de produto".into(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn context_rename_and_delete_keep_capture_and_export_state_consistent() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        scrypuppy_core::schema::migrate(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let context_key = "56".repeat(32);
+        let context_id =
+            create_context_in(&mut conn, dir.path(), &context_key, "Pesquisa".into()).unwrap();
+        let capture_id = scrypuppy_core::capture_store::save_clipboard_capture(
+            &mut conn,
+            dir.path(),
+            &scrypuppy_core::clipboard::ClipboardSnapshot {
+                representations: vec![
+                    scrypuppy_core::clipboard::ClipboardRepresentation::PlainText(
+                        "nota de pesquisa".into(),
+                    ),
+                ],
+                formats: Vec::new(),
+            },
+            "capture",
+        )
+        .unwrap();
+        scrypuppy_core::contexts::add_capture_contexts(
+            &mut conn,
+            &capture_id,
+            std::slice::from_ref(&context_id),
+            || "2026-01-01T00:00:00Z".into(),
+        )
+        .unwrap();
+        scrypuppy_core::search_index::refresh_search_document(
+            &conn,
+            &capture_id,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        rename_context_in(
+            &mut conn,
+            dir.path(),
+            &context_key,
+            &context_id,
+            "Pesquisa de produto",
+        )
+        .unwrap();
+        let export_dir = dir.path().join("markdown/contexts");
+        assert!(export_dir.join("pesquisa-de-produto.scryppy").is_file());
+        assert!(!export_dir.join("pesquisa.scryppy").exists());
+        let indexed_context: String = conn
+            .query_row(
+                "SELECT metadata FROM capture_search_documents WHERE capture_id = ?",
+                [&capture_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(indexed_context.contains("Pesquisa de produto"));
+
+        delete_context_in(&mut conn, dir.path(), &context_id).unwrap();
+        assert!(!export_dir.join("pesquisa-de-produto.scryppy").exists());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM captures WHERE id = ?",
+                [&capture_id],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM capture_contexts WHERE capture_id = ?",
+                [&capture_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
