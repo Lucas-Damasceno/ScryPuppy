@@ -425,6 +425,32 @@ pub fn image_thumbnail(bytes: &[u8]) -> Result<ImagePreview, PreviewError> {
     })
 }
 
+/// Render the first DOCX page locally with a bounded OOXML package expansion.
+/// This renderer is used by the Windows app and does not contact a service.
+#[cfg(windows)]
+pub fn docx_first_page_preview(bytes: &[u8]) -> Result<Vec<u8>, PreviewError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let document = rdocx::Document::from_bytes_with_limits(
+        bytes,
+        rdocx::PackageReadLimits {
+            max_entries: 2048,
+            max_part_uncompressed_bytes: 8 * 1024 * 1024,
+            max_total_uncompressed_bytes: 32 * 1024 * 1024,
+        },
+    )
+    .map_err(|_| PreviewError::InvalidDocument)?;
+    let png = document
+        .render_page_to_png_deterministic(0, 72.0)
+        .map_err(|_| PreviewError::InvalidDocument)?
+        .ok_or(PreviewError::InvalidDocument)?;
+    if png.len() > 12 * 1024 * 1024 {
+        return Err(PreviewError::TooLarge);
+    }
+    Ok(png)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +488,23 @@ mod tests {
             docx_excerpt(b"not a docx"),
             Err(PreviewError::InvalidDocument)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docx_first_page_preview_renders_a_real_word_page() {
+        let mut document = rdocx::Document::new();
+        document.add_paragraph("Prévia local da primeira página do documento.");
+        let bytes = document.to_bytes().unwrap();
+        let png = docx_first_page_preview(&bytes).unwrap();
+        assert_eq!(image::guess_format(&png).unwrap(), ImageFormat::Png);
+        let rendered = ImageReader::new(Cursor::new(png))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert!(rendered.width() > 400);
+        assert!(rendered.height() > 500);
     }
 
     #[test]

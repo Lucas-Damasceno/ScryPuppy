@@ -6009,6 +6009,18 @@ fn previews(root: &Path, captures: &[CaptureDto]) -> (Vec<ImagePreview>, Vec<Tex
                 continue;
             }
             if let Ok(bytes) = bytes {
+                if extension.eq_ignore_ascii_case("docx") {
+                    if let Ok(preview) = scrypuppy_core::preview::cached_preview(
+                        &cache_root,
+                        &capture.id,
+                        "docx-first-page",
+                        &bytes,
+                        12 * 1024 * 1024,
+                        || scrypuppy_core::preview::docx_first_page_preview(&bytes),
+                    ) {
+                        images.push((capture.id.clone(), preview));
+                    }
+                }
                 let kind = if extension.eq_ignore_ascii_case("txt") {
                     "plain-text-excerpt"
                 } else {
