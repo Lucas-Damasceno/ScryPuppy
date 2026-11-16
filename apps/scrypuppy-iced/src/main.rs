@@ -8250,6 +8250,16 @@ mod tests {
             include_bytes!("../../../crates/scrypuppy-core/tests/fixtures/legacy-word-sample.doc"),
         )
         .unwrap();
+        let image_source = asset_root.join("sample.webp");
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        ::image::DynamicImage::ImageRgba8(::image::RgbaImage::from_pixel(
+            2,
+            2,
+            ::image::Rgba([40, 80, 120, 255]),
+        ))
+        .write_to(&mut image_bytes, ::image::ImageFormat::WebP)
+        .unwrap();
+        std::fs::write(&image_source, image_bytes.into_inner()).unwrap();
         let capture = CaptureDto {
             id: "legacy-doc-capture".into(),
             content_text: "Documento Word".into(),
@@ -8286,17 +8296,24 @@ mod tests {
             ocr: None,
             contexts: Vec::new(),
         };
+        let mut image_capture = capture.clone();
+        image_capture.id = "image-file-capture".into();
+        image_capture.content_text = "sample.webp".into();
+        image_capture.files[0].id = "image-file".into();
+        image_capture.files[0].display_name = "sample.webp".into();
+        image_capture.files[0].local_path = Some(image_source.to_string_lossy().into_owned());
+        image_capture.files[0].extension = Some("webp".into());
 
-        let (images, text) = previews(&asset_root, &[capture]);
+        let (images, text) = previews(&asset_root, &[capture, image_capture]);
 
-        assert!(images.len() <= 1);
-        if let Some((capture_id, image)) = images.first() {
-            assert_eq!(capture_id, "legacy-doc-capture");
-            assert_eq!(
-                ::image::guess_format(image).unwrap(),
-                ::image::ImageFormat::Png
-            );
-        }
+        let image_preview = images
+            .iter()
+            .find(|(capture_id, _)| capture_id == "image-file-capture")
+            .expect("attached WebP should have a preview");
+        assert_eq!(
+            ::image::guess_format(&image_preview.1).unwrap(),
+            ::image::ImageFormat::Png
+        );
         assert_eq!(text.len(), 1);
         assert_eq!(text[0].0, "legacy-doc-capture");
         assert!(text[0].1.contains("Concert du soir"));
