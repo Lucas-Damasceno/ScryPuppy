@@ -558,9 +558,9 @@ fn activate_existing_instance() {
 fn app_theme_variant(dark: bool, transparent: bool) -> Theme {
     let rgb = Color::from_rgb8;
     let (mut background, text, primary) = if dark {
-        (rgb(22, 26, 35), rgb(241, 243, 247), rgb(224, 103, 105))
+        (rgb(22, 26, 35), rgb(241, 243, 247), rgb(232, 128, 130))
     } else {
-        (rgb(247, 248, 250), rgb(37, 42, 54), rgb(201, 72, 76))
+        (rgb(247, 248, 250), rgb(37, 42, 54), rgb(232, 128, 130))
     };
     if transparent {
         background = Color::TRANSPARENT;
