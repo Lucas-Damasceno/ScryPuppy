@@ -995,6 +995,10 @@ mod tests {
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let tomorrow = today.succ_opt().unwrap();
+        let offset = chrono::Local::now().format("%:z").to_string();
         let capture_id = save_clipboard_capture(
             &mut conn,
             dir.path(),
@@ -1062,21 +1066,21 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-15T10:00:00Z'
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = ?2
              WHERE id = ?1",
-            [&capture_id],
+            rusqlite::params![capture_id, format!("{today}T10:00:00{offset}")],
         )
         .unwrap();
         conn.execute(
-            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-14T10:00:00Z'
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = ?2
              WHERE id = ?1",
-            [&archived_id],
+            rusqlite::params![archived_id, format!("{yesterday}T10:00:00{offset}")],
         )
         .unwrap();
         conn.execute(
-            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = '2026-11-15T23:59:59Z'
+            "UPDATE captures SET source_app_name = 'Visual Studio Code', captured_at = ?2
              WHERE id = ?1",
-            [&late_today_id],
+            rusqlite::params![late_today_id, format!("{today}T23:59:59{offset}")],
         )
         .unwrap();
 
@@ -1116,8 +1120,8 @@ mod tests {
                 query: "planejamento".into(),
                 context_id: Some("work".into()),
                 app: Some("Visual Studio".into()),
-                date_from: Some("2026-11-15T00:00:00".into()),
-                date_to: Some("2026-11-16T00:00:00".into()),
+                date_from: Some(format!("{today}T00:00:00{offset}")),
+                date_to: Some(format!("{tomorrow}T00:00:00{offset}")),
                 limit: None,
             },
         )

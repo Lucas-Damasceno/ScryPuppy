@@ -507,6 +507,21 @@ mod tests {
         assert!(rendered.height() > 500);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn docx_first_page_preview_rejects_invalid_and_oversized_inputs() {
+        assert!(matches!(
+            docx_first_page_preview(b"not a Word document"),
+            Err(PreviewError::InvalidDocument)
+        ));
+
+        let oversized = vec![0; MAX_INPUT_BYTES + 1];
+        assert!(matches!(
+            docx_first_page_preview(&oversized),
+            Err(PreviewError::TooLarge)
+        ));
+    }
+
     #[test]
     fn large_and_malformed_inputs_are_rejected() {
         let input = vec![0; MAX_INPUT_BYTES + 1];
