@@ -405,6 +405,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('link_preview_fetch_enabled', 'true')",
+        [],
+    )?;
+    conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_provider', 'deepseek')",
         [],
     )?;
@@ -478,5 +482,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(screenshots, "true");
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'link_preview_fetch_enabled'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "true"
+        );
     }
 }

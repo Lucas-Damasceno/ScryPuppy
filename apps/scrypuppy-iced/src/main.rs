@@ -215,6 +215,7 @@ struct App {
     context: Option<String>,
     offset: usize,
     selected_capture: Option<String>,
+    pending_delete_capture: Option<String>,
     theme_changed: bool,
     clipboard_monitor_enabled: bool,
     clipboard_monitor_changed: bool,
@@ -251,6 +252,10 @@ enum Message {
     NextPage,
     SelectContext(Option<String>),
     SelectCapture(String),
+    RequestDeleteCapture(String),
+    CancelDeleteCapture,
+    DeleteCapture(String),
+    CaptureDeleted(Result<(), String>),
     AssignContext(String, String),
     RemoveContext(String, String),
     CaptureClipboard,
@@ -303,6 +308,7 @@ impl App {
             context: None,
             offset: 0,
             selected_capture: None,
+            pending_delete_capture: None,
             theme_changed: false,
             clipboard_monitor_enabled: false,
             clipboard_monitor_changed: false,
@@ -554,6 +560,42 @@ impl App {
             Message::SelectCapture(id) => {
                 self.selected_capture = Some(id);
                 Task::none()
+            }
+            Message::RequestDeleteCapture(id) => {
+                self.pending_delete_capture = Some(id);
+                Task::none()
+            }
+            Message::CancelDeleteCapture => {
+                self.pending_delete_capture = None;
+                Task::none()
+            }
+            Message::DeleteCapture(id) => {
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    self.notice = Some("Exclusão desativada no modo de demonstração.".into());
+                    self.pending_delete_capture = None;
+                    return Task::none();
+                }
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { delete_capture_from_library(id) },
+                    Message::CaptureDeleted,
+                )
+            }
+            Message::CaptureDeleted(result) => {
+                self.action_busy = false;
+                self.pending_delete_capture = None;
+                match result {
+                    Ok(()) => {
+                        self.selected_capture = None;
+                        self.notice = Some("Captura excluída.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.reload()
             }
             Message::AssignContext(capture_id, context_id) => {
                 #[cfg(debug_assertions)]
@@ -1227,6 +1269,25 @@ impl App {
                     if let Some(ocr_text) = &ocr.text {
                         details = details.push(text(format!("Texto OCR: {ocr_text}")).size(12));
                     }
+                }
+                if self.pending_delete_capture.as_deref() == Some(capture.id.as_str()) {
+                    details = details.push(
+                        text("Excluir esta captura e seus arquivos locais? Essa ação não pode ser desfeita.")
+                            .size(12),
+                    );
+                    details = details.push(
+                        row![
+                            button("Confirmar exclusão")
+                                .on_press(Message::DeleteCapture(capture.id.clone())),
+                            button("Cancelar").on_press(Message::CancelDeleteCapture),
+                        ]
+                        .spacing(8),
+                    );
+                } else {
+                    details = details.push(
+                        button("Excluir captura")
+                            .on_press(Message::RequestDeleteCapture(capture.id.clone())),
+                    );
                 }
                 content = content.push(
                     container(details)
@@ -2071,6 +2132,141 @@ fn remove_capture_from_context(capture_id: String, context_id: String) -> Result
         &capture_id,
         &context_id,
     )
+}
+
+fn delete_capture_from_library(capture_id: String) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let context_key = CredentialEntry::new("Scryppy", "context-key-v1")
+        .map_err(|_| "Credencial local indisponível.")?
+        .get_password()
+        .map_err(|_| "Não foi possível acessar a chave dos Contextos.")?;
+    let mut conn = open_existing_read_write(&path, &database_key)?;
+    let mut asset_stmt = conn
+        .prepare("SELECT path FROM capture_assets WHERE capture_id = ? AND path IS NOT NULL")
+        .map_err(|error| error.to_string())?;
+    let asset_paths = asset_stmt
+        .query_map([&capture_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    drop(asset_stmt);
+    let mut context_stmt = conn
+        .prepare("SELECT context_id FROM capture_contexts WHERE capture_id = ?")
+        .map_err(|error| error.to_string())?;
+    let context_ids = context_stmt
+        .query_map([&capture_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    drop(context_stmt);
+
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let deleted = transaction
+        .execute("DELETE FROM captures WHERE id = ?", [&capture_id])
+        .map_err(|error| error.to_string())?;
+    if deleted == 0 {
+        return Err("Captura não encontrada.".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    let assets_root = app_dir.join("assets");
+    for raw_path in asset_paths {
+        remove_managed_capture_file(&assets_root, Path::new(&raw_path))?;
+    }
+    remove_managed_capture_dir(
+        &assets_root,
+        &assets_root.join("clipboard-files").join(&capture_id),
+    )?;
+
+    let contexts =
+        scrypuppy_core::context_exports::list_contexts(&conn).map_err(|error| error.to_string())?;
+    let export_dir = app_dir.join("markdown").join("contexts");
+    for context_id in context_ids {
+        if matches!(context_id.as_str(), "inbox" | "knowledge-base") {
+            continue;
+        }
+        if let Some(context) = contexts.iter().find(|context| context.id == context_id) {
+            scrypuppy_core::context_exports::write_context_export(
+                &conn,
+                &export_dir,
+                context,
+                &context_key,
+            )
+            .map_err(|error| {
+                format!("Captura excluída, mas o export criptografado do Contexto não foi atualizado: {error}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_managed_capture_file(assets_root: &Path, path: &Path) -> Result<(), String> {
+    if !path.starts_with(assets_root) {
+        return Ok(());
+    }
+    let mut ancestors = path
+        .ancestors()
+        .take_while(|candidate| candidate.starts_with(assets_root))
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors.iter().take(ancestors.len().saturating_sub(1)) {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(());
+        }
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(());
+    }
+    scrypuppy_core::context_exports::secure_remove_file(path)
+}
+
+fn remove_managed_capture_dir(assets_root: &Path, directory: &Path) -> Result<(), String> {
+    if !directory.starts_with(assets_root) {
+        return Ok(());
+    }
+    let mut ancestors = directory
+        .ancestors()
+        .take_while(|candidate| candidate.starts_with(assets_root))
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+    }
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        } else if metadata.is_dir() {
+            remove_managed_capture_dir(assets_root, &path)?;
+        } else if metadata.is_file() {
+            remove_managed_capture_file(assets_root, &path)?;
+        }
+    }
+    std::fs::remove_dir(directory).map_err(|error| error.to_string())
 }
 
 fn remove_capture_from_context_in(
