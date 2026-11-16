@@ -795,6 +795,7 @@ impl App {
             Message::QuickPasteOpened(id) => Task::batch([
                 window::gain_focus(id),
                 iced::widget::operation::focus(self.quick_search_id.clone()),
+                set_quick_paste_hit_region(id, self.quick_paste_minimal),
             ]),
             Message::FinishQuickPaste => {
                 if let Some(id) = self.quick_window.take() {
@@ -2169,10 +2170,18 @@ impl App {
                 } else {
                     "normal"
                 };
-                Task::perform(
+                let save = Task::perform(
                     async move { save_window_style_preference("iced_quick_paste_style", value) },
                     Message::QuickStyleSaved,
-                )
+                );
+                #[cfg(windows)]
+                if let Some(id) = self.quick_window {
+                    return Task::batch([
+                        save,
+                        set_quick_paste_hit_region(id, self.quick_paste_minimal),
+                    ]);
+                }
+                save
             }
             Message::ToggleQuickContextStyle => {
                 self.quick_context_minimal = !self.quick_context_minimal;
@@ -2316,7 +2325,11 @@ impl App {
                             async move { link_previews(&root, &captures, fetch_links) },
                             move |links| Message::LinkPreviews(revision, links),
                         );
-                        return Task::batch([local, links]);
+                        let hit_region = self
+                            .quick_window
+                            .map(|id| set_quick_paste_hit_region(id, self.quick_paste_minimal))
+                            .unwrap_or_else(Task::none);
+                        return Task::batch([local, links, hit_region]);
                     }
                     Err(error) => {
                         self.snapshot = None;
@@ -3954,6 +3967,63 @@ fn show_window(id: window::Id) -> Task<Message> {
 #[cfg(not(windows))]
 fn show_window(id: window::Id) -> Task<Message> {
     window::gain_focus(id)
+}
+
+#[cfg(windows)]
+fn set_quick_paste_hit_region(id: window::Id, minimal: bool) -> Task<Message> {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ},
+        UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::GetClientRect},
+    };
+
+    window::run(id, move |window| {
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+        unsafe {
+            if !minimal {
+                let _ = SetWindowRgn(hwnd, None, true);
+                return;
+            }
+
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client).is_err() {
+                return;
+            }
+            let dpi = GetDpiForWindow(hwnd).max(1) as f32 / 96.0;
+            let margin = (14.0 * dpi).round() as i32;
+            let radius = (36.0 * dpi).round() as i32;
+            let width = client.right - client.left;
+            let height = client.bottom - client.top;
+            if width <= margin * 2 || height <= margin * 2 {
+                return;
+            }
+
+            let region = CreateRoundRectRgn(
+                margin,
+                margin,
+                width - margin,
+                height - margin,
+                radius,
+                radius,
+            );
+            if SetWindowRgn(hwnd, Some(region), true) == 0 {
+                let _ = DeleteObject(HGDIOBJ(region.0));
+            }
+        }
+    })
+    .discard()
+}
+
+#[cfg(not(windows))]
+fn set_quick_paste_hit_region(_id: window::Id, _minimal: bool) -> Task<Message> {
+    Task::none()
 }
 
 #[cfg(debug_assertions)]
