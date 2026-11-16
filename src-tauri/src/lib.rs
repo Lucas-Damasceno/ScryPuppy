@@ -7772,6 +7772,26 @@ mod tests {
     }
 
     #[test]
+    fn iced_sourced_document_is_readable_by_legacy_magic_search_reader() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        migrate(&conn).expect("current database schema");
+        let answer = scrypuppy_core::assistant::ChatAnswer {
+            answer: "A decisão será revisada na sexta-feira.".into(),
+            confidence: "medium".into(),
+            evidence: Vec::new(),
+        };
+        let created =
+            scrypuppy_core::documents::save_answer(&conn, "Quando será a revisão?", &answer, None)
+                .expect("Iced creates a document in the shared schema");
+
+        let loaded = get_magic_search_document(&conn, &created.id)
+            .expect("Tauri Magic Search deserializes and opens the Iced document");
+        assert_eq!(loaded.response_mode, "direct");
+        assert_eq!(loaded.query, "Quando será a revisão?");
+        assert!(loaded.markdown.contains("sexta-feira"));
+    }
+
+    #[test]
     fn search_schema_is_idempotent_and_fts_tracks_capture_documents() {
         let conn = Connection::open_in_memory().expect("in-memory database");
         migrate(&conn).expect("first migration");
