@@ -571,6 +571,43 @@ mod tests {
     }
 
     #[test]
+    fn file_import_keeps_the_original_physical_file_reference() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("research.txt");
+        fs::write(&source, b"local file contents").unwrap();
+        let original_path = source.display().to_string();
+        let snapshot = ClipboardSnapshot {
+            representations: vec![ClipboardRepresentation::Files(vec![
+                ClipboardFile::physical(source),
+            ])],
+            formats: Vec::new(),
+        };
+        let id = save_clipboard_capture_with_window_metadata(
+            &mut conn,
+            dir.path(),
+            &snapshot,
+            "capture",
+            CaptureSourceMetadata {
+                capture_origin: "file_import",
+                ..CaptureSourceMetadata::default()
+            },
+        )
+        .unwrap();
+
+        let capture = get_capture_by_id(&conn, &id).unwrap();
+        assert_eq!(capture.files[0].display_name, "research.txt");
+        assert_eq!(
+            capture.files[0].original_path.as_deref(),
+            Some(original_path.as_str())
+        );
+        assert!(capture.files[0].local_path.is_none());
+        assert_eq!(capture.files[0].availability, "available");
+        assert_eq!(capture.metadata["capture_origin"], "file_import");
+    }
+
+    #[test]
     fn database_failure_rolls_back_capture_and_removes_new_assets() {
         let mut conn = Connection::open_in_memory().unwrap();
         schema(&conn);
