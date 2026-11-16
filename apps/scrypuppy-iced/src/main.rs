@@ -6711,7 +6711,7 @@ fn capture_selected_content(capture_kind: &str) -> Result<String, String> {
             window_id: active.window_id.as_deref(),
         },
     )?;
-    if include_screenshot {
+    if capture_kind == "capture" && include_screenshot {
         queue_window_screenshot(id.clone(), active);
     }
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
