@@ -527,6 +527,10 @@ jobs:
               src-tauri/Cargo.toml `
               src-tauri/Cargo.lock `
               src-tauri/tauri.conf.json `
+              apps/scrypuppy-iced/Cargo.toml `
+              apps/scrypuppy-iced/Cargo.lock `
+              crates/scrypuppy-core/Cargo.toml `
+              crates/scrypuppy-core/Cargo.lock `
               README.md
             git diff --cached --quiet
             if ($LASTEXITCODE -eq 0) {
