@@ -9,7 +9,7 @@ chrono = "0.4"
 dirs = "6"
 enigo = "0.2.1"
 global-hotkey = "=0.8.0"
-iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs"] }
+iced = { package = "plushie-iced", version = "=0.8.4", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs", "a11y"] }
 keyring = "4.1.4"
 rfd = "=0.16.0"
 uuid = { version = "1", features = ["v4"] }

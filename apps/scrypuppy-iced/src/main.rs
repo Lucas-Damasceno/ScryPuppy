@@ -568,7 +568,7 @@ fn app_theme_variant(dark: bool, transparent: bool) -> Theme {
     }
     Theme::custom(
         "ScryPuppy",
-        iced::theme::Palette {
+        iced::theme::palette::Seed {
             background,
             text,
             primary,
