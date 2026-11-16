@@ -281,6 +281,9 @@ struct App {
     dark: bool,
     query: String,
     assistant_query: String,
+    assistant_app_filter: String,
+    assistant_date_from: String,
+    assistant_date_to: String,
     assistant_busy: bool,
     assistant_revision: u64,
     assistant_answer: Option<scrypuppy_core::assistant::ChatAnswer>,
@@ -358,6 +361,9 @@ enum Message {
     QuitFromTray,
     QueryChanged(String),
     AssistantQueryChanged(String),
+    AssistantAppFilterChanged(String),
+    AssistantDateFromChanged(String),
+    AssistantDateToChanged(String),
     AskAssistant,
     AssistantAnswered(u64, Result<scrypuppy_core::assistant::ChatAnswer, String>),
     SaveAnswerAsDocument,
@@ -503,6 +509,9 @@ impl App {
             dark: true,
             query: String::new(),
             assistant_query: String::new(),
+            assistant_app_filter: String::new(),
+            assistant_date_from: String::new(),
+            assistant_date_to: String::new(),
             assistant_busy: false,
             assistant_revision: 0,
             assistant_answer: None,
@@ -802,10 +811,55 @@ impl App {
                 self.assistant_answer = None;
                 Task::none()
             }
+            Message::AssistantAppFilterChanged(value) => {
+                self.assistant_app_filter = value.chars().take(120).collect();
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                self.assistant_busy = false;
+                self.assistant_answer = None;
+                Task::none()
+            }
+            Message::AssistantDateFromChanged(value) => {
+                self.assistant_date_from = value.chars().take(10).collect();
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                self.assistant_busy = false;
+                self.assistant_answer = None;
+                Task::none()
+            }
+            Message::AssistantDateToChanged(value) => {
+                self.assistant_date_to = value.chars().take(10).collect();
+                self.assistant_revision = self.assistant_revision.wrapping_add(1);
+                self.assistant_busy = false;
+                self.assistant_answer = None;
+                Task::none()
+            }
             Message::AskAssistant => {
                 let query = self.assistant_query.trim().to_string();
                 if query.is_empty() {
                     self.notice = Some("Digite uma pergunta para buscar nas capturas.".into());
+                    return Task::none();
+                }
+                let app_filter = self.assistant_app_filter.trim().to_string();
+                let date_from =
+                    match normalize_assistant_date_filter(&self.assistant_date_from, false) {
+                        Ok(date) => date,
+                        Err(error) => {
+                            self.notice = Some(error);
+                            return Task::none();
+                        }
+                    };
+                let date_to = match normalize_assistant_date_filter(&self.assistant_date_to, true) {
+                    Ok(date) => date,
+                    Err(error) => {
+                        self.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                if date_from
+                    .as_deref()
+                    .zip(date_to.as_deref())
+                    .is_some_and(|(from, to)| from > to)
+                {
+                    self.notice = Some("A data inicial deve ser anterior à data final.".into());
                     return Task::none();
                 }
                 #[cfg(debug_assertions)]
@@ -826,7 +880,9 @@ impl App {
                     async move {
                         let (sender, receiver) = iced::futures::channel::oneshot::channel();
                         thread::spawn(move || {
-                            let _ = sender.send(answer_library_question(&query, context_id));
+                            let _ = sender.send(answer_library_question(
+                                &query, context_id, app_filter, date_from, date_to,
+                            ));
                         });
                         receiver
                             .await
@@ -2493,6 +2549,35 @@ impl App {
                 ]
                 .spacing(8),
             );
+            content = content.push(
+                row![
+                    text_input("App (opcional)", &self.assistant_app_filter)
+                        .on_input(Message::AssistantAppFilterChanged)
+                        .padding(8),
+                    text_input("De · AAAA-MM-DD", &self.assistant_date_from)
+                        .on_input(Message::AssistantDateFromChanged)
+                        .padding(8),
+                    text_input("Até · AAAA-MM-DD", &self.assistant_date_to)
+                        .on_input(Message::AssistantDateToChanged)
+                        .padding(8),
+                ]
+                .spacing(8),
+            );
+            if let Some(context_id) = &self.context {
+                let context_name = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .contexts
+                            .iter()
+                            .find(|context| &context.id == context_id)
+                    })
+                    .map(|context| context.name.as_str())
+                    .unwrap_or("Contexto selecionado");
+                content = content
+                    .push(text(format!("Escopo limitado ao Contexto: {context_name}")).size(10));
+            }
             if self.assistant_busy {
                 content = content.push(text("Consultando capturas locais…").size(12));
             }
@@ -3847,6 +3932,9 @@ fn default_database_credentials() -> Result<(PathBuf, String), String> {
 fn answer_library_question(
     query: &str,
     context_id: Option<String>,
+    app: String,
+    date_from: Option<String>,
+    date_to: Option<String>,
 ) -> Result<scrypuppy_core::assistant::ChatAnswer, String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_only(&path, &database_key)?;
@@ -3874,12 +3962,35 @@ fn answer_library_question(
         &scrypuppy_core::assistant::ChatRequest {
             query: query.into(),
             context_id,
-            app: None,
-            date_from: None,
-            date_to: None,
+            app: (!app.is_empty()).then_some(app),
+            date_from,
+            date_to,
             limit: Some(12),
         },
     )
+}
+
+fn normalize_assistant_date_filter(
+    value: &str,
+    end_of_day: bool,
+) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| "Use datas no formato AAAA-MM-DD.".to_string())?;
+    let time = if end_of_day {
+        chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)
+    } else {
+        chrono::NaiveTime::from_hms_opt(0, 0, 0)
+    }
+    .ok_or_else(|| "Data inválida.".to_string())?;
+    Ok(Some(
+        date.and_time(time)
+            .format("%Y-%m-%dT%H:%M:%S%.f")
+            .to_string(),
+    ))
 }
 
 fn load_capture_by_id(capture_id: &str) -> Result<CaptureDto, String> {
@@ -5868,6 +5979,20 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
 mod tests {
     use super::*;
     use scrypuppy_core::storage::open_or_create;
+
+    #[test]
+    fn assistant_date_filters_cover_the_whole_requested_day() {
+        assert_eq!(
+            normalize_assistant_date_filter("2026-11-15", false).unwrap(),
+            Some("2026-11-15T00:00:00".into())
+        );
+        assert_eq!(
+            normalize_assistant_date_filter("2026-11-15", true).unwrap(),
+            Some("2026-11-15T23:59:59.999999999".into())
+        );
+        assert!(normalize_assistant_date_filter("15/11/2026", false).is_err());
+        assert_eq!(normalize_assistant_date_filter("", false).unwrap(), None);
+    }
 
     #[test]
     fn quick_paste_shortcut_is_registered_as_ctrl_shift_v() {
