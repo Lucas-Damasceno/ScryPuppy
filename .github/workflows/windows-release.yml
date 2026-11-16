@@ -49,6 +49,9 @@ jobs:
     outputs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
       installer_name: ${{ steps.metadata.outputs.installer_name }}
+      iced_installer_name: ${{ steps.metadata.outputs.iced_installer_name }}
+      iced_installer_path: ${{ steps.metadata.outputs.iced_installer_path }}
+      iced_checksum_path: ${{ steps.metadata.outputs.iced_checksum_path }}
       checksum_name: ${{ steps.metadata.outputs.checksum_name }}
       signature_name: ${{ steps.metadata.outputs.signature_name }}
       public_version: ${{ steps.metadata.outputs.public_version }}
@@ -161,6 +164,16 @@ jobs:
           REQUIRE_UPDATER_SIGNATURE: ${{ startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true }}
         run: npm run build:windows
 
+      - name: Build Iced NSIS candidate
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true) && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true) && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          REQUIRE_UPDATER_SIGNATURE: ${{ startsWith(github.ref, 'refs/tags/') || inputs.automatic_release == true }}
+        run: ./scripts/build-iced-windows.ps1
+
+      - name: Smoke-test Iced NSIS install and uninstall
+        run: ./scripts/test-iced-windows-installer.ps1
+
       - name: Create SHA-256 checksum
         id: checksum
         shell: pwsh
@@ -195,6 +208,8 @@ jobs:
           path: |
             ${{ steps.metadata.outputs.installer_path }}
             ${{ steps.metadata.outputs.checksum_path }}
+            ${{ steps.metadata.outputs.iced_installer_path }}
+            ${{ steps.metadata.outputs.iced_checksum_path }}
           if-no-files-found: error
           retention-days: 1
 
