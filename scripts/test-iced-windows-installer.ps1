@@ -41,6 +41,9 @@ $installLocationRegistryPath = "HKCU:\$installLocationKey"
 $autostartKey = "Software\Microsoft\Windows\CurrentVersion\Run\ScryPuppy-Iced-Validation-$validationId"
 $autostartRegistryPath = "HKCU:\$autostartKey"
 $autostartValue = "ScryPuppy"
+$shortcutName = "ScryPuppy-Iced-Validation-$validationId"
+$startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$shortcutName.lnk"
+$desktopShortcut = Join-Path $env:USERPROFILE "Desktop\$shortcutName.lnk"
 $fileVersion = "1.0.0.1"
 New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
 
@@ -57,6 +60,7 @@ try {
       "/DINSTALL_LOCATION_KEY=$installLocationKey" `
       "/DAUTOSTART_KEY=$autostartKey" `
       "/DAUTOSTART_VALUE=$autostartValue" `
+      "/DSHORTCUT_NAME=$shortcutName" `
       $installerScript
     if ($LASTEXITCODE -ne 0) {
       throw "Iced NSIS validation installer compilation failed with exit code $LASTEXITCODE."
@@ -72,10 +76,12 @@ try {
   New-Item -ItemType Directory -Force -Path $autostartRegistryPath | Out-Null
   Set-ItemProperty -LiteralPath $autostartRegistryPath -Name $autostartValue `
     -Value '"C:\Legacy\scrypuppy.exe"'
+  New-Item -ItemType Directory -Force -Path $installLocationRegistryPath | Out-Null
+  Set-Item -LiteralPath $installLocationRegistryPath -Value $installRoot
 
   $installerProcess = Start-Process `
     -FilePath $installerPath `
-    -ArgumentList @("/S", "/D=$installRoot") `
+    -ArgumentList "/S" `
     -PassThru `
     -Wait `
     -NoNewWindow
@@ -88,6 +94,9 @@ try {
   }
   if (-not (Test-Path -LiteralPath $uninstaller)) {
     throw "Iced NSIS validation install did not create its uninstaller."
+  }
+  if (-not (Test-Path -LiteralPath $startMenuShortcut)) {
+    throw "Iced NSIS validation install did not create its Start menu shortcut."
   }
   if (-not (Test-Path -LiteralPath $registryPath)) {
     throw "Iced NSIS validation install did not register the uninstall entry."
@@ -129,6 +138,9 @@ try {
   if (Test-Path -LiteralPath $installLocationRegistryPath) {
     throw "Iced NSIS validation uninstall left its install-location key behind."
   }
+  if ((Test-Path -LiteralPath $startMenuShortcut) -or (Test-Path -LiteralPath $desktopShortcut)) {
+    throw "Iced NSIS validation uninstall left a test shortcut behind."
+  }
 
   Write-Host "Iced NSIS install and uninstall smoke test passed."
 } finally {
@@ -156,6 +168,8 @@ try {
     foreach ($path in @(
       $installedApplication,
       (Join-Path $installRoot "scrypuppy.ico"),
+      $startMenuShortcut,
+      $desktopShortcut,
       $uninstaller,
       $installerPath
     )) {

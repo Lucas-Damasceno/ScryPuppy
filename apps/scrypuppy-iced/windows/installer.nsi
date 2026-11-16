@@ -32,6 +32,9 @@ SetCompressor /SOLID lzma
 !ifndef AUTOSTART_VALUE
   !define AUTOSTART_VALUE "${PRODUCT_NAME}"
 !endif
+!ifndef SHORTCUT_NAME
+  !define SHORTCUT_NAME "${PRODUCT_NAME}"
+!endif
 !ifndef UNINSTALL_KEY
   !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !endif
@@ -41,7 +44,7 @@ SetCompressor /SOLID lzma
 Name "${PRODUCT_NAME} ${APP_VERSION}"
 OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\${PRODUCT_NAME}"
-InstallDirRegKey HKCU "${UNINSTALL_KEY}" "InstallLocation"
+InstallDirRegKey HKCU "${INSTALL_LOCATION_KEY}" ""
 RequestExecutionLevel user
 ShowInstDetails hide
 ShowUninstDetails hide
@@ -91,10 +94,10 @@ Section "Install"
     Delete "$INSTDIR\$PreviousBinary"
   ${EndIf}
 
-  CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}.lnk" \
+  CreateShortcut "$SMPROGRAMS\${SHORTCUT_NAME}.lnk" \
     "$INSTDIR\${APP_BINARY}" "" "$INSTDIR\${APP_ICON_NAME}"
-  IfFileExists "$DESKTOP\${PRODUCT_NAME}.lnk" 0 desktop_shortcut_done
-  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" \
+  IfFileExists "$DESKTOP\${SHORTCUT_NAME}.lnk" 0 desktop_shortcut_done
+  CreateShortcut "$DESKTOP\${SHORTCUT_NAME}.lnk" \
     "$INSTDIR\${APP_BINARY}" "" "$INSTDIR\${APP_ICON_NAME}"
   desktop_shortcut_done:
 
@@ -117,8 +120,8 @@ SectionEnd
 
 Section "Uninstall"
   SetShellVarContext current
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
-  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${SHORTCUT_NAME}.lnk"
+  Delete "$DESKTOP\${SHORTCUT_NAME}.lnk"
   Delete "$INSTDIR\${APP_BINARY}"
   Delete "$INSTDIR\${APP_ICON_NAME}"
   Delete "$INSTDIR\uninstall.exe"

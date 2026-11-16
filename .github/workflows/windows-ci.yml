@@ -123,6 +123,12 @@ jobs:
           REQUIRE_UPDATER_SIGNATURE: false
         run: npm run build:windows
 
+      - name: Build Iced NSIS migration candidate
+        run: ./scripts/build-iced-windows.ps1
+
+      - name: Smoke-test Iced NSIS install and uninstall
+        run: ./scripts/test-iced-windows-installer.ps1
+
       - name: Create SHA-256 checksum
         shell: pwsh
         env:
@@ -144,5 +150,7 @@ jobs:
           path: |
             ${{ steps.metadata.outputs.installer_path }}
             ${{ steps.metadata.outputs.checksum_path }}
+            ${{ steps.metadata.outputs.iced_installer_path }}
+            ${{ steps.metadata.outputs.iced_checksum_path }}
           if-no-files-found: error
           retention-days: 1
