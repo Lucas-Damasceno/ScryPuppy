@@ -588,6 +588,7 @@ enum Message {
     ToggleMonitorQuickContext,
     ToggleQuickContext,
     CompleteOnboarding,
+    ReopenOnboarding,
     ClipboardChanged(u32),
     OcrUpdated(String),
     ClipboardCaptured(Result<Option<(String, bool)>, String>),
@@ -2490,6 +2491,12 @@ impl App {
                 self.onboarding_changed = true;
                 persist_boolean_setting("onboarding_completed", true, self.is_demo_mode())
             }
+            Message::ReopenOnboarding => {
+                self.onboarding_completed = false;
+                self.onboarding_changed = true;
+                self.settings_open = false;
+                persist_boolean_setting("onboarding_completed", false, self.is_demo_mode())
+            }
             Message::ToggleCaptureScreenshots => {
                 self.capture_screenshots = !self.capture_screenshots;
                 self.capture_screenshots_changed = true;
@@ -3415,6 +3422,7 @@ impl App {
                 })
                 .unwrap_or_else(|| self.ai_model.clone());
             content = content
+                .push(button("Reabrir tutorial de introdução").on_press(Message::ReopenOnboarding))
                 .push(text("Captura e privacidade").size(20))
                 .push(
                     button(if self.capture_screenshots {
