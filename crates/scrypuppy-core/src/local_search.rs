@@ -148,6 +148,14 @@ impl LocalSearchManager {
         if !allow_download && !self.installed() {
             return Err("local model is not installed".into());
         }
+        if self
+            .model
+            .lock()
+            .map_err(|_| "local model lock is unavailable".to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
         fs::create_dir_all(&self.cache_dir).map_err(|error| error.to_string())?;
         let options = TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
             .with_cache_dir(self.cache_dir.clone())

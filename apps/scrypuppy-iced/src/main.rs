@@ -373,6 +373,7 @@ struct App {
     main: window::Id,
     local_search: Arc<LocalSearchManager>,
     local_search_status: LocalSearchStatus,
+    local_search_refresh_pending: bool,
     quick_window: Option<window::Id>,
     quick_context_window: Option<window::Id>,
     quick_context_selected: Vec<String>,
@@ -472,6 +473,7 @@ enum Message {
     PrepareLocalSearch,
     RemoveLocalSearch,
     LocalSearchFinished(Result<LocalSearchStatus, String>),
+    LocalSearchRefreshFinished(Result<LocalSearchStatus, String>),
     QueryChanged(String),
     LibraryAppFilterChanged(String),
     LibraryDateFromChanged(String),
@@ -601,6 +603,32 @@ enum Message {
 }
 
 impl App {
+    fn refresh_local_search(&mut self) -> Task<Message> {
+        if !self.local_search.installed() {
+            return Task::none();
+        }
+        if self.local_search.operation_running() {
+            self.local_search_refresh_pending = true;
+            return Task::none();
+        }
+        if self.local_search.status().phase != LocalSearchPhase::Ready {
+            return Task::none();
+        }
+        if !self.local_search.try_begin_operation() {
+            self.local_search_refresh_pending = true;
+            return Task::none();
+        }
+        self.local_search_refresh_pending = false;
+        self.local_search
+            .set_phase(LocalSearchPhase::Indexing, None);
+        self.local_search_status = self.local_search.status();
+        let manager = self.local_search.clone();
+        Task::perform(
+            async move { refresh_local_search_data(manager) },
+            Message::LocalSearchRefreshFinished,
+        )
+    }
+
     fn invalidate_rule_preview(&mut self) {
         self.rule_preview_revision = self.rule_preview_revision.wrapping_add(1);
         self.rule_preview = None;
@@ -634,6 +662,7 @@ impl App {
             main,
             local_search,
             local_search_status,
+            local_search_refresh_pending: false,
             quick_window: None,
             quick_context_window: None,
             quick_context_selected: Vec::new(),
@@ -906,6 +935,23 @@ impl App {
                         LocalSearchPhase::NotDownloaded => "Modelo de busca local removido.".into(),
                         _ => "Busca local atualizada.".into(),
                     });
+                }
+                if self.local_search_refresh_pending
+                    && self.local_search_status.phase == LocalSearchPhase::Ready
+                {
+                    return self.refresh_local_search();
+                }
+                Task::none()
+            }
+            Message::LocalSearchRefreshFinished(result) => {
+                self.local_search_status = self.local_search.status();
+                if let Err(error) = result {
+                    self.notice = Some(format!("Atualização da busca local: {error}"));
+                }
+                if self.local_search_refresh_pending
+                    && self.local_search_status.phase == LocalSearchPhase::Ready
+                {
+                    return self.refresh_local_search();
                 }
                 Task::none()
             }
@@ -1538,12 +1584,17 @@ impl App {
                 self.action_busy = false;
                 self.assistant_capture = None;
                 self.assistant_answer = None;
-                if let Err(error) = result {
-                    self.notice = Some(error);
-                } else {
-                    self.new_tag.clear();
-                }
-                self.reload()
+                let refresh = match result {
+                    Ok(()) => {
+                        self.new_tag.clear();
+                        self.refresh_local_search()
+                    }
+                    Err(error) => {
+                        self.notice = Some(error);
+                        Task::none()
+                    }
+                };
+                Task::batch([self.reload(), refresh])
             }
             Message::CycleAiProvider => {
                 #[cfg(debug_assertions)]
@@ -2379,19 +2430,21 @@ impl App {
                 if self.selected_capture.as_deref() == Some(capture_id.as_str()) {
                     self.notice = Some("Análise local da imagem concluída.".into());
                 }
-                self.reload()
+                let refresh = self.refresh_local_search();
+                Task::batch([self.reload(), refresh])
             }
             Message::ClipboardCaptured(result) => match result {
                 Ok(Some((id, open_quick_context))) => {
                     self.notice = Some("Captura automática salva.".into());
+                    let refresh = self.refresh_local_search();
                     if open_quick_context {
                         self.query.clear();
                         self.context = None;
                         self.offset = 0;
                         self.selected_capture = Some(id.clone());
-                        Task::done(Message::OpenQuickContext(id))
+                        Task::batch([Task::done(Message::OpenQuickContext(id)), refresh])
                     } else {
-                        self.reload()
+                        Task::batch([self.reload(), refresh])
                     }
                 }
                 Ok(None) => Task::none(),
@@ -2631,6 +2684,7 @@ impl App {
                 if revision != self.revision {
                     return Task::none();
                 }
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 let close_quick_context = match result {
                     Ok(()) => {
                         self.assistant_capture = None;
@@ -2646,11 +2700,15 @@ impl App {
                 if close_quick_context.is_some() {
                     self.quick_context_selected.clear();
                 }
-                let reload = self.reload();
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
                 if let Some(id) = close_quick_context {
-                    Task::batch([reload, window::close(id)])
+                    tasks.push(window::close(id));
+                    Task::batch(tasks)
                 } else {
-                    reload
+                    Task::batch(tasks)
                 }
             }
             Message::ContextRemoved(revision, result) => {
@@ -2658,6 +2716,7 @@ impl App {
                 if revision != self.revision {
                     return Task::none();
                 }
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 match result {
                     Ok(()) => {
                         self.assistant_capture = None;
@@ -2666,7 +2725,11 @@ impl App {
                     }
                     Err(error) => self.notice = Some(error),
                 }
-                self.reload()
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
+                Task::batch(tasks)
             }
             Message::Captured(revision, result) => {
                 self.action_busy = false;
@@ -2676,14 +2739,18 @@ impl App {
                 match result {
                     Ok(id) => {
                         self.notice = Some("Captura salva.".into());
+                        let refresh = self.refresh_local_search();
                         self.query.clear();
                         self.context = None;
                         self.offset = 0;
                         self.selected_capture = Some(id.clone());
                         if self.quick_context_enabled {
-                            return Task::done(Message::OpenQuickContext(id));
+                            return Task::batch([
+                                Task::done(Message::OpenQuickContext(id)),
+                                refresh,
+                            ]);
                         }
-                        return self.reload();
+                        return Task::batch([self.reload(), refresh]);
                     }
                     Err(error) => self.notice = Some(error),
                 }
@@ -4541,6 +4608,31 @@ fn remove_local_search(manager: Arc<LocalSearchManager>) -> Result<LocalSearchSt
             LocalSearchPhase::Error,
             Some(scrypuppy_core::app_error::AppNotice::new(
                 "local_search.remove_failed",
+            )),
+        );
+        return Err(error);
+    }
+    Ok(manager.status())
+}
+
+fn refresh_local_search_data(
+    manager: Arc<LocalSearchManager>,
+) -> Result<LocalSearchStatus, String> {
+    let result = (|| {
+        let (path, key) = default_database_credentials()?;
+        let mut conn = open_existing_read_write(&path, &key)?;
+        manager.load_model(false)?;
+        manager.set_phase(LocalSearchPhase::Indexing, None);
+        scrypuppy_core::local_search::index_embeddings(&mut conn, &manager, |_| {})?;
+        manager.set_phase(LocalSearchPhase::Ready, None);
+        Ok(())
+    })();
+    manager.finish_operation();
+    if let Err(error) = result {
+        manager.set_phase(
+            LocalSearchPhase::Error,
+            Some(scrypuppy_core::app_error::AppNotice::new(
+                "local_search.operation_failed",
             )),
         );
         return Err(error);
