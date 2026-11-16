@@ -562,6 +562,8 @@ enum Message {
     CancelDeleteCapture,
     DeleteCapture(String),
     CaptureDeleted(Result<(), String>),
+    ImportFiles,
+    FilesImported(Result<usize, String>),
     RequestClearAllData,
     CancelClearAllData,
     ConfirmClearAllData,
@@ -2167,6 +2169,46 @@ impl App {
                 }
                 self.reload()
             }
+            Message::ImportFiles => {
+                if self.action_busy || self.is_demo_mode() {
+                    if self.is_demo_mode() {
+                        self.notice = Some("Importação desativada no modo de demonstração.".into());
+                    }
+                    return Task::none();
+                }
+                self.action_busy = true;
+                self.notice = None;
+                Task::perform(
+                    async {
+                        let Some(files) = rfd::AsyncFileDialog::new().pick_files().await else {
+                            return Ok(0);
+                        };
+                        import_file_paths(
+                            files.iter().map(|file| file.path().to_path_buf()).collect(),
+                        )
+                    },
+                    Message::FilesImported,
+                )
+            }
+            Message::FilesImported(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(0) => Task::none(),
+                    Ok(count) => {
+                        self.notice = Some(format!("{count} arquivo(s) importado(s)."));
+                        self.query.clear();
+                        self.context = None;
+                        self.offset = 0;
+                        let refresh = self.refresh_local_search();
+                        Task::batch([self.reload(), refresh])
+                    }
+                    Err(error) => {
+                        self.notice = Some(error);
+                        let refresh = self.refresh_local_search();
+                        Task::batch([self.reload(), refresh])
+                    }
+                }
+            }
             Message::RequestClearAllData => {
                 self.clear_all_data_confirmation = true;
                 Task::none()
@@ -3187,6 +3229,8 @@ impl App {
                 "Capturar clipboard"
             })
             .on_press(Message::CaptureClipboard),
+            button("Importar arquivos")
+                .on_press_maybe((!self.action_busy).then_some(Message::ImportFiles)),
             button(if self.clipboard_monitor_enabled {
                 "Auto: ligada"
             } else {
@@ -6402,6 +6446,56 @@ fn remove_capture_from_context_in(
             "Contexto atualizado, mas não foi possível atualizar seu export criptografado: {error}"
         )
         })
+}
+
+fn import_file_paths(paths: Vec<PathBuf>) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let _capture_session = CAPTURE_COORDINATOR
+        .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default)
+        .begin()?;
+    if DATA_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+        return Err("A limpeza da biblioteca está em andamento.".into());
+    }
+    let (database_path, database_key) = default_database_credentials()?;
+    let app_dir = database_path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let mut conn = open_existing_read_write(&database_path, &database_key).map_err(|_| {
+        "Não foi possível abrir a biblioteca com segurança para edição.".to_string()
+    })?;
+    let mut imported = 0usize;
+    for source_path in paths {
+        if !source_path.exists() {
+            return Err(format!(
+                "O caminho selecionado não existe: {}",
+                source_path.display()
+            ));
+        }
+        let file = scrypuppy_core::clipboard::ClipboardFile::physical(source_path);
+        let snapshot = scrypuppy_core::clipboard::ClipboardSnapshot {
+            representations: vec![scrypuppy_core::clipboard::ClipboardRepresentation::Files(
+                vec![file],
+            )],
+            formats: Vec::new(),
+        };
+        let id = scrypuppy_core::capture_store::save_clipboard_capture_with_window_metadata(
+            &mut conn,
+            app_dir,
+            &snapshot,
+            "capture",
+            scrypuppy_core::capture_store::CaptureSourceMetadata {
+                capture_origin: "file_import",
+                source_app_name: Some("Windows Explorer"),
+                ..scrypuppy_core::capture_store::CaptureSourceMetadata::default()
+            },
+        )?;
+        let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
+        sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
+        imported += 1;
+    }
+    Ok(imported)
 }
 
 fn capture_current_clipboard() -> Result<String, String> {
