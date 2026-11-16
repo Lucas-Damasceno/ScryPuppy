@@ -1927,6 +1927,7 @@ impl App {
             }
             Message::ContextRuleCreated(result) => {
                 self.action_busy = false;
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 match result {
                     Ok(count) => {
                         self.new_rule_name.clear();
@@ -1940,7 +1941,11 @@ impl App {
                     }
                     Err(error) => self.notice = Some(error),
                 }
-                self.reload()
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
+                Task::batch(tasks)
             }
             Message::ToggleContextRule(id, enabled) => {
                 if self.action_busy {
@@ -1964,10 +1969,15 @@ impl App {
             }
             Message::ContextRuleChanged(result) => {
                 self.action_busy = false;
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 if let Err(error) = result {
                     self.notice = Some(error);
                 }
-                self.reload()
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
+                Task::batch(tasks)
             }
             Message::ContextCreated(result) => {
                 self.action_busy = false;
@@ -2019,6 +2029,7 @@ impl App {
             }
             Message::ContextRenamed(result) => {
                 self.action_busy = false;
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 match result {
                     Ok(id) => {
                         self.context = Some(id);
@@ -2026,7 +2037,11 @@ impl App {
                     }
                     Err(error) => self.notice = Some(error),
                 }
-                self.reload()
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
+                Task::batch(tasks)
             }
             Message::RequestDeleteContext(id) => {
                 self.pending_delete_context = Some(id);
@@ -2056,6 +2071,7 @@ impl App {
             Message::ContextDeleted(result) => {
                 self.action_busy = false;
                 self.pending_delete_context = None;
+                let refresh = result.is_ok().then(|| self.refresh_local_search());
                 match result {
                     Ok(()) => {
                         self.context = None;
@@ -2065,7 +2081,11 @@ impl App {
                     }
                     Err(error) => self.notice = Some(error),
                 }
-                self.reload()
+                let mut tasks = vec![self.reload()];
+                if let Some(refresh) = refresh {
+                    tasks.push(refresh);
+                }
+                Task::batch(tasks)
             }
             Message::SelectCapture(id) => {
                 self.selected_capture = Some(id);
