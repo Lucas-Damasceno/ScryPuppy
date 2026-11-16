@@ -27,6 +27,7 @@ use std::{
 static QUICK_PASTE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static CAPTURE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static REFERENCE_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
+static MAGIC_SEARCH_HOTKEY_ID: OnceLock<u32> = OnceLock::new();
 static TRAY_EVENT_SENDER: OnceLock<
     Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<Message>>>,
 > = OnceLock::new();
@@ -83,6 +84,7 @@ fn main() -> iced::Result {
                 ("ctrl+shift+KeyV", "Quick Paste", &QUICK_PASTE_HOTKEY_ID),
                 ("ctrl+shift+KeyC", "captura", &CAPTURE_HOTKEY_ID),
                 ("ctrl+shift+KeyS", "referência", &REFERENCE_HOTKEY_ID),
+                ("ctrl+shift+KeyF", "Magic Search", &MAGIC_SEARCH_HOTKEY_ID),
             ] {
                 match HotKey::from_str(shortcut) {
                     Ok(hotkey) => match manager.register(hotkey) {
@@ -382,6 +384,7 @@ struct App {
     quick_context_window: Option<window::Id>,
     quick_context_selected: Vec<String>,
     quick_search_id: iced::widget::Id,
+    assistant_query_id: iced::widget::Id,
     paste_target: Option<isize>,
     dark: bool,
     query: String,
@@ -475,6 +478,7 @@ enum Message {
     FocusTab(window::Id, bool),
     MainOpened(window::Id),
     ShowMain,
+    OpenMagicSearch,
     QuitFromTray,
     LocalSearchTick,
     PrepareLocalSearch,
@@ -684,6 +688,7 @@ impl App {
             quick_context_window: None,
             quick_context_selected: Vec::new(),
             quick_search_id: iced::widget::Id::unique(),
+            assistant_query_id: iced::widget::Id::unique(),
             paste_target: None,
             dark: true,
             query: String::new(),
@@ -908,6 +913,13 @@ impl App {
             }
             Message::MainOpened(_) => Task::none(),
             Message::ShowMain => show_window(self.main),
+            Message::OpenMagicSearch => {
+                self.settings_open = false;
+                Task::batch([
+                    show_window(self.main),
+                    iced::widget::operation::focus(self.assistant_query_id.clone()),
+                ])
+            }
             Message::QuitFromTray => iced::exit(),
             Message::LocalSearchTick => {
                 self.local_search_status = self.local_search.status();
@@ -3313,6 +3325,7 @@ impl App {
                     text_input("Pergunte sobre suas capturas", &self.assistant_query)
                         .on_input(Message::AssistantQueryChanged)
                         .on_submit(Message::AskAssistant)
+                        .id(self.assistant_query_id.clone())
                         .padding(10),
                     button(if self.assistant_busy {
                         "Buscando…"
@@ -4432,6 +4445,7 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
             let quick_paste_id = QUICK_PASTE_HOTKEY_ID.get().copied();
             let capture_id = CAPTURE_HOTKEY_ID.get().copied();
             let reference_id = REFERENCE_HOTKEY_ID.get().copied();
+            let magic_search_id = MAGIC_SEARCH_HOTKEY_ID.get().copied();
             let _ = thread::Builder::new()
                 .name("scrypuppy-hotkey-events".into())
                 .spawn(move || {
@@ -4447,6 +4461,12 @@ fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
                         }
                         if Some(event.id) == reference_id {
                             if sender.unbounded_send(Message::CaptureReference).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if Some(event.id) == magic_search_id {
+                            if sender.unbounded_send(Message::OpenMagicSearch).is_err() {
                                 break;
                             }
                             continue;
@@ -7686,6 +7706,12 @@ mod tests {
     #[test]
     fn reference_shortcut_is_registered_as_ctrl_shift_s() {
         let hotkey = HotKey::from_str("ctrl+shift+KeyS").unwrap();
+        assert_ne!(hotkey.id(), 0);
+    }
+
+    #[test]
+    fn magic_search_shortcut_is_registered_as_ctrl_shift_f() {
+        let hotkey = HotKey::from_str("ctrl+shift+KeyF").unwrap();
         assert_ne!(hotkey.id(), 0);
     }
 

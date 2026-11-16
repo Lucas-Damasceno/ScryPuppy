@@ -4,6 +4,8 @@ Esta aplicação ainda não substitui a versão distribuída. A tela principal a
 
 A barra principal também importa múltiplos arquivos selecionados como capturas independentes, guardando os anexos na biblioteca e aplicando as regras de Contexto existentes.
 
+Ctrl+Shift+F abre a janela principal com foco na pergunta à biblioteca, substituindo o atalho de Magic Search do shell anterior.
+
 Na raiz do projeto, execute `cargo run --manifest-path apps/scrypuppy-iced/Cargo.toml` no Windows. A compilação do SQLCipher requer as mesmas ferramentas nativas do projeto existente. DOCX também gera uma miniatura PNG local da primeira página em segundo plano, com limites de leitura do pacote e do tamanho renderizado; a imagem fica no cache local e não é enviada a serviços externos. O idioma das respostas e documentos do assistente pode alternar entre português e inglês; a localização da interface Iced ainda está pendente. Os atalhos globais incluem Ctrl+Shift+C para salvar o clipboard atual, Ctrl+Shift+S para copiar a seleção do aplicativo ativo e salvá-la como referência na Knowledge Base, e Ctrl+Shift+V para Quick Paste. Configurações controlam se o Quick Context abre após uma captura manual, referência ou captura automática.
 
 Para conferir o layout sem acessar dados pessoais, adicione `-- --demo` ao comando de desenvolvimento. Esse modo usa apenas dados sintéticos e não é incluído em builds de release.
