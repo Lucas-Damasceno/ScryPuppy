@@ -3,7 +3,7 @@ use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotK
 use iced::widget::{
     button, column, container, image as iced_image, row, scrollable, text, text_input, Space,
 };
-use iced::{window, Alignment, Color, Element, Length, Size, Task, Theme};
+use iced::{window, Alignment, Color, Element, Length, Point, Size, Task, Theme};
 use keyring::{Entry as CredentialEntry, Error as CredentialError};
 use scrypuppy_core::library::{
     count_captures_from_conn, list_captures_from_conn, list_contexts_from_conn, CaptureDto,
@@ -519,7 +519,12 @@ impl App {
                 let (id, open) = window::open(window::Settings {
                     size: Size::new(430.0, 570.0),
                     min_size: Some(Size::new(380.0, 420.0)),
-                    position: window::Position::Centered,
+                    position: window::Position::SpecificWith(|window, monitor| {
+                        Point::new(
+                            ((monitor.width - window.width) / 2.0).max(0.0),
+                            ((monitor.height - window.height) / 2.0).max(0.0),
+                        )
+                    }),
                     level: window::Level::AlwaysOnTop,
                     decorations: false,
                     transparent: true,
@@ -553,7 +558,9 @@ impl App {
                 let (id, open) = window::open(window::Settings {
                     size: Size::new(390.0, 440.0),
                     min_size: Some(Size::new(340.0, 320.0)),
-                    position: window::Position::Centered,
+                    position: window::Position::SpecificWith(|window, monitor| {
+                        Point::new(16.0, (monitor.height - window.height - 64.0).max(0.0))
+                    }),
                     level: window::Level::AlwaysOnTop,
                     decorations: false,
                     transparent: true,
