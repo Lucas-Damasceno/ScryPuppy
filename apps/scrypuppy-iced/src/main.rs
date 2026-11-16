@@ -3718,11 +3718,10 @@ fn previews(
                 }
             }
         }
-        if let Some(file) = capture.files.iter().find(|file| {
-            file.extension.as_deref().is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("txt") || extension.eq_ignore_ascii_case("docx")
-            })
-        }) {
+        for file in &capture.files {
+            let Some(extension) = file.extension.as_deref() else {
+                continue;
+            };
             let bytes = if let Some(path) = file.local_path.as_deref() {
                 read_managed_asset(root, Path::new(path))
             } else if let Some(path) = file.original_path.as_deref() {
@@ -3730,8 +3729,21 @@ fn previews(
             } else {
                 continue;
             };
+            if extension.eq_ignore_ascii_case("pdf") {
+                if let Some(path) = file.local_path.as_deref().map(Path::new) {
+                    if read_managed_asset(root, path).is_ok() {
+                        if let Ok(preview) = render_pdf_first_page(path) {
+                            images.push((capture.id.clone(), preview));
+                        }
+                    }
+                }
+                continue;
+            }
+            if !extension.eq_ignore_ascii_case("txt") && !extension.eq_ignore_ascii_case("docx") {
+                continue;
+            }
             if let Ok(bytes) = bytes {
-                let excerpt = match file.extension.as_deref() {
+                let excerpt = match Some(extension) {
                     Some(extension) if extension.eq_ignore_ascii_case("txt") => {
                         scrypuppy_core::preview::text_excerpt(&bytes)
                     }
@@ -3745,6 +3757,67 @@ fn previews(
         }
     }
     (images, text)
+}
+
+#[cfg(windows)]
+fn render_pdf_first_page(path: &Path) -> Result<Vec<u8>, String> {
+    use windows::{
+        core::HSTRING,
+        Data::Pdf::PdfDocument,
+        Storage::StorageFile,
+        Storage::Streams::{DataReader, InMemoryRandomAccessStream},
+        Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+    };
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 20 * 1024 * 1024 {
+        return Err("PDF acima do limite seguro de prévia.".into());
+    }
+    // The preview worker owns this COM apartment and never blocks capture or window creation.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.display().to_string()))
+        .map_err(|error| error.to_string())?
+        .get()
+        .map_err(|error| error.to_string())?;
+    let document = PdfDocument::LoadFromFileAsync(&file)
+        .map_err(|error| error.to_string())?
+        .get()
+        .map_err(|error| error.to_string())?;
+    if document.PageCount().map_err(|error| error.to_string())? == 0 {
+        return Err("O PDF não contém páginas.".into());
+    }
+    let page = document.GetPage(0).map_err(|error| error.to_string())?;
+    let stream = InMemoryRandomAccessStream::new().map_err(|error| error.to_string())?;
+    page.RenderToStreamAsync(&stream)
+        .map_err(|error| error.to_string())?
+        .get()
+        .map_err(|error| error.to_string())?;
+    let size = stream.Size().map_err(|error| error.to_string())?;
+    if size == 0 || size > 12 * 1024 * 1024 {
+        return Err("A miniatura do PDF excedeu o limite seguro.".into());
+    }
+    let reader = DataReader::CreateDataReader(
+        &stream
+            .GetInputStreamAt(0)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    reader
+        .LoadAsync(size as u32)
+        .map_err(|error| error.to_string())?
+        .get()
+        .map_err(|error| error.to_string())?;
+    let mut bytes = vec![0; size as usize];
+    reader
+        .ReadBytes(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let preview =
+        image_thumbnail(&bytes).map_err(|error| format!("Prévia PDF inválida: {error:?}"))?;
+    Ok(preview.png)
+}
+
+#[cfg(not(windows))]
+fn render_pdf_first_page(_path: &Path) -> Result<Vec<u8>, String> {
+    Err("A prévia visual de PDF está disponível no Windows.".into())
 }
 
 fn link_previews(
