@@ -2163,6 +2163,10 @@ impl App {
                 self.quick_paste_style_changed = true;
                 #[cfg(debug_assertions)]
                 if self.demo {
+                    #[cfg(windows)]
+                    if let Some(id) = self.quick_window {
+                        return set_quick_paste_hit_region(id, self.quick_paste_minimal);
+                    }
                     return Task::none();
                 }
                 let value = if self.quick_paste_minimal {
