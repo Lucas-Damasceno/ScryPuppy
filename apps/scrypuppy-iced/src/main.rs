@@ -4000,22 +4000,20 @@ fn set_quick_paste_hit_region(id: window::Id, minimal: bool) -> Task<Message> {
             if GetClientRect(hwnd, &mut client).is_err() {
                 return;
             }
-            let dpi = GetDpiForWindow(hwnd).max(1) as f32 / 96.0;
-            let margin = (14.0 * dpi).round() as i32;
-            let radius = (36.0 * dpi).round() as i32;
             let width = client.right - client.left;
             let height = client.bottom - client.top;
-            if width <= margin * 2 || height <= margin * 2 {
+            let dpi = GetDpiForWindow(hwnd);
+            let Some(bounds) = quick_paste_hit_region_bounds(width, height, dpi) else {
                 return;
-            }
+            };
 
             let region = CreateRoundRectRgn(
-                margin,
-                margin,
-                width - margin,
-                height - margin,
-                radius,
-                radius,
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+                bounds.corner_radius,
+                bounds.corner_radius,
             );
             if SetWindowRgn(hwnd, Some(region), true) == 0 {
                 let _ = DeleteObject(HGDIOBJ(region.0));
@@ -4028,6 +4026,35 @@ fn set_quick_paste_hit_region(id: window::Id, minimal: bool) -> Task<Message> {
 #[cfg(not(windows))]
 fn set_quick_paste_hit_region(_id: window::Id, _minimal: bool) -> Task<Message> {
     Task::none()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QuickPasteHitRegionBounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    corner_radius: i32,
+}
+
+fn quick_paste_hit_region_bounds(
+    width: i32,
+    height: i32,
+    dpi: u32,
+) -> Option<QuickPasteHitRegionBounds> {
+    let scale = dpi.max(1) as f32 / 96.0;
+    let margin = (14.0 * scale).round() as i32;
+    if width <= margin * 2 || height <= margin * 2 {
+        return None;
+    }
+    let corner_radius = (36.0 * scale).round() as i32;
+    Some(QuickPasteHitRegionBounds {
+        left: margin,
+        top: margin,
+        right: width - margin,
+        bottom: height - margin,
+        corner_radius,
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -6336,6 +6363,31 @@ fn preview_fallback_text(capture: &CaptureDto) -> String {
 mod tests {
     use super::*;
     use scrypuppy_core::storage::open_or_create;
+
+    #[test]
+    fn quick_paste_hit_region_scales_with_dpi_and_rejects_tiny_windows() {
+        assert_eq!(
+            quick_paste_hit_region_bounds(430, 570, 96),
+            Some(QuickPasteHitRegionBounds {
+                left: 14,
+                top: 14,
+                right: 416,
+                bottom: 556,
+                corner_radius: 36,
+            })
+        );
+        assert_eq!(
+            quick_paste_hit_region_bounds(645, 855, 144),
+            Some(QuickPasteHitRegionBounds {
+                left: 21,
+                top: 21,
+                right: 624,
+                bottom: 834,
+                corner_radius: 54,
+            })
+        );
+        assert_eq!(quick_paste_hit_region_bounds(24, 570, 96), None);
+    }
 
     #[test]
     fn assistant_date_filters_cover_the_whole_requested_day() {
