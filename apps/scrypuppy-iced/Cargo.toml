@@ -12,6 +12,7 @@ global-hotkey = "=0.8.0"
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "image-without-codecs"] }
 keyring = "4.1.4"
 uuid = { version = "1", features = ["v4"] }
+url = "2.5.8"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher-vendored-openssl"] }
 scrypuppy-core = { path = "../../crates/scrypuppy-core" }

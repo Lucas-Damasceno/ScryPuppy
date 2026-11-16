@@ -12,12 +12,12 @@ use scrypuppy_core::library::{
 use scrypuppy_core::preview::{image_thumbnail, read_managed_asset};
 use scrypuppy_core::storage::{open_existing_read_only, open_existing_read_write, DATABASE_FILE};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
 };
@@ -186,6 +186,21 @@ struct Snapshot {
     quick_paste_minimal: bool,
     quick_context_minimal: bool,
     clipboard_monitor_enabled: bool,
+    link_preview_fetch_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LinkPreviewData {
+    title: Option<String>,
+    image: Option<Vec<u8>>,
+    favicon: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+struct LinkPreviewHandles {
+    title: Option<String>,
+    image: Option<iced_image::Handle>,
+    favicon: Option<iced_image::Handle>,
 }
 
 struct App {
@@ -203,6 +218,9 @@ struct App {
     theme_changed: bool,
     clipboard_monitor_enabled: bool,
     clipboard_monitor_changed: bool,
+    link_preview_fetch_enabled: bool,
+    link_preview_fetch_changed: bool,
+    link_previews_loading: bool,
     quick_paste_minimal: bool,
     quick_context_minimal: bool,
     quick_paste_style_changed: bool,
@@ -215,6 +233,7 @@ struct App {
     notice: Option<String>,
     thumbnails: HashMap<String, iced_image::Handle>,
     text_previews: HashMap<String, String>,
+    link_previews: HashMap<String, LinkPreviewHandles>,
     #[cfg(debug_assertions)]
     demo: bool,
 }
@@ -246,6 +265,7 @@ enum Message {
     PasteCapture(String),
     ToggleTheme,
     ToggleClipboardMonitor,
+    ToggleLinkPreviewFetch,
     ClipboardChanged(u32),
     ClipboardCaptured(Result<Option<(String, bool)>, String>),
     ClipboardMonitorSaved(Result<(), String>),
@@ -253,12 +273,14 @@ enum Message {
     ToggleQuickContextStyle,
     Loaded(u64, Result<Snapshot, String>),
     Previews(u64, Vec<(String, Vec<u8>)>, Vec<(String, String)>),
+    LinkPreviews(u64, Vec<(String, LinkPreviewData)>),
     ContextAssigned(u64, Result<(), String>),
     ContextRemoved(u64, Result<(), String>),
     Captured(u64, Result<String, String>),
     Pasted(Result<(), String>),
     ThemeSaved(Result<(), String>),
     QuickStyleSaved(Result<(), String>),
+    LinkPreviewsSaved(Result<(), String>),
 }
 
 impl App {
@@ -284,6 +306,9 @@ impl App {
             theme_changed: false,
             clipboard_monitor_enabled: false,
             clipboard_monitor_changed: false,
+            link_preview_fetch_enabled: true,
+            link_preview_fetch_changed: false,
+            link_previews_loading: false,
             quick_paste_minimal: true,
             quick_context_minimal: true,
             quick_paste_style_changed: false,
@@ -296,6 +321,7 @@ impl App {
             notice: None,
             thumbnails: HashMap::new(),
             text_previews: HashMap::new(),
+            link_previews: HashMap::new(),
             #[cfg(debug_assertions)]
             demo: false,
         };
@@ -610,6 +636,25 @@ impl App {
                     Message::ClipboardMonitorSaved,
                 )
             }
+            Message::ToggleLinkPreviewFetch => {
+                self.link_preview_fetch_enabled = !self.link_preview_fetch_enabled;
+                self.link_preview_fetch_changed = true;
+                #[cfg(debug_assertions)]
+                if self.demo {
+                    return Task::none();
+                }
+                let value = if self.link_preview_fetch_enabled {
+                    "true"
+                } else {
+                    "false"
+                };
+                let reload = self.reload();
+                let save = Task::perform(
+                    async move { save_setting_value("link_preview_fetch_enabled", value) },
+                    Message::LinkPreviewsSaved,
+                );
+                Task::batch([reload, save])
+            }
             Message::ClipboardChanged(sequence) => {
                 let coordinator = CAPTURE_COORDINATOR
                     .get_or_init(scrypuppy_core::coordination::CaptureCoordinator::default);
@@ -704,6 +749,20 @@ impl App {
                 }
                 Task::none()
             }
+            Message::LinkPreviewsSaved(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!(
+                        "Preferência de prévias alterada nesta sessão, mas não foi salva: {error}"
+                    ));
+                } else {
+                    self.notice = Some(if self.link_preview_fetch_enabled {
+                        "Prévia de links ativada; ScryPuppy buscará dados em sites públicos para os links salvos.".into()
+                    } else {
+                        "Busca remota de prévias desativada.".into()
+                    });
+                }
+                Task::none()
+            }
             Message::Loaded(revision, result) if revision == self.revision => {
                 self.loading = false;
                 match result {
@@ -724,13 +783,27 @@ impl App {
                             CLIPBOARD_MONITOR_ENABLED
                                 .store(snapshot.clipboard_monitor_enabled, Ordering::Release);
                         }
+                        if !self.link_preview_fetch_changed {
+                            self.link_preview_fetch_enabled = snapshot.link_preview_fetch_enabled;
+                        }
+                        let fetch_links = self.link_preview_fetch_enabled;
+                        self.link_previews_loading = fetch_links
+                            && captures.iter().any(|capture| capture.content_kind == "url");
                         self.snapshot = Some(snapshot);
                         self.thumbnails.clear();
                         self.text_previews.clear();
-                        return Task::perform(
-                            async move { previews(&root, &captures) },
+                        self.link_previews.clear();
+                        let preview_root = root.clone();
+                        let preview_captures = captures.clone();
+                        let local = Task::perform(
+                            async move { previews(&preview_root, &preview_captures) },
                             move |(images, text)| Message::Previews(revision, images, text),
                         );
+                        let links = Task::perform(
+                            async move { link_previews(&root, &captures, fetch_links) },
+                            move |links| Message::LinkPreviews(revision, links),
+                        );
+                        return Task::batch([local, links]);
                     }
                     Err(error) => {
                         self.snapshot = None;
@@ -747,6 +820,25 @@ impl App {
                         .map(|(id, data)| (id, iced_image::Handle::from_bytes(data)))
                         .collect();
                     self.text_previews = text.into_iter().collect();
+                }
+                Task::none()
+            }
+            Message::LinkPreviews(revision, links) => {
+                if revision == self.revision {
+                    self.link_previews_loading = false;
+                    self.link_previews = links
+                        .into_iter()
+                        .map(|(id, preview)| {
+                            (
+                                id,
+                                LinkPreviewHandles {
+                                    title: preview.title,
+                                    image: preview.image.map(iced_image::Handle::from_bytes),
+                                    favicon: preview.favicon.map(iced_image::Handle::from_bytes),
+                                },
+                            )
+                        })
+                        .collect();
                 }
                 Task::none()
             }
@@ -872,6 +964,12 @@ impl App {
                 "Auto: desligada"
             })
             .on_press(Message::ToggleClipboardMonitor),
+            button(if self.link_preview_fetch_enabled {
+                "Prévia web: ligada"
+            } else {
+                "Prévia web: desligada"
+            })
+            .on_press(Message::ToggleLinkPreviewFetch),
             button(if self.dark {
                 "Tema claro"
             } else {
@@ -893,6 +991,9 @@ impl App {
                 text("Capturas novas são salvas localmente; imagens seguem a preferência de captura de telas.").size(11),
             );
         }
+        content = content.push(
+            text("Prévia web acessa sites públicos para buscar título, favicon e imagem do link; a busca pode ser desativada aqui.").size(11),
+        );
         if self.loading {
             content = content.push(text("Carregando biblioteca…"));
         } else if let Some(error) = &self.error {
@@ -936,6 +1037,27 @@ impl App {
                         .unwrap_or("Aplicativo desconhecido");
                     let mut body =
                         column![text(capture.content_kind.to_uppercase()).size(10)].spacing(9);
+                    let link_preview = self.link_previews.get(&capture.id);
+                    if let Some(favicon) = link_preview.and_then(|preview| preview.favicon.clone())
+                    {
+                        body = body.push(
+                            row![
+                                iced_image(favicon).height(18).width(18),
+                                text(
+                                    link_preview
+                                        .and_then(|preview| preview.title.as_deref())
+                                        .unwrap_or(source)
+                                )
+                                .size(12),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        );
+                    } else if let Some(title) =
+                        link_preview.and_then(|preview| preview.title.as_deref())
+                    {
+                        body = body.push(text(title).size(12));
+                    }
                     if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                         body = body.push(
                             iced_image(thumbnail.clone())
@@ -943,7 +1065,22 @@ impl App {
                                 .width(Length::Fill)
                                 .content_fit(iced::ContentFit::Contain),
                         );
+                    } else if let Some(thumbnail) =
+                        link_preview.and_then(|preview| preview.image.clone())
+                    {
+                        body = body.push(
+                            iced_image(thumbnail)
+                                .height(80)
+                                .width(Length::Fill)
+                                .content_fit(iced::ContentFit::Contain),
+                        );
                     } else {
+                        let excerpt = if capture.content_kind == "url" && self.link_previews_loading
+                        {
+                            "Buscando prévia do site…".to_string()
+                        } else {
+                            excerpt
+                        };
                         body = body.push(text(excerpt).size(15));
                     }
                     if let Some(file) = capture.files.first() {
@@ -1160,6 +1297,26 @@ impl App {
                 ))
                 .size(10),]
                 .spacing(7);
+                let link_preview = self.link_previews.get(&capture.id);
+                if let Some(favicon) = link_preview.and_then(|preview| preview.favicon.clone()) {
+                    card = card.push(
+                        row![
+                            iced_image(favicon).height(16).width(16),
+                            text(
+                                link_preview
+                                    .and_then(|preview| preview.title.as_deref())
+                                    .unwrap_or(source)
+                            )
+                            .size(11),
+                        ]
+                        .spacing(7)
+                        .align_y(Alignment::Center),
+                    );
+                } else if let Some(title) =
+                    link_preview.and_then(|preview| preview.title.as_deref())
+                {
+                    card = card.push(text(title).size(11));
+                }
                 if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                     card = card.push(
                         iced_image(thumbnail.clone())
@@ -1167,7 +1324,21 @@ impl App {
                             .width(Length::Fill)
                             .content_fit(iced::ContentFit::Contain),
                     );
+                } else if let Some(thumbnail) =
+                    link_preview.and_then(|preview| preview.image.clone())
+                {
+                    card = card.push(
+                        iced_image(thumbnail)
+                            .height(96)
+                            .width(Length::Fill)
+                            .content_fit(iced::ContentFit::Contain),
+                    );
                 } else {
+                    let excerpt = if capture.content_kind == "url" && self.link_previews_loading {
+                        "Buscando prévia do site…".to_string()
+                    } else {
+                        excerpt
+                    };
                     card = card.push(text(excerpt).size(14));
                 }
                 if let Some(file) = capture.files.first() {
@@ -1292,19 +1463,39 @@ impl App {
                 } else {
                     excerpt
                 };
+                let title = self
+                    .link_previews
+                    .get(&capture.id)
+                    .and_then(|preview| preview.title.as_deref());
+                let favicon = self
+                    .link_previews
+                    .get(&capture.id)
+                    .and_then(|preview| preview.favicon.clone());
+                let mut item = row![].spacing(8).align_y(Alignment::Center);
+                if let Some(favicon) = favicon {
+                    item = item.push(iced_image(favicon).height(16).width(16));
+                }
+                let excerpt = title.map(str::to_string).unwrap_or_else(|| {
+                    if capture.content_kind == "url" && self.link_previews_loading {
+                        "Buscando prévia…".into()
+                    } else {
+                        excerpt
+                    }
+                });
+                item = item.push(
+                    text(format!(
+                        "{} {} · {} · {}",
+                        if selected { "[x]" } else { "[ ]" },
+                        capture.content_kind.to_uppercase(),
+                        source,
+                        excerpt
+                    ))
+                    .size(11),
+                );
                 content = content.push(
-                    button(
-                        text(format!(
-                            "{} {} · {} · {}",
-                            if selected { "[x]" } else { "[ ]" },
-                            capture.content_kind.to_uppercase(),
-                            source,
-                            excerpt
-                        ))
-                        .size(11),
-                    )
-                    .on_press(Message::ToggleQuickContextCapture(capture.id.clone()))
-                    .width(Length::Fill),
+                    button(item)
+                        .on_press(Message::ToggleQuickContextCapture(capture.id.clone()))
+                        .width(Length::Fill),
                 );
             }
 
@@ -1324,9 +1515,30 @@ impl App {
                                 .size(10)
                         ]
                         .spacing(6);
+                    if let Some(link_preview) = self.link_previews.get(&capture.id) {
+                        let mut identity = row![].spacing(7).align_y(Alignment::Center);
+                        if let Some(favicon) = link_preview.favicon.clone() {
+                            identity = identity.push(iced_image(favicon).height(18).width(18));
+                        }
+                        if let Some(title) = link_preview.title.as_deref() {
+                            identity = identity.push(text(title).size(11));
+                        }
+                        preview = preview.push(identity);
+                    }
                     if let Some(thumbnail) = self.thumbnails.get(&capture.id) {
                         preview = preview.push(
                             iced_image(thumbnail.clone())
+                                .height(88)
+                                .width(Length::Fill)
+                                .content_fit(iced::ContentFit::Contain),
+                        );
+                    } else if let Some(thumbnail) = self
+                        .link_previews
+                        .get(&capture.id)
+                        .and_then(|preview| preview.image.clone())
+                    {
+                        preview = preview.push(
+                            iced_image(thumbnail)
                                 .height(88)
                                 .width(Length::Fill)
                                 .content_fit(iced::ContentFit::Contain),
@@ -1698,6 +1910,7 @@ fn demo_snapshot() -> Snapshot {
         quick_paste_minimal: true,
         quick_context_minimal: true,
         clipboard_monitor_enabled: false,
+        link_preview_fetch_enabled: true,
     }
 }
 
@@ -2171,6 +2384,8 @@ fn load_library(
     let quick_paste_minimal = read_style_preference(&conn, "iced_quick_paste_style");
     let quick_context_minimal = read_style_preference(&conn, "iced_quick_context_style");
     let clipboard_monitor_enabled = read_boolean_setting(&conn, "clipboard_monitor_enabled", false);
+    let link_preview_fetch_enabled =
+        read_boolean_setting(&conn, "link_preview_fetch_enabled", true);
     Ok(Snapshot {
         contexts: list_contexts_from_conn(&conn)?,
         total: count_captures_from_conn(&conn, &filter)?,
@@ -2183,6 +2398,7 @@ fn load_library(
         quick_paste_minimal,
         quick_context_minimal,
         clipboard_monitor_enabled,
+        link_preview_fetch_enabled,
     })
 }
 
@@ -2250,6 +2466,130 @@ fn previews(
     (images, text)
 }
 
+fn link_previews(
+    root: &Path,
+    captures: &[CaptureDto],
+    fetch: bool,
+) -> Vec<(String, LinkPreviewData)> {
+    let cache_root = root.join("link-previews");
+    let entries = captures
+        .iter()
+        .filter(|capture| capture.content_kind == "url")
+        .filter_map(|capture| capture_link_url(capture).map(|url| (capture.id.clone(), url)))
+        .collect::<VecDeque<_>>();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let queue = Arc::new(Mutex::new(entries));
+    std::thread::scope(|scope| {
+        let workers = (0..4)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let cache_root = cache_root.clone();
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let entry = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                        let Some((id, url)) = entry else { break };
+                        results.push((id, load_link_preview(&cache_root, &url, fetch)));
+                    }
+                    results
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok())
+            .flatten()
+            .collect()
+    })
+}
+
+fn capture_link_url(capture: &CaptureDto) -> Option<String> {
+    let candidate = capture
+        .representations
+        .iter()
+        .find(|representation| representation.kind == "url")
+        .and_then(|representation| representation.text_content.as_deref())
+        .unwrap_or(&capture.content_text)
+        .trim();
+    let parsed = url::Url::parse(candidate).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+fn load_link_preview(cache_root: &Path, url: &str, fetch: bool) -> LinkPreviewData {
+    use std::time::Duration;
+
+    let hash = scrypuppy_core::crypto::sha256_hex(url.as_bytes());
+    let marker_path = cache_root.join(format!("{hash}.cache"));
+    let title_path = cache_root.join(format!("{hash}.title"));
+    let image_path = cache_root.join(format!("{hash}.image.png"));
+    let favicon_path = cache_root.join(format!("{hash}.favicon.png"));
+    let read_cache = || LinkPreviewData {
+        title: read_bounded_cache_file(&title_path, 4096)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|title| !title.trim().is_empty()),
+        image: read_bounded_cache_file(&image_path, 3 * 1024 * 1024)
+            .and_then(|bytes| image_thumbnail(&bytes).ok())
+            .map(|preview| preview.png),
+        favicon: read_bounded_cache_file(&favicon_path, 3 * 1024 * 1024)
+            .and_then(|bytes| image_thumbnail(&bytes).ok())
+            .map(|preview| preview.png),
+    };
+    let fresh = std::fs::metadata(&marker_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(7 * 24 * 60 * 60));
+    if fresh || !fetch {
+        return read_cache();
+    }
+
+    let fetched = scrypuppy_core::link_fetch::fetch_link(url);
+    let Ok(fetched) = fetched else {
+        return read_cache();
+    };
+    let image = fetched
+        .image
+        .as_deref()
+        .and_then(|bytes| image_thumbnail(bytes).ok())
+        .map(|preview| preview.png);
+    let favicon = fetched
+        .favicon
+        .as_deref()
+        .and_then(|bytes| image_thumbnail(bytes).ok())
+        .map(|preview| preview.png);
+    if std::fs::create_dir_all(cache_root).is_ok() {
+        if let Some(title) = fetched.metadata.title.as_deref() {
+            let _ = std::fs::write(&title_path, title);
+        }
+        if let Some(bytes) = &image {
+            let _ = std::fs::write(&image_path, bytes);
+        } else {
+            let _ = std::fs::remove_file(&image_path);
+        }
+        if let Some(bytes) = &favicon {
+            let _ = std::fs::write(&favicon_path, bytes);
+        } else {
+            let _ = std::fs::remove_file(&favicon_path);
+        }
+        let _ = std::fs::write(marker_path, b"cached");
+    }
+    LinkPreviewData {
+        title: fetched.metadata.title,
+        image,
+        favicon,
+    }
+}
+
+fn read_bounded_cache_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
 fn preview_fallback_text(capture: &CaptureDto) -> String {
     let extension = capture
         .files
@@ -2285,6 +2625,18 @@ mod tests {
     fn capture_shortcut_matches_the_existing_default() {
         let hotkey = HotKey::from_str("ctrl+shift+KeyC").unwrap();
         assert_ne!(hotkey.id(), 0);
+    }
+
+    #[test]
+    fn link_preview_uses_local_cache_without_fetch_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1/private";
+        let hash = scrypuppy_core::crypto::sha256_hex(url.as_bytes());
+        std::fs::write(dir.path().join(format!("{hash}.title")), "Local title").unwrap();
+
+        let preview = load_link_preview(dir.path(), url, false);
+
+        assert_eq!(preview.title.as_deref(), Some("Local title"));
     }
 
     #[test]

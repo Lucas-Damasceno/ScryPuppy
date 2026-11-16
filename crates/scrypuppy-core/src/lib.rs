@@ -14,6 +14,6 @@ pub mod local_search;
 pub mod monitor;
 pub mod preview;
 pub mod restore;
+pub mod schema;
 pub mod search_index;
 pub mod storage;
-pub mod schema;

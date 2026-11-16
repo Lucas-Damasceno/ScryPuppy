@@ -4803,6 +4803,7 @@ dependencies = [
  "scrypuppy-core",
  "tempfile",
  "tray-icon",
+ "url",
  "uuid",
  "windows 0.61.3",
 ]
