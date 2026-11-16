@@ -1,7 +1,8 @@
 //! Native Iced UI for the ScryPuppy migration.
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use iced::widget::{
-    button, column, container, image as iced_image, row, scrollable, text, text_input, Space,
+    button, column, container, image as iced_image, row, scrollable, text, text_editor, text_input,
+    Space,
 };
 use iced::{window, Alignment, Color, Element, Length, Point, Size, Task, Theme};
 use keyring::{Entry as CredentialEntry, Error as CredentialError};
@@ -277,6 +278,7 @@ struct App {
     assistant_answer: Option<scrypuppy_core::assistant::ChatAnswer>,
     assistant_capture: Option<CaptureDto>,
     selected_document: Option<scrypuppy_core::documents::Document>,
+    document_editor: text_editor::Content,
     context: Option<String>,
     new_context_name: String,
     new_rule_name: String,
@@ -353,6 +355,11 @@ enum Message {
     AnswerSavedAsDocument(Result<scrypuppy_core::documents::Document, String>),
     OpenSavedDocument(String),
     SavedDocumentLoaded(Result<scrypuppy_core::documents::Document, String>),
+    EditDocument(text_editor::Action),
+    SaveEditedDocument,
+    EditedDocumentSaved(Result<(), String>),
+    ExportDocument,
+    DocumentExported(Result<String, String>),
     OpenAssistantEvidence(String),
     AssistantEvidenceLoaded(u64, String, Result<Box<CaptureDto>, String>),
     Search,
@@ -488,6 +495,7 @@ impl App {
             assistant_answer: None,
             assistant_capture: None,
             selected_document: None,
+            document_editor: text_editor::Content::new(),
             context: None,
             new_context_name: String::new(),
             new_rule_name: String::new(),
@@ -853,7 +861,61 @@ impl App {
             ),
             Message::SavedDocumentLoaded(result) => {
                 match result {
-                    Ok(document) => self.selected_document = Some(document),
+                    Ok(document) => {
+                        self.document_editor = text_editor::Content::with_text(&document.markdown);
+                        self.selected_document = Some(document);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::EditDocument(action) => {
+                self.document_editor.perform(action);
+                Task::none()
+            }
+            Message::SaveEditedDocument => {
+                let Some(document) = &self.selected_document else {
+                    return Task::none();
+                };
+                if self.is_demo_mode() {
+                    self.notice = Some("Edição desativada no modo de demonstração.".into());
+                    return Task::none();
+                }
+                self.action_busy = true;
+                let id = document.id.clone();
+                let markdown = self.document_editor.text();
+                Task::perform(
+                    async move { save_document_markdown(&id, &markdown) },
+                    Message::EditedDocumentSaved,
+                )
+            }
+            Message::EditedDocumentSaved(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(document) = &mut self.selected_document {
+                            document.markdown = self.document_editor.text();
+                        }
+                        self.notice = Some("Documento atualizado.".into());
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::ExportDocument => {
+                let Some(document) = self.selected_document.clone() else {
+                    return Task::none();
+                };
+                self.action_busy = true;
+                Task::perform(
+                    async move { export_document_markdown(&document) },
+                    Message::DocumentExported,
+                )
+            }
+            Message::DocumentExported(result) => {
+                self.action_busy = false;
+                match result {
+                    Ok(path) => self.notice = Some(format!("Markdown exportado em {path}")),
                     Err(error) => self.error = Some(error),
                 }
                 Task::none()
@@ -2408,7 +2470,20 @@ impl App {
                     container(
                         column![
                             text(document.title.as_str()).size(18),
-                            text(document.markdown.as_str()).size(13),
+                            text_editor(&self.document_editor)
+                                .on_action(Message::EditDocument)
+                                .height(Length::Fixed(220.0)),
+                            button(if self.action_busy {
+                                "Salvando documento…"
+                            } else {
+                                "Salvar edição"
+                            })
+                            .on_press_maybe(
+                                (!self.action_busy).then_some(Message::SaveEditedDocument),
+                            ),
+                            button("Exportar Markdown").on_press_maybe(
+                                (!self.action_busy).then_some(Message::ExportDocument)
+                            ),
                             text(format!("{} fonte(s) vinculada(s)", document.evidence.len()))
                                 .size(11),
                         ]
@@ -3714,6 +3789,49 @@ fn load_saved_document(id: &str) -> Result<scrypuppy_core::documents::Document, 
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_only(&path, &database_key)?;
     scrypuppy_core::documents::get(&conn, id)
+}
+
+fn save_document_markdown(id: &str, markdown: &str) -> Result<(), String> {
+    let (path, database_key) = default_database_credentials()?;
+    let conn = open_existing_read_write(&path, &database_key)?;
+    scrypuppy_core::documents::update_markdown(&conn, id, markdown)
+}
+
+fn export_document_markdown(
+    document: &scrypuppy_core::documents::Document,
+) -> Result<String, String> {
+    let (database_path, _) = default_database_credentials()?;
+    let root = database_path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível")?;
+    let export_dir = root.join("exports").join("magic-search");
+    std::fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+    let slug = document
+        .title
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else if character.is_whitespace() || character == '-' || character == '_' {
+                '-'
+            } else {
+                '\0'
+            }
+        })
+        .filter(|character| *character != '\0')
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let filename = format!(
+        "{}-{}.md",
+        if slug.is_empty() { "documento" } else { &slug },
+        &document.id[..8.min(document.id.len())]
+    );
+    let path = export_dir.join(filename);
+    std::fs::write(&path, &document.markdown).map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn save_theme_preference(dark: bool) -> Result<(), String> {
