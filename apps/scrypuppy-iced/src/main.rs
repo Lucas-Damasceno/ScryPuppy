@@ -236,6 +236,7 @@ struct App {
     new_context_name: String,
     new_rule_name: String,
     new_rule_condition: String,
+    new_tag: String,
     context_editor: Option<ContextEditor>,
     pending_delete_context: Option<String>,
     offset: usize,
@@ -289,6 +290,10 @@ enum Message {
     SelectContext(Option<String>),
     NewContextNameChanged(String),
     CreateContext,
+    NewTagChanged(String),
+    AddTag(String),
+    RemoveTag(String, String),
+    TagSaved(Result<(), String>),
     NewRuleNameChanged(String),
     NewRuleConditionChanged(String),
     CreateContextRule,
@@ -382,6 +387,7 @@ impl App {
             new_context_name: String::new(),
             new_rule_name: String::new(),
             new_rule_condition: String::new(),
+            new_tag: String::new(),
             context_editor: None,
             pending_delete_context: None,
             offset: 0,
@@ -649,6 +655,40 @@ impl App {
             Message::NewContextNameChanged(name) => {
                 self.new_context_name = name;
                 Task::none()
+            }
+            Message::NewTagChanged(value) => {
+                self.new_tag = value;
+                Task::none()
+            }
+            Message::AddTag(capture_id) => {
+                if self.action_busy || self.new_tag.trim().is_empty() {
+                    return Task::none();
+                }
+                let tag = self.new_tag.trim().to_string();
+                self.action_busy = true;
+                Task::perform(
+                    async move { update_capture_tag(&capture_id, &tag, false) },
+                    Message::TagSaved,
+                )
+            }
+            Message::RemoveTag(capture_id, tag) => {
+                if self.action_busy {
+                    return Task::none();
+                }
+                self.action_busy = true;
+                Task::perform(
+                    async move { update_capture_tag(&capture_id, &tag, true) },
+                    Message::TagSaved,
+                )
+            }
+            Message::TagSaved(result) => {
+                self.action_busy = false;
+                if let Err(error) = result {
+                    self.notice = Some(error);
+                } else {
+                    self.new_tag.clear();
+                }
+                self.reload()
             }
             Message::CreateContext => {
                 #[cfg(debug_assertions)]
@@ -1745,6 +1785,27 @@ impl App {
                     details =
                         details.push(text(format!("Tags: {}", capture.tags.join(", "))).size(12));
                 }
+                if !self.is_demo_mode() {
+                    let mut tag_row = row![
+                        text_input("Adicionar tag", &self.new_tag)
+                            .on_input(Message::NewTagChanged)
+                            .on_submit(Message::AddTag(capture.id.clone()))
+                            .padding(7),
+                        button("Adicionar").on_press_maybe(
+                            (!self.action_busy).then_some(Message::AddTag(capture.id.clone()))
+                        ),
+                    ]
+                    .spacing(6);
+                    for tag in &capture.tags {
+                        tag_row = tag_row.push(
+                            button(text(format!("× {tag}"))).on_press_maybe(
+                                (!self.action_busy)
+                                    .then_some(Message::RemoveTag(capture.id.clone(), tag.clone())),
+                            ),
+                        );
+                    }
+                    details = details.push(tag_row);
+                }
                 if !capture.contexts.is_empty() {
                     details = details.push(
                         text(format!(
@@ -2639,6 +2700,56 @@ fn save_setting_value_in(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn update_capture_tag(capture_id: &str, raw_tag: &str, remove: bool) -> Result<(), String> {
+    let tag = raw_tag.trim();
+    if tag.is_empty() || tag.chars().count() > 80 || tag.chars().any(char::is_control) {
+        return Err("A tag precisa ter até 80 caracteres e não pode estar vazia.".into());
+    }
+    let (path, key) = default_database_credentials()?;
+    let app_dir = path
+        .parent()
+        .ok_or("Diretório da biblioteca indisponível.")?;
+    let mut conn = open_existing_read_write(&path, &key)?;
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM captures WHERE id = ?1)",
+            [capture_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("Captura não encontrada.".into());
+    }
+    if remove {
+        transaction
+            .execute(
+                "DELETE FROM capture_tags WHERE capture_id = ?1 AND tag = ?2",
+                rusqlite::params![capture_id, tag],
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        transaction.execute(
+            "INSERT OR IGNORE INTO capture_tags (capture_id, tag, source, created_at) VALUES (?1, ?2, 'manual', ?3)",
+            rusqlite::params![capture_id, tag, chrono::Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+    }
+    let context_ids = {
+        let mut stmt = transaction
+            .prepare("SELECT context_id FROM capture_contexts WHERE capture_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([capture_id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    transaction.commit().map_err(|e| e.to_string())?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    scrypuppy_core::search_index::refresh_search_document(&conn, capture_id, &timestamp)?;
+    sync_context_exports_for_capture(&conn, app_dir, &context_ids)
 }
 
 fn create_text_context_rule(context_id: &str, name: &str, value: &str) -> Result<(), String> {
