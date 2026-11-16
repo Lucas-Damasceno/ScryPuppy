@@ -129,6 +129,41 @@ jobs:
       - name: Smoke-test Iced NSIS install and uninstall
         run: ./scripts/test-iced-windows-installer.ps1
 
+      - name: Download released Tauri migration baseline
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $baselineRoot = Join-Path $env:RUNNER_TEMP "scrypuppy-tauri-baseline"
+          New-Item -ItemType Directory -Force -Path $baselineRoot | Out-Null
+          gh release download v1.0.0-beta.12 `
+            --repo Lucas-Damasceno/ScryPuppy `
+            --pattern "ScryPuppy_beta_installer_v1.0.12.exe" `
+            --pattern "ScryPuppy_beta_installer_v1.0.12.exe.sha256" `
+            --dir $baselineRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the released Tauri beta.12 migration baseline."
+          }
+          $installer = Join-Path $baselineRoot "ScryPuppy_beta_installer_v1.0.12.exe"
+          $checksumFile = "$installer.sha256"
+          $expectedHash = [regex]::Match(
+            (Get-Content -LiteralPath $checksumFile -Raw),
+            '(?i)\b[0-9a-f]{64}\b'
+          ).Value.ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $expectedHash -or $actualHash -ne $expectedHash) {
+            throw "The released Tauri baseline failed SHA-256 validation."
+          }
+          "TAURI_BASELINE_INSTALLER=$installer" >> $env:GITHUB_ENV
+
+      - name: Validate released Tauri to Iced upgrade
+        shell: pwsh
+        env:
+          ICED_INSTALLER: ${{ steps.metadata.outputs.iced_installer_path }}
+        run: ./scripts/test-tauri-to-iced-upgrade.ps1 `
+          -TauriInstaller $env:TAURI_BASELINE_INSTALLER `
+          -IcedInstaller $env:ICED_INSTALLER
+
       - name: Create SHA-256 checksum
         shell: pwsh
         env:
