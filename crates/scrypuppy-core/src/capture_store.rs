@@ -30,6 +30,17 @@ struct AssetCleanup {
     committed: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct CaptureSourceMetadata<'a> {
+    pub capture_origin: &'a str,
+    pub source_app_name: Option<&'a str>,
+    pub source_app_id: Option<&'a str>,
+    pub source_process_id: Option<i64>,
+    pub source_process_path: Option<&'a str>,
+    pub window_title: Option<&'a str>,
+    pub window_id: Option<&'a str>,
+}
+
 impl Drop for AssetCleanup {
     fn drop(&mut self) {
         if !self.committed {
@@ -62,13 +73,10 @@ pub fn save_clipboard_capture_with_origin(
         app_dir,
         snapshot,
         capture_kind,
-        capture_origin,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        CaptureSourceMetadata {
+            capture_origin,
+            ..CaptureSourceMetadata::default()
+        },
     )
 }
 
@@ -79,14 +87,17 @@ pub fn save_clipboard_capture_with_window_metadata(
     app_dir: &Path,
     snapshot: &ClipboardSnapshot,
     capture_kind: &str,
-    capture_origin: &str,
-    source_app_name: Option<&str>,
-    source_app_id: Option<&str>,
-    source_process_id: Option<i64>,
-    source_process_path: Option<&str>,
-    window_title: Option<&str>,
-    window_id: Option<&str>,
+    source: CaptureSourceMetadata<'_>,
 ) -> Result<String, String> {
+    let CaptureSourceMetadata {
+        capture_origin,
+        source_app_name,
+        source_app_id,
+        source_process_id,
+        source_process_path,
+        window_title,
+        window_id,
+    } = source;
     let content_text = snapshot.content_text();
     if snapshot.is_empty()
         || (content_text.trim().is_empty()
@@ -487,13 +498,15 @@ mod tests {
             dir.path(),
             &snapshot,
             "capture",
-            "explicit_hotkey",
-            Some("Editor"),
-            Some("editor.exe"),
-            Some(123),
-            Some("C:/Editor/editor.exe"),
-            Some("Notes — Draft"),
-            Some("window-123"),
+            CaptureSourceMetadata {
+                capture_origin: "explicit_hotkey",
+                source_app_name: Some("Editor"),
+                source_app_id: Some("editor.exe"),
+                source_process_id: Some(123),
+                source_process_path: Some("C:/Editor/editor.exe"),
+                window_title: Some("Notes — Draft"),
+                window_id: Some("window-123"),
+            },
         )
         .unwrap();
         let capture = get_capture_by_id(&conn, &id).unwrap();

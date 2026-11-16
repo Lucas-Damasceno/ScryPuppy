@@ -5788,13 +5788,15 @@ fn capture_current_clipboard() -> Result<String, String> {
         app_dir,
         &snapshot,
         "capture",
-        "explicit_hotkey",
-        active.app_name.as_deref(),
-        active.app_id.as_deref(),
-        active.process_id,
-        active.process_path.as_deref(),
-        active.window_title.as_deref(),
-        active.window_id.as_deref(),
+        scrypuppy_core::capture_store::CaptureSourceMetadata {
+            capture_origin: "explicit_hotkey",
+            source_app_name: active.app_name.as_deref(),
+            source_app_id: active.app_id.as_deref(),
+            source_process_id: active.process_id,
+            source_process_path: active.process_path.as_deref(),
+            window_title: active.window_title.as_deref(),
+            window_id: active.window_id.as_deref(),
+        },
     )?;
     let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
     sync_context_exports_for_capture(&conn, app_dir, &context_ids)?;
@@ -5883,13 +5885,15 @@ fn capture_monitored_clipboard() -> Result<Option<(String, bool)>, String> {
         app_dir,
         &snapshot,
         "capture",
-        "clipboard_monitor",
-        active.app_name.as_deref(),
-        active.app_id.as_deref(),
-        active.process_id,
-        active.process_path.as_deref(),
-        active.window_title.as_deref(),
-        active.window_id.as_deref(),
+        scrypuppy_core::capture_store::CaptureSourceMetadata {
+            capture_origin: "clipboard_monitor",
+            source_app_name: active.app_name.as_deref(),
+            source_app_id: active.app_id.as_deref(),
+            source_process_id: active.process_id,
+            source_process_path: active.process_path.as_deref(),
+            window_title: active.window_title.as_deref(),
+            window_id: active.window_id.as_deref(),
+        },
     ) {
         Ok(id) => {
             let context_ids = scrypuppy_core::context_rules::apply_enabled_rules(&conn, &id)?;
