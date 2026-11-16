@@ -40,8 +40,8 @@ use clipboard::{
 use clipboard_monitor::ClipboardMonitorHandle;
 use crypto::sha256_hex;
 use local_search::{
-    cosine_similarity, decode_embedding, encode_embedding, normalize_embedding, LocalSearchManager,
-    LocalSearchPhase, LocalSearchStatus, INDEX_VERSION, MODEL_DIMENSIONS, MODEL_ID,
+    cosine_similarity, decode_embedding, normalize_embedding, LocalSearchManager, LocalSearchPhase,
+    LocalSearchStatus, INDEX_VERSION, MODEL_DIMENSIONS, MODEL_ID,
 };
 use scrypuppy_core::context_exports;
 use scrypuppy_core::contexts::{validate_capture_exists, validate_user_context_exists};
@@ -4231,103 +4231,14 @@ fn refresh_search_document(conn: &Connection, capture_id: &str) -> Result<(), St
 }
 
 fn reconcile_search_documents(conn: &Connection) -> Result<usize, String> {
-    let mut stmt = conn
-        .prepare("SELECT id FROM captures ORDER BY captured_at ASC")
-        .map_err(err)?;
-    let ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    for capture_id in &ids {
-        refresh_search_document(conn, capture_id)?;
-    }
-    conn.execute(
-        "DELETE FROM capture_search_documents
-         WHERE NOT EXISTS (SELECT 1 FROM captures WHERE captures.id = capture_search_documents.capture_id)",
-        [],
-    )
-    .map_err(err)?;
-    Ok(ids.len())
+    local_search::reconcile_search_documents(conn)
 }
 
 fn index_local_embeddings(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let mut conn = open_conn(state)?;
-    let total = reconcile_search_documents(&conn)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT d.capture_id, trim(d.content || '\n' || d.ocr || '\n' || d.metadata), d.content_hash
-             FROM capture_search_documents d
-             LEFT JOIN capture_embeddings e ON e.capture_id = d.capture_id
-               AND e.model_id = ? AND e.index_version = ? AND e.dimensions = ?
-               AND e.content_hash = d.content_hash
-             WHERE e.capture_id IS NULL
-             ORDER BY d.id ASC",
-        )
-        .map_err(err)?;
-    let pending = stmt
-        .query_map(
-            params![MODEL_ID, INDEX_VERSION, MODEL_DIMENSIONS as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err)?;
-    drop(stmt);
-    let mut indexed = total.saturating_sub(pending.len());
-    state.local_search.set_index_progress(indexed, total);
-    let _ = app.emit("local-search-status-changed", state.local_search.status());
-
-    for batch in pending.chunks(32) {
-        if state.local_search.cancel_requested() {
-            return Err("local indexing was cancelled".into());
-        }
-        let embeddings = state.local_search.embed_passages(
-            batch
-                .iter()
-                .map(|(_, passage, _)| passage.clone())
-                .collect(),
-        )?;
-        let transaction = conn.transaction().map_err(err)?;
-        for ((capture_id, _, content_hash), embedding) in batch.iter().zip(embeddings) {
-            let vector = encode_embedding(&normalize_embedding(embedding))?;
-            transaction
-                .execute(
-                    "INSERT INTO capture_embeddings
-                     (capture_id, model_id, index_version, dimensions, content_hash, vector, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                     ON CONFLICT(capture_id) DO UPDATE SET
-                        model_id = excluded.model_id,
-                        index_version = excluded.index_version,
-                        dimensions = excluded.dimensions,
-                        content_hash = excluded.content_hash,
-                        vector = excluded.vector,
-                        updated_at = excluded.updated_at",
-                    params![
-                        capture_id,
-                        MODEL_ID,
-                        INDEX_VERSION,
-                        MODEL_DIMENSIONS as i64,
-                        content_hash,
-                        vector,
-                        now()
-                    ],
-                )
-                .map_err(err)?;
-        }
-        transaction.commit().map_err(err)?;
-        indexed += batch.len();
-        state.local_search.set_index_progress(indexed, total);
+    local_search::index_embeddings(&mut conn, &state.local_search, |_| {
         let _ = app.emit("local-search-status-changed", state.local_search.status());
-    }
-    Ok(())
+    })
 }
 
 fn refresh_search_index_best_effort(app: &AppHandle, state: &AppState, capture_id: &str) {

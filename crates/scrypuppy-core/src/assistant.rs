@@ -70,6 +70,17 @@ pub fn answer_chat(
     settings: &AssistantSettings,
     request: &ChatRequest,
 ) -> Result<ChatAnswer, String> {
+    answer_chat_with_ranked_ids(conn, settings, request, None)
+}
+
+/// Answer using optional IDs from the local hybrid search index. The normal
+/// lexical assistant remains the fallback when the model is not installed.
+pub fn answer_chat_with_ranked_ids(
+    conn: &Connection,
+    settings: &AssistantSettings,
+    request: &ChatRequest,
+    ranked_ids: Option<&[String]>,
+) -> Result<ChatAnswer, String> {
     let portuguese = settings.language == "pt-BR";
     let query = request.query.trim();
     if query.is_empty() {
@@ -89,6 +100,12 @@ pub fn answer_chat(
     }
 
     let captures = load_chat_captures(conn, request)?;
+    let mut indexed_ranks = indexed_capture_ranks(conn, query);
+    if let Some(ranked_ids) = ranked_ids {
+        for (rank, id) in ranked_ids.iter().enumerate().rev() {
+            indexed_ranks.insert(id.clone(), rank);
+        }
+    }
     let intent = detect_chat_intent(query);
     let broad_query = is_broad_collection_query(query);
     let terms = query_terms(query);
@@ -106,9 +123,11 @@ pub fn answer_chat(
         })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
+        indexed_ranks
+            .get(&left.capture.id)
+            .unwrap_or(&usize::MAX)
+            .cmp(indexed_ranks.get(&right.capture.id).unwrap_or(&usize::MAX))
+            .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| right.capture.captured_at.cmp(&left.capture.captured_at))
             .then_with(|| left.capture.id.cmp(&right.capture.id))
     });
@@ -131,6 +150,54 @@ pub fn answer_chat(
         }
     }
     Ok(answer)
+}
+
+/// Use the canonical FTS index when available so assistant evidence follows the
+/// same searchable text as the library, including OCR and file metadata.
+/// Older databases or empty queries keep the scoring fallback below.
+fn indexed_capture_ranks(
+    conn: &Connection,
+    query: &str,
+) -> std::collections::HashMap<String, usize> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let fts_query = terms
+        .iter()
+        .filter_map(|term| {
+            let safe = term
+                .chars()
+                .filter(|character| {
+                    character.is_alphanumeric() || *character == '_' || *character == '-'
+                })
+                .collect::<String>();
+            (!safe.is_empty()).then(|| format!("\"{}\"", safe.replace('"', "\"\"")))
+        })
+        .take(24)
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if fts_query.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut stmt = match conn.prepare(
+        "SELECT d.capture_id
+         FROM capture_search_fts
+         JOIN capture_search_documents d ON d.id = capture_search_fts.rowid
+         WHERE capture_search_fts MATCH ?
+         ORDER BY bm25(capture_search_fts, 5.0, 4.0, 2.0), d.capture_id
+         LIMIT 200",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let ids = match stmt.query_map([fts_query], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    ids.enumerate()
+        .filter_map(|(rank, id)| id.ok().map(|id| (id, rank)))
+        .collect()
 }
 
 fn load_chat_captures(conn: &Connection, request: &ChatRequest) -> Result<Vec<CaptureDto>, String> {

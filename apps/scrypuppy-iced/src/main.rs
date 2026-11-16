@@ -10,6 +10,7 @@ use scrypuppy_core::library::{
     count_captures_from_conn, list_captures_from_conn, list_contexts_from_conn, CaptureDto,
     CaptureFilter, ContextDto,
 };
+use scrypuppy_core::local_search::{LocalSearchManager, LocalSearchPhase, LocalSearchStatus};
 use scrypuppy_core::preview::{image_thumbnail, read_managed_asset};
 use scrypuppy_core::storage::{open_existing_read_only, open_existing_read_write, DATABASE_FILE};
 use std::{
@@ -115,8 +116,8 @@ fn main() -> iced::Result {
                 app.quick_window == Some(id) || app.quick_context_window == Some(id),
             )
         })
-        .subscription(|_: &App| {
-            iced::Subscription::batch([
+        .subscription(|app: &App| {
+            let mut subscriptions = vec![
                 window::close_events().map(Message::Closed),
                 window::close_requests().map(Message::CloseRequested),
                 window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
@@ -131,7 +132,11 @@ fn main() -> iced::Result {
                 iced::Subscription::run(hotkey_events),
                 iced::Subscription::run(tray_events),
                 iced::Subscription::run(clipboard_events),
-            ])
+            ];
+            if app.local_search.operation_running() {
+                subscriptions.push(iced::Subscription::run(local_search_ticks));
+            }
+            iced::Subscription::batch(subscriptions)
         })
         .run();
     clipboard_monitor_handle.shutdown();
@@ -365,6 +370,8 @@ struct ContextEditor {
 
 struct App {
     main: window::Id,
+    local_search: Arc<LocalSearchManager>,
+    local_search_status: LocalSearchStatus,
     quick_window: Option<window::Id>,
     quick_context_window: Option<window::Id>,
     quick_context_selected: Vec<String>,
@@ -458,6 +465,10 @@ enum Message {
     MainOpened(window::Id),
     ShowMain,
     QuitFromTray,
+    LocalSearchTick,
+    PrepareLocalSearch,
+    RemoveLocalSearch,
+    LocalSearchFinished(Result<LocalSearchStatus, String>),
     QueryChanged(String),
     LibraryAppFilterChanged(String),
     LibraryDateFromChanged(String),
@@ -610,8 +621,15 @@ impl App {
             exit_on_close_request: false,
             ..window::Settings::default()
         });
+        let app_dir = dirs::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("com.scryppy.desktop");
+        let local_search = Arc::new(LocalSearchManager::new(&app_dir));
+        let local_search_status = local_search.status();
         let mut app = Self {
             main,
+            local_search,
+            local_search_status,
             quick_window: None,
             quick_context_window: None,
             quick_context_selected: Vec::new(),
@@ -703,7 +721,16 @@ impl App {
             return (app, open.map(Message::MainOpened));
         }
         let load = app.reload();
-        (app, Task::batch([open.map(Message::MainOpened), load]))
+        let mut tasks = vec![open.map(Message::MainOpened), load];
+        let local_search = app.local_search.clone();
+        if local_search.installed() && local_search.try_begin_operation() {
+            local_search.set_phase(LocalSearchPhase::Indexing, None);
+            tasks.push(Task::perform(
+                async move { prepare_local_search(local_search, false) },
+                Message::LocalSearchFinished,
+            ));
+        }
+        (app, Task::batch(tasks))
     }
 
     fn reload(&mut self) -> Task<Message> {
@@ -827,6 +854,55 @@ impl App {
             Message::MainOpened(_) => Task::none(),
             Message::ShowMain => show_window(self.main),
             Message::QuitFromTray => iced::exit(),
+            Message::LocalSearchTick => {
+                self.local_search_status = self.local_search.status();
+                Task::none()
+            }
+            Message::PrepareLocalSearch => {
+                if !self.local_search.try_begin_operation() {
+                    self.notice = Some("A busca local já está ocupada.".into());
+                    return Task::none();
+                }
+                let phase = if self.local_search.installed() {
+                    LocalSearchPhase::Indexing
+                } else {
+                    LocalSearchPhase::Downloading
+                };
+                self.local_search.set_phase(phase, None);
+                self.local_search_status = self.local_search.status();
+                let manager = self.local_search.clone();
+                Task::perform(
+                    async move { prepare_local_search(manager, true) },
+                    Message::LocalSearchFinished,
+                )
+            }
+            Message::RemoveLocalSearch => {
+                if !self.local_search.try_begin_operation() {
+                    self.notice = Some("A busca local já está ocupada.".into());
+                    return Task::none();
+                }
+                self.local_search
+                    .set_phase(LocalSearchPhase::Removing, None);
+                self.local_search_status = self.local_search.status();
+                let manager = self.local_search.clone();
+                Task::perform(
+                    async move { remove_local_search(manager) },
+                    Message::LocalSearchFinished,
+                )
+            }
+            Message::LocalSearchFinished(result) => {
+                self.local_search_status = self.local_search.status();
+                if let Err(error) = result {
+                    self.notice = Some(format!("Busca local: {error}"));
+                } else {
+                    self.notice = Some(match self.local_search_status.phase {
+                        LocalSearchPhase::Ready => "Busca local pronta.".into(),
+                        LocalSearchPhase::NotDownloaded => "Modelo de busca local removido.".into(),
+                        _ => "Busca local atualizada.".into(),
+                    });
+                }
+                Task::none()
+            }
             Message::Closed(id) if id == self.main => Task::none(),
             Message::Closed(id) if self.quick_window == Some(id) => {
                 self.quick_window = None;
@@ -1111,6 +1187,7 @@ impl App {
                     return Task::none();
                 }
                 let context_id = self.context.clone();
+                let local_search = self.local_search.clone();
                 self.assistant_revision = self.assistant_revision.wrapping_add(1);
                 let revision = self.assistant_revision;
                 self.assistant_busy = true;
@@ -1120,7 +1197,12 @@ impl App {
                         let (sender, receiver) = iced::futures::channel::oneshot::channel();
                         thread::spawn(move || {
                             let _ = sender.send(answer_library_question(
-                                &query, context_id, app_filter, date_from, date_to,
+                                &query,
+                                context_id,
+                                app_filter,
+                                date_from,
+                                date_to,
+                                local_search,
                             ));
                         });
                         receiver
@@ -3080,6 +3162,21 @@ impl App {
             );
         }
         if self.settings_open {
+            let local_search_label = match self.local_search_status.phase {
+                LocalSearchPhase::NotDownloaded => "Modelo local não baixado".to_string(),
+                LocalSearchPhase::Downloading => "Baixando o modelo local…".to_string(),
+                LocalSearchPhase::Indexing => format!(
+                    "Indexando capturas: {} de {}",
+                    self.local_search_status.indexed_count, self.local_search_status.total_count
+                ),
+                LocalSearchPhase::Ready => format!(
+                    "Busca local pronta · {} capturas indexadas",
+                    self.local_search_status.indexed_count
+                ),
+                LocalSearchPhase::Error => "Busca local encontrou um erro".to_string(),
+                LocalSearchPhase::Removing => "Removendo o modelo local…".to_string(),
+            };
+            let local_search_busy = self.local_search.operation_running();
             let ai_provider_label = scrypuppy_core::ai::provider_options()
                 .into_iter()
                 .find(|provider| provider.id == self.ai_provider)
@@ -3141,6 +3238,26 @@ impl App {
                     .on_press(Message::ToggleLinkPreviewFetch),
                 )
                 .push(text("Quando ligada, a busca acessa sites públicos para obter título, favicon e imagem dos links salvos. Endereços locais e privados são bloqueados; a busca pode ser desligada, mantendo as prévias já salvas em cache local.").size(12))
+                .push(text("Busca inteligente local").size(20))
+                .push(text(local_search_label).size(12))
+                .push(text("O modelo multilíngue é baixado sob demanda. As capturas e seus vetores permanecem na biblioteca local criptografada; a indexação não envia capturas a serviços externos.").size(12));
+            if self.local_search_status.can_download || self.local_search_status.can_retry {
+                content = content.push(
+                    button(if self.local_search_status.can_retry {
+                        "Tentar novamente / reindexar"
+                    } else {
+                        "Baixar modelo e preparar busca local"
+                    })
+                    .on_press_maybe((!local_search_busy).then_some(Message::PrepareLocalSearch)),
+                );
+            }
+            if self.local_search_status.can_remove {
+                content = content
+                    .push(button("Remover modelo de busca baixado").on_press_maybe(
+                        (!local_search_busy).then_some(Message::RemoveLocalSearch),
+                    ));
+            }
+            content = content
                 .push(text("Inteligência artificial").size(20))
                 .push(
                     button(text(format!("Provedor: {ai_provider_label}")))
@@ -3914,6 +4031,27 @@ impl App {
     }
 }
 
+fn local_search_ticks() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        8,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::{channel::mpsc, sink::SinkExt, StreamExt};
+            let (sender, mut receiver) = mpsc::unbounded();
+            thread::spawn(move || loop {
+                thread::sleep(std::time::Duration::from_millis(500));
+                if sender.unbounded_send(Message::LocalSearchTick).is_err() {
+                    break;
+                }
+            });
+            while let Some(message) = receiver.next().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
 fn hotkey_events() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(
         8,
@@ -4322,6 +4460,51 @@ fn demo_assistant_answer(query: &str) -> scrypuppy_core::assistant::ChatAnswer {
     }
 }
 
+fn prepare_local_search(
+    manager: Arc<LocalSearchManager>,
+    allow_download: bool,
+) -> Result<LocalSearchStatus, String> {
+    let was_installed = manager.installed();
+    let result = (|| {
+        let (path, key) = default_database_credentials()?;
+        let mut conn = open_existing_read_write(&path, &key)?;
+        manager.load_model(allow_download)?;
+        if !was_installed {
+            manager.mark_installed()?;
+        }
+        manager.set_phase(LocalSearchPhase::Indexing, None);
+        scrypuppy_core::local_search::index_embeddings(&mut conn, &manager, |_| {})?;
+        manager.set_phase(LocalSearchPhase::Ready, None);
+        Ok(())
+    })();
+    manager.finish_operation();
+    if let Err(error) = result {
+        manager.set_phase(
+            LocalSearchPhase::Error,
+            Some(scrypuppy_core::app_error::AppNotice::new(
+                "local_search.operation_failed",
+            )),
+        );
+        return Err(error);
+    }
+    Ok(manager.status())
+}
+
+fn remove_local_search(manager: Arc<LocalSearchManager>) -> Result<LocalSearchStatus, String> {
+    let result = manager.remove_model();
+    manager.finish_operation();
+    if let Err(error) = result {
+        manager.set_phase(
+            LocalSearchPhase::Error,
+            Some(scrypuppy_core::app_error::AppNotice::new(
+                "local_search.remove_failed",
+            )),
+        );
+        return Err(error);
+    }
+    Ok(manager.status())
+}
+
 fn load_default_library(mut filter: CaptureFilter) -> Result<Snapshot, String> {
     let (path, key) = default_database_credentials()?;
     filter.date_from = filter
@@ -4439,6 +4622,7 @@ fn answer_library_question(
     app: String,
     date_from: Option<String>,
     date_to: Option<String>,
+    local_search: Arc<LocalSearchManager>,
 ) -> Result<scrypuppy_core::assistant::ChatAnswer, String> {
     let (path, database_key) = default_database_credentials()?;
     let conn = open_existing_read_only(&path, &database_key)?;
@@ -4460,7 +4644,8 @@ fn answer_library_question(
         model,
         api_key,
     };
-    scrypuppy_core::assistant::answer_chat(
+    let ranked_ids = scrypuppy_core::local_search::rank_capture_ids(&conn, &local_search, query)?;
+    scrypuppy_core::assistant::answer_chat_with_ranked_ids(
         &conn,
         &settings,
         &scrypuppy_core::assistant::ChatRequest {
@@ -4471,6 +4656,7 @@ fn answer_library_question(
             date_to,
             limit: Some(12),
         },
+        Some(&ranked_ids),
     )
 }
 

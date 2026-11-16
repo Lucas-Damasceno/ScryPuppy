@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -9,6 +10,7 @@ use std::{
 };
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::app_error::AppNotice;
@@ -231,6 +233,205 @@ impl LocalSearchManager {
     }
 }
 
+/// Rebuild the canonical search documents before vector indexing and remove
+/// rows that no longer have a corresponding capture.
+pub fn reconcile_search_documents(conn: &Connection) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM captures ORDER BY captured_at ASC")
+        .map_err(|error| error.to_string())?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    for capture_id in &ids {
+        crate::search_index::refresh_search_document(conn, capture_id, &updated_at)?;
+    }
+    conn.execute(
+        "DELETE FROM capture_search_documents
+         WHERE NOT EXISTS (SELECT 1 FROM captures WHERE captures.id = capture_search_documents.capture_id)",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(ids.len())
+}
+
+/// Index stale or missing capture vectors in bounded batches. The callback is
+/// invoked after each committed batch so UI shells can publish live progress.
+pub fn index_embeddings(
+    conn: &mut Connection,
+    manager: &LocalSearchManager,
+    mut on_progress: impl FnMut(LocalSearchStatus),
+) -> Result<(), String> {
+    let total = reconcile_search_documents(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.capture_id, trim(d.content || '\n' || d.ocr || '\n' || d.metadata), d.content_hash
+             FROM capture_search_documents d
+             LEFT JOIN capture_embeddings e ON e.capture_id = d.capture_id
+               AND e.model_id = ? AND e.index_version = ? AND e.dimensions = ?
+               AND e.content_hash = d.content_hash
+             WHERE e.capture_id IS NULL
+             ORDER BY d.id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let pending = stmt
+        .query_map(
+            params![MODEL_ID, INDEX_VERSION, MODEL_DIMENSIONS as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+
+    let mut indexed = total.saturating_sub(pending.len());
+    manager.set_index_progress(indexed, total);
+    on_progress(manager.status());
+
+    for batch in pending.chunks(32) {
+        if manager.cancel_requested() {
+            return Err("local indexing was cancelled".into());
+        }
+        let embeddings = manager.embed_passages(
+            batch
+                .iter()
+                .map(|(_, passage, _)| passage.clone())
+                .collect(),
+        )?;
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        for ((capture_id, _, content_hash), embedding) in batch.iter().zip(embeddings) {
+            let vector = encode_embedding(&normalize_embedding(embedding))?;
+            transaction
+                .execute(
+                    "INSERT INTO capture_embeddings
+                     (capture_id, model_id, index_version, dimensions, content_hash, vector, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(capture_id) DO UPDATE SET
+                        model_id = excluded.model_id,
+                        index_version = excluded.index_version,
+                        dimensions = excluded.dimensions,
+                        content_hash = excluded.content_hash,
+                        vector = excluded.vector,
+                        updated_at = excluded.updated_at",
+                    params![
+                        capture_id,
+                        MODEL_ID,
+                        INDEX_VERSION,
+                        MODEL_DIMENSIONS as i64,
+                        content_hash,
+                        vector,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        indexed += batch.len();
+        manager.set_index_progress(indexed, total);
+        on_progress(manager.status());
+    }
+    Ok(())
+}
+
+/// Rank captures with the same lexical + E5 reciprocal-rank fusion used by
+/// Magic Search. If the local model is unavailable, the canonical FTS ranking
+/// is returned by itself.
+pub fn rank_capture_ids(
+    conn: &Connection,
+    manager: &LocalSearchManager,
+    query: &str,
+) -> Result<Vec<String>, String> {
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() > 1)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .take(24)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fts_query = terms.join(" OR ");
+    let mut rankings = Vec::<(&str, Vec<String>)>::new();
+    let mut lexical = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT d.capture_id FROM capture_search_fts
+         JOIN capture_search_documents d ON d.id = capture_search_fts.rowid
+         WHERE capture_search_fts MATCH ?
+         ORDER BY bm25(capture_search_fts, 5.0, 4.0, 2.0), d.capture_id LIMIT 200",
+    ) {
+        if let Ok(rows) = stmt.query_map([fts_query], |row| row.get::<_, String>(0)) {
+            lexical.extend(rows.filter_map(Result::ok));
+        }
+    }
+    if !lexical.is_empty() {
+        rankings.push(("lexical", lexical));
+    }
+
+    if manager.status().phase == LocalSearchPhase::Ready {
+        if let Ok(query_vector) = manager.embed_query(query) {
+            let query_vector = normalize_embedding(query_vector);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT e.capture_id, e.vector FROM capture_embeddings e
+                 JOIN capture_search_documents d ON d.capture_id = e.capture_id
+                    AND d.content_hash = e.content_hash
+                 WHERE e.model_id = ? AND e.index_version = ? AND e.dimensions = ?",
+            ) {
+                if let Ok(rows) = stmt.query_map(
+                    params![MODEL_ID, INDEX_VERSION, MODEL_DIMENSIONS as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                ) {
+                    let mut semantic = rows
+                        .filter_map(Result::ok)
+                        .filter_map(|(id, bytes)| {
+                            decode_embedding(&bytes)
+                                .map(|vector| (id, cosine_similarity(&query_vector, &vector)))
+                        })
+                        .collect::<Vec<_>>();
+                    semantic.sort_by(|left, right| {
+                        right
+                            .1
+                            .total_cmp(&left.1)
+                            .then_with(|| left.0.cmp(&right.0))
+                    });
+                    let semantic = semantic
+                        .into_iter()
+                        .take(200)
+                        .map(|(id, _)| id)
+                        .collect::<Vec<_>>();
+                    if !semantic.is_empty() {
+                        rankings.push(("semantic", semantic));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut fused = HashMap::<String, f64>::new();
+    for (_, ranking) in rankings {
+        for (rank, id) in ranking.iter().enumerate() {
+            *fused.entry(id.clone()).or_default() += 1.0 / (60.0 + (rank + 1) as f64);
+        }
+    }
+    let mut ranked = fused.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(ranked.into_iter().map(|(id, _)| id).collect())
+}
+
 pub fn normalize_embedding(mut embedding: Vec<f32>) -> Vec<f32> {
     let norm = embedding
         .iter()
@@ -320,5 +521,29 @@ mod tests {
     #[test]
     fn cosine_rejects_mismatched_vectors() {
         assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn lexical_rank_uses_the_canonical_fts_index_without_a_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE capture_search_documents (
+                id INTEGER PRIMARY KEY, capture_id TEXT NOT NULL, content_hash TEXT NOT NULL
+             );
+             CREATE VIRTUAL TABLE capture_search_fts USING fts5(content, ocr, metadata);
+             INSERT INTO capture_search_documents VALUES (1, 'first', 'hash-1');
+             INSERT INTO capture_search_documents VALUES (2, 'second', 'hash-2');
+             INSERT INTO capture_search_fts(rowid, content, ocr, metadata)
+                VALUES (1, 'invoice payment due', '', '');
+             INSERT INTO capture_search_fts(rowid, content, ocr, metadata)
+                VALUES (2, 'meeting notes', '', '');",
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let manager = LocalSearchManager::new(directory.path());
+
+        let ranked = rank_capture_ids(&conn, &manager, "invoice payment").unwrap();
+
+        assert_eq!(ranked, ["first"]);
     }
 }
