@@ -110,6 +110,14 @@ fn main() -> iced::Result {
             iced::Subscription::batch([
                 window::close_events().map(Message::Closed),
                 window::close_requests().map(Message::CloseRequested),
+                iced::event::listen_with(|event, _status, id| match event {
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                        modifiers,
+                        ..
+                    }) => Some(Message::FocusTab(id, modifiers.shift())),
+                    _ => None,
+                }),
                 iced::Subscription::run(hotkey_events),
                 iced::Subscription::run(tray_events),
                 iced::Subscription::run(clipboard_events),
@@ -344,6 +352,7 @@ struct App {
 enum Message {
     CloseRequested(window::Id),
     Closed(window::Id),
+    FocusTab(window::Id, bool),
     MainOpened(window::Id),
     ShowMain,
     QuitFromTray,
@@ -611,6 +620,13 @@ impl App {
         match message {
             Message::CloseRequested(id) if id == self.main => hide_window(id),
             Message::CloseRequested(_) => Task::none(),
+            Message::FocusTab(_id, reverse) => {
+                if reverse {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                }
+            }
             Message::MainOpened(id) if id == self.main => {
                 #[cfg(windows)]
                 let tray_task = window::run(id, |_| initialize_tray()).discard::<Message>();
