@@ -132,6 +132,20 @@ fn main() -> iced::Result {
                         modifiers,
                         ..
                     }) => Some(Message::FocusTab(id, modifiers.shift())),
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                        ..
+                    }) => Some(Message::QuickPasteEscape(id)),
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Character(value),
+                        modifiers,
+                        ..
+                    }) if modifiers.control()
+                        && modifiers.shift()
+                        && value.eq_ignore_ascii_case("m") =>
+                    {
+                        Some(Message::QuickPasteToggleStyle(id))
+                    }
                     _ => None,
                 }),
                 iced::Subscription::run(hotkey_events),
@@ -579,6 +593,8 @@ enum Message {
     OpenQuickPaste(isize),
     QuickPasteOpened(window::Id),
     FinishQuickPaste,
+    QuickPasteEscape(window::Id),
+    QuickPasteToggleStyle(window::Id),
     OpenQuickContext(String),
     ToggleQuickContextCapture(String),
     AssignQuickContext(String),
@@ -1039,6 +1055,20 @@ impl App {
                 if let Some(id) = self.quick_window.take() {
                     self.paste_target = None;
                     window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::QuickPasteEscape(id) => {
+                if self.quick_window == Some(id) {
+                    Task::done(Message::FinishQuickPaste)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::QuickPasteToggleStyle(id) => {
+                if self.quick_window == Some(id) {
+                    Task::done(Message::ToggleQuickPasteStyle)
                 } else {
                     Task::none()
                 }
@@ -4062,19 +4092,22 @@ impl App {
             .on_input(Message::QueryChanged)
             .on_submit(Message::Search)
             .padding(12);
-        let mut items = column![
-            row![
-                text("Quick Paste").size(20),
-                Space::new().width(Length::Fill),
-                button(if minimal { "Minimalista" } else { "Normal" })
-                    .on_press(Message::ToggleQuickPasteStyle),
-                button("Fechar").on_press(Message::FinishQuickPaste)
+        let mut items = if minimal {
+            column![search].spacing(0)
+        } else {
+            column![
+                row![
+                    text("Quick Paste").size(20),
+                    Space::new().width(Length::Fill),
+                    button("Minimalista").on_press(Message::ToggleQuickPasteStyle),
+                    button("Fechar").on_press(Message::FinishQuickPaste)
+                ]
+                .align_y(Alignment::Center),
+                text("Ctrl + Shift + V para abrir · escolha uma captura para colar").size(11),
+                search
             ]
-            .align_y(Alignment::Center),
-            text("Ctrl + Shift + V para abrir · escolha uma captura para colar").size(11),
-            search
-        ]
-        .spacing(12);
+            .spacing(12)
+        };
         if let Some(snapshot) = &self.snapshot {
             for capture in &snapshot.captures {
                 let excerpt = self
@@ -4213,7 +4246,7 @@ impl App {
         container(scrollable(items).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(14)
+            .padding(if minimal { 8 } else { 14 })
             .style(move |_| {
                 if minimal {
                     container::Style {
